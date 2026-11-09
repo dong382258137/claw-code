@@ -265,6 +265,19 @@ pub struct LspServerConfig {
     /// Optional working directory root path for the LSP server.
     /// If None, uses the workspace root.
     pub root_path: Option<String>,
+    /// 解释器路径（主要用于 Python）。
+    ///
+    /// 未配置时按 `.venv`/`venv`/`env` → uv 项目环境
+    /// (`UV_PROJECT_ENVIRONMENT`) → `VIRTUAL_ENV` → `pyproject.toml`
+    /// → 系统解释器的顺序自动探测。
+    pub interpreter: Option<String>,
+    /// 启动语言服务器时附加的环境变量（如 `PYTHONPATH`）。
+    pub env: BTreeMap<String, String>,
+    /// 项目标志文件（用于从被诊断文件向上探测项目根）。
+    ///
+    /// 为空时使用按语言内置的标记表（`Cargo.toml` / `pyproject.toml` /
+    /// `package.json` 等）。
+    pub root_markers: Vec<String>,
 }
 
 impl LspConfigCollection {
@@ -1185,6 +1198,11 @@ fn merge_lsp_servers(
         let root_path = optional_string(obj, "rootPath", &context)?
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
+        let interpreter = optional_string(obj, "interpreter", &context)?
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let env = optional_string_map(obj, "env", &context)?.unwrap_or_default();
+        let root_markers = optional_string_array(obj, "rootMarkers", &context)?.unwrap_or_default();
         target.insert(
             language.clone(),
             LspServerConfig {
@@ -1192,6 +1210,9 @@ fn merge_lsp_servers(
                 command: command.to_owned(),
                 args,
                 root_path,
+                interpreter,
+                env,
+                root_markers,
             },
         );
     }
@@ -3159,6 +3180,9 @@ mod tests {
             command: "rust-analyzer".to_string(),
             args: Vec::new(),
             root_path: None,
+            interpreter: None,
+            env: std::collections::BTreeMap::new(),
+            root_markers: Vec::new(),
         };
         assert!(cfg.args.is_empty());
     }

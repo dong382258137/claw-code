@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -114,6 +115,12 @@ pub struct LspServerState {
     /// None 表示未配置真实 server(仅 placeholder 注册)。
     #[serde(default)]
     pub server_command: Option<String>,
+    /// Python 解释器绑定(仅 Python 有意义)。
+    #[serde(default)]
+    pub interpreter: Option<String>,
+    /// 解释器的来源(`config` / `VIRTUAL_ENV` / `.venv` / `pyproject.toml` / `system`)。
+    #[serde(default)]
+    pub interpreter_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -141,6 +148,14 @@ struct RegistryInner {
     /// 语言级 auto-start 冷却:auto-start 失败后,该语言在冷却期内不再尝试。
     /// 避免 server 缺失时每次编辑都重复 spawn + 弹安装提示(刷屏)。
     auto_start_cooldowns: Mutex<HashMap<String, Instant>>,
+    /// 语言级配置:解释器路径覆盖(主要供 Python)。
+    configured_interpreters: HashMap<String, String>,
+    /// 语言级配置:启动 server 时附加的环境变量。
+    configured_env: HashMap<String, Vec<(String, String)>>,
+    /// 语言级配置:项目根标志文件(为空则用内置标记表)。
+    configured_root_markers: HashMap<String, Vec<String>>,
+    /// 实例最近使用时间(key = `instance_key`)。
+    last_used: Mutex<HashMap<String, Instant>>,
 }
 
 impl std::fmt::Debug for RegistryInner {
@@ -165,6 +180,8 @@ pub enum LspAutoDiagOutcome {
     Refresh(Vec<LspDiagnostic>),
     /// auto-start 首次失败,携带安装提示(应附到工具结果,引导安装 server)。
     InstallHint(String),
+    /// turn 已取消,提前退出等待。
+    Cancelled,
     /// 静默跳过:语言不支持 / 冷却期 / 服务器不可用 / 等待推送超时。
     Skip,
 }
@@ -174,6 +191,19 @@ const LSP_AUTO_DIAG_TIMEOUT_MS: u64 = 2500;
 
 /// 语言级 auto-start 失败后的冷却时长。
 const LSP_AUTO_START_COOLDOWN_MS: u64 = 60_000;
+
+/// 语言服务器实例总数上限(跨语言、跨工作区根)。超出时回收最久未用的实例,
+/// 防止多会话/多工作区把进程数无限放大。
+const MAX_LSP_INSTANCES: usize = 6;
+
+/// `LSP` 工具显式请求诊断时,冷启动(首次索引)允许的等待上限。
+const LSP_DIAG_COLD_TIMEOUT_MS: u64 = 15_000;
+
+/// `LSP` 工具显式请求诊断时,已就绪实例的等待上限(需留出 flycheck 时间)。
+const LSP_DIAG_WARM_TIMEOUT_MS: u64 = 10_000;
+
+/// 收到空诊断推送后,为等待 flycheck 级非空结果追加的宽限时间。
+const LSP_DIAG_NONEMPTY_GRACE_MS: u64 = 5_000;
 
 impl LspRegistry {
     #[must_use]
@@ -188,6 +218,39 @@ impl LspRegistry {
     pub fn set_default_root_path(&self, root_path: &str) {
         let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
         inner.default_root_path = Some(root_path.to_owned());
+    }
+
+    /// 写入语言级配置(解释器 / 附加环境变量 / 项目根标志文件)。
+    ///
+    /// 由 `init_lsp_from_config` 在启动时调用；未配置的语言使用内置默认。
+    pub fn set_language_config(
+        &self,
+        language: &str,
+        interpreter: Option<&str>,
+        env: Vec<(String, String)>,
+        root_markers: Vec<String>,
+    ) {
+        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+        if let Some(interpreter) = interpreter.filter(|value| !value.is_empty()) {
+            inner
+                .configured_interpreters
+                .insert(language.to_owned(), interpreter.to_owned());
+        }
+        if !env.is_empty() {
+            inner.configured_env.insert(language.to_owned(), env);
+        }
+        if !root_markers.is_empty() {
+            inner
+                .configured_root_markers
+                .insert(language.to_owned(), root_markers);
+        }
+    }
+
+    /// 默认工作区根路径(由 `init_lsp_from_config` 设置)。
+    #[must_use]
+    pub fn default_root_path(&self) -> Option<String> {
+        let inner = self.inner.lock().expect("lsp registry lock poisoned");
+        inner.default_root_path.clone()
     }
 
     pub fn register(
@@ -207,6 +270,8 @@ impl LspRegistry {
                 capabilities,
                 diagnostics: Vec::new(),
                 server_command: None,
+                interpreter: None,
+                interpreter_source: None,
             },
         );
     }
@@ -233,6 +298,8 @@ impl LspRegistry {
                 capabilities,
                 diagnostics: Vec::new(),
                 server_command: Some(server_command.to_owned()),
+                interpreter: None,
+                interpreter_source: None,
             },
         );
     }
@@ -265,135 +332,276 @@ impl LspRegistry {
         args: &[String],
         root_path: &str,
     ) -> Result<(), String> {
-        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+        self.spawn_server_with_env(language, command, args, root_path, &[], None, None)
+    }
 
-        // 检查是否已有运行中的 transport
-        if inner.process_transports.contains_key(language) {
-            return Err(format!(
-                "LSP server for '{language}' already spawned; call shutdown_server first"
-            ));
+    /// 启动语言服务器实例(支持附加环境变量与 Python 解释器绑定)。
+    ///
+    /// 实例以 `(language, 规范化工作区根)` 为键:同一语言在不同工作区根上各有一个
+    /// 实例,互不复用(否则 A 项目的诊断会基于 B 项目的索引)。
+    ///
+    /// `extra_env` 会在 spawn 时注入子进程环境(如 `VIRTUAL_ENV` / `PATH`)。
+    /// `interpreter` 仅用于 Python,写入 server 状态供诊断结果回报。
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_server_with_env(
+        &self,
+        language: &str,
+        command: &str,
+        args: &[String],
+        root_path: &str,
+        extra_env: &[(String, String)],
+        interpreter: Option<String>,
+        interpreter_source: Option<String>,
+    ) -> Result<(), String> {
+        let root = normalize_lsp_path(root_path).unwrap_or_else(|| root_path.to_owned());
+        let key = instance_key(language, &root);
+
+        {
+            let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+            if inner.process_transports.contains_key(&key) {
+                return Err(format!(
+                    "LSP server for '{language}' already spawned at {root}; call shutdown_server first"
+                ));
+            }
+            let server = inner
+                .servers
+                .get_mut(language)
+                .ok_or_else(|| format!("LSP server not registered for language: {language}"))?;
+            server.status = LspServerStatus::Starting;
+            server.server_command = Some(command.to_owned());
+            server.root_path = Some(root.clone());
+            server.interpreter = interpreter.clone();
+            server.interpreter_source = interpreter_source.clone();
         }
 
-        // 检查 language 是否已注册
-        let server = inner
-            .servers
-            .get_mut(language)
-            .ok_or_else(|| format!("LSP server not registered for language: {language}"))?;
+        // 实例上限:超出时回收最久未用的实例(不持锁 shutdown,避免死锁)。
+        self.evict_instances_if_needed(&key);
 
-        server.status = LspServerStatus::Starting;
-        server.server_command = Some(command.to_owned());
-        server.root_path = Some(root_path.to_owned());
-
-        // 创建并 spawn ProcessLspTransport
-        let mut transport = ProcessLspTransport::with_args(
+        let mut transport = ProcessLspTransport::with_args_env(
             language.to_owned(),
-            Some(root_path.to_owned()),
+            Some(root.clone()),
             command.to_owned(),
             args.to_vec(),
+            extra_env.to_vec(),
+            interpreter.as_deref().map(std::path::PathBuf::from),
         );
         // 注入 registry inner 的弱引用,供后台 reader 线程推送 publishDiagnostics
         // 弱引用避免 ProcessLspTransport ↔ LspRegistry 的循环强引用
         transport.set_registry_inner(Arc::downgrade(&self.inner));
 
-        match transport.spawn() {
+        // spawn 不持锁:initialize 握手最长 30s,不能让其它会话被这把锁卡住。
+        let spawn_result = transport.spawn();
+        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+        match spawn_result {
             Ok(()) => {
-                let server = inner
-                    .servers
-                    .get_mut(language)
-                    .expect("server was checked above");
-                server.status = LspServerStatus::Connected;
+                if let Some(server) = inner.servers.get_mut(language) {
+                    server.status = LspServerStatus::Connected;
+                }
                 inner
                     .process_transports
-                    .insert(language.to_owned(), Arc::new(Mutex::new(transport)));
+                    .insert(key.clone(), Arc::new(Mutex::new(transport)));
+                drop(inner);
+                self.touch_instance(&key);
                 Ok(())
             }
             Err(e) => {
-                let server = inner
-                    .servers
-                    .get_mut(language)
-                    .expect("server was checked above");
-                server.status = LspServerStatus::Error;
+                if let Some(server) = inner.servers.get_mut(language) {
+                    server.status = LspServerStatus::Error;
+                }
                 Err(format!("failed to spawn LSP server '{command}': {e}"))
             }
         }
     }
 
-    /// Step 4.2:关闭已 spawn 的 LSP server。
-    ///
-    /// 从 registry 中移除 transport(触发 Drop → kill 子进程),
-    /// 并将 server 状态更新为 `Disconnected`。
+    /// 实例数达到上限时回收最久未用的实例。
+    fn evict_instances_if_needed(&self, incoming_key: &str) {
+        let victim = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            if inner.process_transports.len() < MAX_LSP_INSTANCES {
+                None
+            } else {
+                let last_used = inner.last_used.lock().unwrap_or_else(|e| e.into_inner());
+                inner
+                    .process_transports
+                    .keys()
+                    .filter(|key| key.as_str() != incoming_key)
+                    .min_by_key(|key| last_used.get(*key).copied())
+                    .cloned()
+            }
+        };
+        if let Some(victim) = victim {
+            self.shutdown_instance(&victim);
+        }
+    }
+
+    /// 记录实例最近使用时间。
+    fn touch_instance(&self, key: &str) {
+        let inner = self.inner.lock().expect("lsp registry lock poisoned");
+        {
+            let mut last_used = inner.last_used.lock().unwrap_or_else(|e| e.into_inner());
+            last_used.insert(key.to_owned(), Instant::now());
+        }
+    }
+
+    /// 关闭并移除单个实例(按 `instance_key`)。
+    fn shutdown_instance(&self, key: &str) {
+        let removed = {
+            let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+            let removed = inner.process_transports.remove(key);
+            if let Ok(mut last_used) = inner.last_used.lock() {
+                last_used.remove(key);
+            }
+            if let Some(language) = key.split("::").next() {
+                let prefix = format!("{language}::");
+                if !inner
+                    .process_transports
+                    .keys()
+                    .any(|existing| existing.starts_with(&prefix))
+                {
+                    if let Some(server) = inner.servers.get_mut(language) {
+                        server.status = LspServerStatus::Disconnected;
+                    }
+                }
+            }
+            removed
+        };
+        if let Some(transport_arc) = removed {
+            if let Ok(mut transport) = transport_arc.lock() {
+                transport.shutdown();
+            }
+        }
+    }
+
+    /// Step 4.2:关闭指定语言的所有实例。
     ///
     /// 若该 language 未 spawn,返回 `Ok(())`(幂等)。
     pub fn shutdown_server(&self, language: &str) -> Result<(), String> {
-        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
-        if let Some(transport_arc) = inner.process_transports.remove(language) {
-            // Drop transport 触发 ProcessLspTransport::drop → kill 子进程
-            // 显式 lock 一下确保 Drop 在这里发生(而非延迟到 Arc 引用计数清零)
-            if let Ok(mut transport) = transport_arc.lock() {
-                // 显式 drop 内部 child
-                transport.shutdown();
-            }
-            if let Some(server) = inner.servers.get_mut(language) {
-                server.status = LspServerStatus::Disconnected;
-            }
+        let prefix = format!("{language}::");
+        let keys: Vec<String> = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            inner
+                .process_transports
+                .keys()
+                .filter(|key| key.starts_with(&prefix))
+                .cloned()
+                .collect()
+        };
+        for key in keys {
+            self.shutdown_instance(&key);
         }
         Ok(())
     }
 
-    /// Step 4.2:检查指定 language 是否有已 spawn 的真实 transport。
+    /// Step 4.2:检查指定 language 是否有已 spawn 的真实实例。
     #[must_use]
     pub fn is_server_spawned(&self, language: &str) -> bool {
+        let prefix = format!("{language}::");
         let inner = self.inner.lock().expect("lsp registry lock poisoned");
-        inner.process_transports.contains_key(language)
+        inner
+            .process_transports
+            .keys()
+            .any(|key| key.starts_with(&prefix))
     }
 
-    /// 尝试为未配置的语言自动启动预置默认 LSP server(lazy auto-start)。
-    ///
-    /// 当 dispatch 发现某语言未注册时调用此方法。流程:
-    /// 1. 查找 `default_lsp_server_for_language` 预置配置
-    /// 2. 若无预置 → 返回 Err("no default")
-    /// 3. 检测命令是否在 PATH 中(`is_command_available`)
-    /// 4. 不在 PATH → 返回 Err(含安装提示)
-    /// 5. 在 PATH → 注册 + spawn,返回 Ok
-    ///
-    /// 这是"拆包即用"的核心:用户无需配置 settings.json,
-    /// 只要系统装了对应的 LSP server(如 rust-analyzer),
-    /// claw 就能在首次调用时自动启动它。
+    /// 在 registry 默认根上懒启动(测试用便捷入口)。
+    #[cfg(test)]
     fn try_auto_start(&self, language: &str) -> Result<(), String> {
-        let (command, args) = default_lsp_server_for_language(language)
-            .ok_or_else(|| format!("no default LSP server for language '{language}'"))?;
+        let root = self.default_root_path().unwrap_or_else(|| ".".to_string());
+        self.try_auto_start_in(language, &root)
+    }
 
-        if !is_command_available(command) {
-            let hint = install_hint_for_command(command)
-                .unwrap_or("install the corresponding LSP server and add it to PATH");
-            return Err(format!(
-                "LSP server '{command}' for language '{language}' is not in PATH — {hint}"
-            ));
+    /// 在指定工作区根上懒启动语言服务器。
+    ///
+    /// 服务器按语言候选表选择(如 Python 依次尝试 pyright / basedpyright / pylsp),
+    /// 取第一个在 PATH 中可用的;Python 额外做解释器绑定(项目虚拟环境优先)。
+    fn try_auto_start_in(&self, language: &str, root_path: &str) -> Result<(), String> {
+        let candidates = default_lsp_servers_for_language(language);
+        if candidates.is_empty() {
+            return Err(format!("no default LSP server for language '{language}'"));
         }
 
-        // 获取 default_root_path(由 init_lsp_from_config 设置)
-        let root_path = {
-            let inner = self.inner.lock().expect("lsp registry lock poisoned");
-            inner
-                .default_root_path
-                .clone()
-                .unwrap_or_else(|| ".".to_string())
+        let mut tried = Vec::new();
+        let mut chosen = None;
+        for (command, args) in candidates {
+            if is_command_available(command) {
+                chosen = Some((*command, *args));
+                break;
+            }
+            tried.push(*command);
+        }
+        let Some((command, args)) = chosen else {
+            let hints: Vec<String> = tried
+                .iter()
+                .map(|command| {
+                    install_hint_for_command(command)
+                        .map(|hint| format!("{command}: {hint}"))
+                        .unwrap_or_else(|| format!("{command}: install and add to PATH"))
+                })
+                .collect();
+            return Err(format!(
+                "LSP server for language '{language}' is not in PATH (tried: {}) — {}",
+                tried.join(", "),
+                hints.join("; ")
+            ));
         };
 
-        // 注册 + spawn
+        let (mut extra_env, interpreter, interpreter_source) = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            (
+                inner
+                    .configured_env
+                    .get(language)
+                    .cloned()
+                    .unwrap_or_default(),
+                inner.configured_interpreters.get(language).cloned(),
+                "config".to_string(),
+            )
+        };
+
+        let mut resolved =
+            interpreter
+                .filter(|path| !path.is_empty())
+                .map(|path| PythonInterpreter {
+                    path: Some(std::path::PathBuf::from(path)),
+                    source: interpreter_source,
+                });
+        if language == "python" {
+            let interpreter = match resolved.take() {
+                Some(configured) => configured,
+                None => resolve_python_interpreter(std::path::Path::new(root_path)),
+            };
+            extra_env.extend(python_interpreter_env(&interpreter));
+            resolved = Some(interpreter);
+        }
+        let (interpreter_path, interpreter_source) = match resolved {
+            Some(interpreter) => (
+                interpreter
+                    .path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                Some(interpreter.source),
+            ),
+            None => (None, None),
+        };
+
         self.register_with_command(
             language,
             LspServerStatus::Disconnected,
-            Some(&root_path),
+            Some(root_path),
             vec![],
             command,
         );
 
         let args_vec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        match self.spawn_server(language, command, &args_vec, &root_path) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(e),
-        }
+        self.spawn_server_with_env(
+            language,
+            command,
+            &args_vec,
+            root_path,
+            &extra_env,
+            interpreter_path,
+            interpreter_source,
+        )
     }
 
     /// 当 dispatch 遇到 Error/Disconnected 状态的已注册 server 时,尝试重新 spawn。
@@ -406,61 +614,12 @@ impl LspRegistry {
     /// 2. 检测命令是否在 PATH 中
     /// 3. 清理旧 transport(通过 [`shutdown_server`](Self::shutdown_server))
     /// 4. 更新 server_command 并重新 spawn
-    fn try_retry_spawn(&self, language: &str) -> Result<(), String> {
-        // 1. 获取 command:优先使用已注册的 server_command,fallback 到预置默认
-        let (command, args): (String, Vec<String>) = {
-            let inner = self.inner.lock().expect("lsp registry lock poisoned");
-            if let Some(cmd) = inner
-                .servers
-                .get(language)
-                .and_then(|s| s.server_command.clone())
-            {
-                drop(inner);
-                (cmd, vec![])
-            } else {
-                drop(inner);
-                let (cmd, args) = default_lsp_server_for_language(language).ok_or_else(|| {
-                    format!(
-                        "no server_command configured and no default LSP server for language '{language}' — add it to lspServers in settings.json"
-                    )
-                })?;
-                (cmd.to_owned(), args.iter().map(|s| s.to_string()).collect())
-            }
-        };
-
-        // 2. 检测命令是否在 PATH 中
-        if !is_command_available(&command) {
-            let hint = install_hint_for_command(&command)
-                .unwrap_or("install the corresponding LSP server and add it to PATH");
-            return Err(format!(
-                "LSP server '{command}' for language '{language}' is not in PATH — {hint}"
-            ));
-        }
-
-        // 3. 获取 root_path
-        let root_path = {
-            let inner = self.inner.lock().expect("lsp registry lock poisoned");
-            inner
-                .default_root_path
-                .clone()
-                .unwrap_or_else(|| ".".to_string())
-        };
-
-        // 4. 清理旧 transport(对 Error 状态可能有残留的僵尸 transport)
+    fn try_retry_spawn(&self, language: &str, root_path: &str) -> Result<(), String> {
+        // 1. 清理该语言的旧实例(含崩溃残留)
         let _ = self.shutdown_server(language);
 
-        // 5. 确保 server_command 为最新值(用于再次重试和错误诊断)
-        {
-            let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
-            if let Some(server) = inner.servers.get_mut(language) {
-                server.server_command = Some(command.clone());
-            }
-        }
-
-        // 6. 重新 spawn
-        self.spawn_server(language, &command, &args, &root_path)?;
-
-        Ok(())
+        // 2. 重新走 lazy auto-start(候选表 + 解释器绑定 + 环境变量)
+        self.try_auto_start_in(language, root_path)
     }
     /// Step 4.2:获取指定文件的 LSP symbols。
     ///
@@ -639,6 +798,36 @@ impl LspRegistry {
     /// - 刷新成功(推送序号越过基线) → [`LspAutoDiagOutcome::Refresh`](诊断,
     ///   空 Vec = 0 问题,表示已确认刷新过)。
     pub fn refresh_diagnostics_for_path(&self, path: &str) -> LspAutoDiagOutcome {
+        self.refresh_diagnostics_for_path_in(
+            path,
+            None,
+            None,
+            Duration::from_millis(LSP_AUTO_DIAG_TIMEOUT_MS),
+            false,
+        )
+    }
+
+    /// 带工作区根 / 取消信号 / 超时的诊断刷新。
+    ///
+    /// - `workspace_root`:显式工作区根(`TurnEnv` 提供);为 `None` 时退回
+    ///   `init_lsp_from_config` 设置的默认根,绝不读进程当前目录。
+    /// - `cancel`:turn 取消令牌,循环中每 20ms 检查一次,取消即返回
+    ///   [`LspAutoDiagOutcome::Cancelled`],不阻塞 turn 退出。
+    /// - `timeout`:等待 `publishDiagnostics` 的上限(冷启动可放宽)。
+    /// - `wait_for_nonempty`:为 `true` 时,收到"空诊断推送"后继续等待,直到
+    ///   出现非空诊断或超时。rust-analyzer 会先推语法层空结果、再推 flycheck
+    ///   结果,显式诊断请求需要后者;写入后自动诊断不需要,以免拖慢编辑。
+    pub fn refresh_diagnostics_for_path_in(
+        &self,
+        path: &str,
+        workspace_root: Option<&Path>,
+        cancel: Option<&AtomicBool>,
+        timeout: Duration,
+        wait_for_nonempty: bool,
+    ) -> LspAutoDiagOutcome {
+        if is_cancelled(cancel) {
+            return LspAutoDiagOutcome::Cancelled;
+        }
         let Some(ext) = std::path::Path::new(path)
             .extension()
             .and_then(|e| e.to_str())
@@ -655,20 +844,36 @@ impl LspRegistry {
             return LspAutoDiagOutcome::Skip;
         }
 
-        // 路径规范化:绝对路径 + 正斜杠,与 `uri_to_path` 的输出格式一致
-        // (publishDiagnostics 推送的 path 是 file:// URI 反解出的 `D:/...` 格式;
-        //  不统一则 last_push_version / get_diagnostics 全部查不到,链路永远超时)。
-        let Some(normalized_path) = normalize_lsp_path(path) else {
+        // 工作区根:显式传入 → registry 默认根;都拿不到就跳过(不读 cwd)。
+        let Some(workspace) = workspace_root
+            .and_then(|root| normalize_lsp_path(&root.display().to_string()))
+            .or_else(|| {
+                self.default_root_path()
+                    .and_then(|root| normalize_lsp_path(&root))
+            })
+        else {
             return LspAutoDiagOutcome::Skip;
         };
 
-        // 确保 server 已注册并 spawn(未就绪则 auto-start,含安装提示)。
+        // 路径规范化:绝对路径 + 正斜杠,与 `uri_to_path` 的输出格式一致
+        // (publishDiagnostics 推送的 path 是 file:// URI 反解出的 `D:/...` 格式;
+        //  不统一则 last_push_version / get_diagnostics 全部查不到,链路永远超时)。
+        let Some(normalized_path) = absolutize_lsp_path(path, &workspace) else {
+            return LspAutoDiagOutcome::Skip;
+        };
+
+        // 项目根探测:按项目标志文件(Cargo.toml / pyproject.toml / package.json ...)
+        // 向上找最近的项目根,避免把 monorepo 里无关的项目索引混在一起。
+        let root = self.project_root_for(&normalized_path, &workspace, language);
+        let key = instance_key(language, &root);
+
+        // 确保 (语言, 项目根) 实例已就绪(未就绪则 lazy auto-start,含安装提示)。
         let server_ready = {
             let inner = self.inner.lock().expect("lsp registry lock poisoned");
-            inner.servers.contains_key(language) && inner.process_transports.contains_key(language)
+            inner.process_transports.contains_key(&key)
         };
         if !server_ready {
-            if let Err(err) = self.try_auto_start(language) {
+            if let Err(err) = self.try_auto_start_in(language, &root) {
                 // 首次失败:记录冷却;若属 server 缺失类错误,附安装提示引导安装。
                 self.set_auto_start_cooldown(language);
                 if err.contains("not in PATH") || err.contains("failed to spawn") {
@@ -681,11 +886,12 @@ impl LspRegistry {
         // 获取 transport 并触发重新诊断(didOpen 首开 + didChange 增量)。
         let transport = {
             let inner = self.inner.lock().expect("lsp registry lock poisoned");
-            inner.process_transports.get(language).cloned()
+            inner.process_transports.get(&key).cloned()
         };
         let Some(transport) = transport else {
             return LspAutoDiagOutcome::Skip;
         };
+        self.touch_instance(&key);
 
         // 基线:该文件当前已知的最新推送序号。
         let baseline = self.last_push_version(&normalized_path);
@@ -698,20 +904,54 @@ impl LspRegistry {
             if t.notify_did_change(&normalized_path).is_err() {
                 return LspAutoDiagOutcome::Skip;
             }
+            // 显式诊断请求:补发 didSave,触发 rust-analyzer 的 flycheck(cargo check),
+            // 否则只能拿到语法层结果,类型错误不会被推送。
+            if wait_for_nonempty {
+                let _ = t.notify_did_save(&normalized_path);
+            }
         }
 
-        // 等待该文件的推送序号越过基线(带超时)。
-        let deadline = Instant::now() + Duration::from_millis(LSP_AUTO_DIAG_TIMEOUT_MS);
+        // 等待该文件的推送序号越过基线(带超时 + 取消检查)。
+        let deadline = Instant::now() + timeout;
+        let mut latest: Option<Vec<LspDiagnostic>> = None;
+        let mut grace_deadline: Option<Instant> = None;
         loop {
+            if is_cancelled(cancel) {
+                return LspAutoDiagOutcome::Cancelled;
+            }
             if self.last_push_version(&normalized_path) > baseline {
                 let diags = self.get_diagnostics(&normalized_path);
-                return LspAutoDiagOutcome::Refresh(diags);
+                if !wait_for_nonempty || !diags.is_empty() {
+                    return LspAutoDiagOutcome::Refresh(diags);
+                }
+                // 空推送:可能只是语法层结果,再给 flycheck 一小段宽限时间。
+                latest = Some(diags);
+                if grace_deadline.is_none() {
+                    grace_deadline =
+                        Some(Instant::now() + Duration::from_millis(LSP_DIAG_NONEMPTY_GRACE_MS));
+                }
             }
-            if Instant::now() >= deadline {
-                return LspAutoDiagOutcome::Skip;
+            let limit = grace_deadline.map_or(deadline, |grace| grace.min(deadline));
+            if Instant::now() >= limit {
+                return latest.map_or(LspAutoDiagOutcome::Skip, LspAutoDiagOutcome::Refresh);
             }
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// 解析文件所属项目根(按语言的项目标志文件)。
+    fn project_root_for(&self, file: &str, workspace: &str, language: &str) -> String {
+        let configured = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            inner
+                .configured_root_markers
+                .get(language)
+                .cloned()
+                .unwrap_or_default()
+        };
+        detect_project_root(Path::new(file), Path::new(workspace), language, &configured)
+            .and_then(|root| normalize_lsp_path(&root.display().to_string()))
+            .unwrap_or_else(|| workspace.to_owned())
     }
 
     /// 该文件最近一次 publishDiagnostics 推送对应的全局序号(0 = 从未推送)。
@@ -772,21 +1012,162 @@ impl LspRegistry {
         path: Option<&str>,
         line: Option<u32>,
         character: Option<u32>,
+        query: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        self.dispatch_in(action, path, line, character, query, None)
+    }
+
+    /// 带显式工作区根的 dispatch。
+    ///
+    /// `workspace_root` 由调用方从 `TurnEnv` 传入；为 `None` 时退回 registry
+    /// 默认根。相对路径一律相对工作区解析，绝不读进程当前目录。
+    pub fn dispatch_in(
+        &self,
+        action: &str,
+        path: Option<&str>,
+        line: Option<u32>,
+        character: Option<u32>,
         _query: Option<&str>,
+        workspace_root: Option<&Path>,
     ) -> Result<serde_json::Value, String> {
         let lsp_action =
             LspAction::from_str(action).ok_or_else(|| format!("unknown LSP action: {action}"))?;
 
-        // For diagnostics, we can check existing cached diagnostics
+        // diagnostics:带工作区根的调用会主动刷新(而非只读缓存),并显式区分
+        // ok / unavailable / cancelled,便于上层做兜底检查;不带工作区根的旧入口
+        // 保持"只读缓存"语义(测试与 repomap 等内部调用依赖该行为)。
         if lsp_action == LspAction::Diagnostics {
             if let Some(path) = path {
-                let diags = self.get_diagnostics(path);
-                return Ok(serde_json::json!({
+                if workspace_root.is_none() {
+                    let diags = self.get_diagnostics(path);
+                    return Ok(serde_json::json!({
+                        "action": "diagnostics",
+                        "path": path,
+                        "diagnostics": diags,
+                        "count": diags.len()
+                    }));
+                }
+                let ext = std::path::Path::new(path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .unwrap_or_default();
+                let Some(language) = language_for_extension(&ext) else {
+                    return Err(format!(
+                        "unsupported file extension '.{}': LSP diagnostics supports rust(.rs), typescript(.ts/.tsx), javascript(.js/.jsx), python(.py), go(.go), java(.java), c(.c/.h), cpp(.cpp/.hpp/.cc), ruby(.rb), lua(.lua); path: {path}",
+                        if ext.is_empty() { "<none>" } else { ext.as_str() }
+                    ));
+                };
+                let Some(workspace) = workspace_root
+                    .and_then(|root| normalize_lsp_path(&root.display().to_string()))
+                    .or_else(|| {
+                        self.default_root_path()
+                            .and_then(|root| normalize_lsp_path(&root))
+                    })
+                else {
+                    return Ok(serde_json::json!({
+                        "action": "diagnostics",
+                        "path": path,
+                        "language": language,
+                        "status": "unavailable",
+                        "source": "none",
+                        "reason": "no workspace root available (TurnEnv workspace missing); refusing to read process cwd"
+                    }));
+                };
+                let Some(abs_path) = absolutize_lsp_path(path, &workspace) else {
+                    return Err(format!("invalid path: {path}"));
+                };
+                let root = self.project_root_for(&abs_path, &workspace, language);
+                let key = instance_key(language, &root);
+                let had_instance = {
+                    let inner = self.inner.lock().expect("lsp registry lock poisoned");
+                    inner.process_transports.contains_key(&key)
+                };
+                // 冷启动(首次索引)给更长的等待预算,已就绪则留出 flycheck 时间。
+                let timeout = if had_instance {
+                    Duration::from_millis(LSP_DIAG_WARM_TIMEOUT_MS)
+                } else {
+                    Duration::from_millis(LSP_DIAG_COLD_TIMEOUT_MS)
+                };
+                let outcome = self.refresh_diagnostics_for_path_in(
+                    &abs_path,
+                    Some(Path::new(&workspace)),
+                    None,
+                    timeout,
+                    true,
+                );
+                let (server_command, interpreter, interpreter_source) = {
+                    let inner = self.inner.lock().expect("lsp registry lock poisoned");
+                    let server = inner.servers.get(language);
+                    (
+                        server.and_then(|s| s.server_command.clone()),
+                        server.and_then(|s| s.interpreter.clone()),
+                        server.and_then(|s| s.interpreter_source.clone()),
+                    )
+                };
+                let base = serde_json::json!({
                     "action": "diagnostics",
-                    "path": path,
-                    "diagnostics": diags,
-                    "count": diags.len()
-                }));
+                    "path": abs_path,
+                    "language": language,
+                    "root": root,
+                    "server": server_command,
+                    "interpreter": interpreter,
+                    "interpreter_source": interpreter_source,
+                });
+                return match outcome {
+                    LspAutoDiagOutcome::Refresh(diags) => Ok(serde_json::json!({
+                        "action": "diagnostics",
+                        "path": base["path"],
+                        "language": language,
+                        "root": root,
+                        "status": "ok",
+                        "source": "lsp",
+                        "transport": "process",
+                        "server": server_command,
+                        "interpreter": interpreter,
+                        // Python 用系统解释器时明确提示:依赖可能解析不到,诊断不可全信。
+                        "interpreter_warning": interpreter_source
+                            .as_deref()
+                            .filter(|source| *source == "system")
+                            .map(|_| "使用系统解释器,项目依赖可能解析不到,诊断可能不准"),
+                        "interpreter_source": interpreter_source,
+                        "diagnostics": diags,
+                        "count": diags.len(),
+                    })),
+                    LspAutoDiagOutcome::InstallHint(reason) => Ok(serde_json::json!({
+                        "action": "diagnostics",
+                        "path": base["path"],
+                        "language": language,
+                        "root": root,
+                        "status": "unavailable",
+                        "source": "none",
+                        "reason": reason,
+                        "server": server_command,
+                        "interpreter": interpreter,
+                        "interpreter_source": interpreter_source,
+                    })),
+                    LspAutoDiagOutcome::Cancelled => Ok(serde_json::json!({
+                        "action": "diagnostics",
+                        "path": base["path"],
+                        "language": language,
+                        "root": root,
+                        "status": "cancelled",
+                        "source": "none",
+                        "reason": "turn cancelled before diagnostics arrived",
+                    })),
+                    LspAutoDiagOutcome::Skip => Ok(serde_json::json!({
+                        "action": "diagnostics",
+                        "path": base["path"],
+                        "language": language,
+                        "root": root,
+                        "status": "unavailable",
+                        "source": "none",
+                        "reason": "LSP server unavailable or published no diagnostics within the timeout",
+                        "server": server_command,
+                        "interpreter": interpreter,
+                        "interpreter_source": interpreter_source,
+                    })),
+                };
             }
             // All diagnostics across all servers
             let inner = self.inner.lock().expect("lsp registry lock poisoned");
@@ -815,23 +1196,57 @@ impl LspRegistry {
             .and_then(|e| e.to_str())
             .unwrap_or("");
 
-        let language = match ext {
-            "rs" => "rust",
-            "ts" | "tsx" => "typescript",
-            "js" | "jsx" => "javascript",
-            "py" => "python",
-            "go" => "go",
-            "java" => "java",
-            "c" | "h" => "c",
-            "cpp" | "hpp" | "cc" => "cpp",
-            "rb" => "ruby",
-            "lua" => "lua",
-            _ => {
-                return Err(format!(
-                    "unsupported file extension '.{}': LSP supports rust(.rs), typescript(.ts/.tsx), javascript(.js/.jsx), python(.py), go(.go), java(.java), c(.c/.h), cpp(.cpp/.hpp/.cc), ruby(.rb), lua(.lua); path: {path}",
-                    if ext.is_empty() { "<none>" } else { ext }
-                ));
+        let language = language_for_extension(&ext.to_ascii_lowercase()).ok_or_else(|| {
+            format!(
+                "unsupported file extension '.{}': LSP supports rust(.rs), typescript(.ts/.tsx), javascript(.js/.jsx), python(.py), go(.go), java(.java), c(.c/.h), cpp(.cpp/.hpp/.cc), ruby(.rb), lua(.lua); path: {path}",
+                if ext.is_empty() { "<none>" } else { ext }
+            )
+        })?;
+
+        // 工作区根 + 项目根:显式 root 优先,其次 registry 默认根,
+        // 最后已注册 server 的 rootPath。绝不读进程当前目录。
+        let registered_root = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            inner
+                .servers
+                .get(language)
+                .and_then(|server| server.root_path.clone())
+        };
+        let workspace = workspace_root
+            .and_then(|root| normalize_lsp_path(&root.display().to_string()))
+            .or_else(|| {
+                self.default_root_path()
+                    .and_then(|root| normalize_lsp_path(&root))
+            })
+            .or_else(|| registered_root.and_then(|root| normalize_lsp_path(&root)));
+        let (root, abs_path) = match workspace.as_deref() {
+            Some(workspace) => {
+                let abs = absolutize_lsp_path(path, workspace).unwrap_or_else(|| path.to_owned());
+                (self.project_root_for(&abs, workspace, language), abs)
             }
+            None => {
+                // 没有工作区根:仅允许走内存 transport(纯逻辑回放,不需要真实路径)。
+                // 若已有真实进程实例却拿不到根,明确报错而不是请求当前目录。
+                let has_process_instance = {
+                    let inner = self.inner.lock().expect("lsp registry lock poisoned");
+                    let prefix = format!("{language}::");
+                    inner
+                        .process_transports
+                        .keys()
+                        .any(|key| key.starts_with(&prefix))
+                };
+                if has_process_instance {
+                    return Err(format!(
+                        "no workspace root available for '{language}' (file: {path}); refusing to read process cwd"
+                    ));
+                }
+                (String::new(), path.to_owned())
+            }
+        };
+        let key = if root.is_empty() {
+            language.to_owned()
+        } else {
+            instance_key(language, &root)
         };
 
         let server = {
@@ -842,14 +1257,15 @@ impl LspRegistry {
         let mut server = match server {
             Some(s) => s,
             None => {
+                if root.is_empty() {
+                    return Err(format!(
+                        "no LSP server configured for language '{language}' (file: {path}); no workspace root available to auto-start one — add \"lspServers\" to settings.json"
+                    ));
+                }
                 // 预置默认配置:尝试 auto-start
-                // 如果该语言有预置默认 LSP server 且在 PATH 中,自动注册并启动
-                // 如果不在 PATH 中,返回含安装提示的错误
-                // 如果无预置默认,返回含配置模板的错误
-                if default_lsp_server_for_language(language).is_some() {
-                    match self.try_auto_start(language) {
+                if !default_lsp_servers_for_language(language).is_empty() {
+                    match self.try_auto_start_in(language, &root) {
                         Ok(()) => {
-                            // auto-start 成功,重新读取 server 状态
                             let inner = self.inner.lock().expect("lsp registry lock poisoned");
                             inner.servers.get(language).cloned().ok_or_else(|| {
                                 "auto-start succeeded but server not found in registry".to_string()
@@ -875,10 +1291,15 @@ impl LspRegistry {
             if server.status == LspServerStatus::Error
                 || server.status == LspServerStatus::Disconnected
             {
-                // 尝试重试 spawn
-                match self.try_retry_spawn(language) {
+                if root.is_empty() {
+                    // 无工作区根时重启没有意义(会在错误目录建索引)。
+                    return Err(format!(
+                        "LSP server for '{}' is not connected (status: {}) — no workspace root available to restart it",
+                        server.language, server.status
+                    ));
+                }
+                match self.try_retry_spawn(language, &root) {
                     Ok(()) => {
-                        // 重试成功,重新读取 server 状态并继续 dispatch
                         let inner = self.inner.lock().expect("lsp registry lock poisoned");
                         server = inner.servers.get(language).cloned().ok_or_else(|| {
                             "retry spawn succeeded but server not found in registry".to_string()
@@ -900,7 +1321,6 @@ impl LspRegistry {
                     }
                 }
             } else {
-                // Starting 状态:无法干预,提示等待
                 return Err(format!(
                     "LSP server for '{}' is still starting up, retry in a few seconds (rust-analyzer indexing may take 30-60s on first run)",
                     server.language,
@@ -909,36 +1329,64 @@ impl LspRegistry {
         }
 
         // Step 4.2 — 真实 LSP JSON-RPC 调用。
-        // 详见 docs/harness-engineering-optimization-plan.md Step 4.2
-        //
-        // 优先级:
-        // 1. 若 process_transports 中有已 spawn 的真实 transport,使用它发送 JSON-RPC
-        // 2. 否则 fallback 到 LspJsonRpcClient(MemoryLspTransport)— 保持向后兼容
-        //
-        // 协议流程:initialize → initialized → didChange → completion/hover/definition
-        let request = LspRequest::new(lsp_action, path, line, character, server.language.clone());
+        let request = LspRequest::new(
+            lsp_action,
+            &abs_path,
+            line,
+            character,
+            server.language.clone(),
+        );
 
-        // 检查是否有已 spawn 的真实 transport
         let transport_arc = {
             let inner = self.inner.lock().expect("lsp registry lock poisoned");
-            inner.process_transports.get(&server.language).cloned()
+            inner.process_transports.get(&key).cloned()
         };
 
         if let Some(transport_arc) = transport_arc {
-            // 使用真实 ProcessLspTransport
-            let transport = transport_arc
-                .lock()
-                .map_err(|_| "transport lock poisoned".to_string())?;
-
-            // SP4.2 修复:在发任何 textDocument 请求前,先发 didOpen 通知。
-            // LSP 协议要求 client 先 didOpen,server 才能解析文件内容。
-            // ensure_did_open 内部跟踪已 open 的文件,不会重复发送。
-            let language_id = language_id_from_extension(path);
-            transport.ensure_did_open(path, language_id)?;
-
+            self.touch_instance(&key);
+            let language_id = language_id_from_extension(&abs_path);
             let method = request.method();
             let params = request.params();
-            let rpc_response = transport.send(method, params)?;
+
+            let send_once = |transport: &ProcessLspTransport| -> Result<serde_json::Value, String> {
+                transport.ensure_did_open(&abs_path, language_id)?;
+                transport.send(method, params.clone())
+            };
+
+            let first = {
+                let transport = transport_arc
+                    .lock()
+                    .map_err(|_| "transport lock poisoned".to_string())?;
+                send_once(&transport)
+            };
+
+            let rpc_response = match first {
+                Ok(response) => response,
+                Err(err) if looks_like_transport_failure(&err) => {
+                    // 服务器崩溃/链路断开:回收实例并重建一次,重建失败则明确报错。
+                    drop(transport_arc);
+                    self.shutdown_instance(&key);
+                    self.try_retry_spawn(language, &root).map_err(|retry_err| {
+                        format!("LSP transport failed ({err}); rebuild failed: {retry_err}")
+                    })?;
+                    let rebuilt = {
+                        let inner = self.inner.lock().expect("lsp registry lock poisoned");
+                        inner.process_transports.get(&key).cloned()
+                    }
+                    .ok_or_else(|| {
+                        format!("LSP transport failed ({err}); rebuild produced no instance")
+                    })?;
+                    let transport = rebuilt
+                        .lock()
+                        .map_err(|_| "transport lock poisoned".to_string())?;
+                    send_once(&transport).map_err(|retry_err| {
+                        format!(
+                            "LSP transport failed ({err}); retry after rebuild failed: {retry_err}"
+                        )
+                    })?
+                }
+                Err(err) => return Err(err),
+            };
 
             return Ok(serde_json::json!({
                 "action": format!("{:?}", request.action).to_lowercase(),
@@ -946,6 +1394,7 @@ impl LspRegistry {
                 "line": request.line,
                 "character": request.character,
                 "language": server.language,
+                "root": root,
                 "method": method,
                 "rpc_response": rpc_response,
                 "transport": "process",
@@ -1157,26 +1606,306 @@ fn is_command_available(command: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 预置的 LSP server 默认配置。
-///
-/// 当用户未在 settings.json 中配置 `lspServers` 时,
-/// dispatch 会根据此表自动推断常见语言应使用的 LSP server。
-/// 仅当对应 server 命令在 PATH 中可用时才会自动启动(lazy auto-start)。
-///
-/// 返回 `(command, args)` 元组。`args` 为空切片表示无参数。
+/// 取某语言的第一个候选 server(测试与兼容用途)。
+#[cfg(test)]
 fn default_lsp_server_for_language(
     language: &str,
 ) -> Option<(&'static str, &'static [&'static str])> {
+    default_lsp_servers_for_language(language).first().copied()
+}
+
+/// 每种语言的 LSP server 候选表(按优先级)。
+///
+/// 例如 Python 依次尝试 pyright → basedpyright → pylsp;取第一个在 PATH 中可用的。
+fn default_lsp_servers_for_language(
+    language: &str,
+) -> &'static [(&'static str, &'static [&'static str])] {
     match language {
-        "rust" => Some(("rust-analyzer", &[])),
-        "python" => Some(("pylsp", &[])),
-        "typescript" | "javascript" => Some(("typescript-language-server", &["--stdio"])),
-        "go" => Some(("gopls", &[])),
-        "c" | "cpp" => Some(("clangd", &[])),
-        "ruby" => Some(("solargraph", &["stdio"])),
-        "lua" => Some(("lua-language-server", &[])),
-        _ => None,
+        "rust" => &[("rust-analyzer", &[] as &[&str])],
+        "python" => &[
+            ("pyright-langserver", &["--stdio"] as &[&str]),
+            ("basedpyright-langserver", &["--stdio"] as &[&str]),
+            ("pylsp", &[] as &[&str]),
+        ],
+        "typescript" | "javascript" => &[("typescript-language-server", &["--stdio"] as &[&str])],
+        "go" => &[("gopls", &[] as &[&str])],
+        "c" | "cpp" => &[("clangd", &[] as &[&str])],
+        "ruby" => &[("solargraph", &["stdio"] as &[&str])],
+        "lua" => &[("lua-language-server", &[] as &[&str])],
+        _ => &[],
     }
+}
+
+/// 语言 → 项目标志文件。用于从被诊断文件向上探测项目根。
+fn default_root_markers(language: &str) -> &'static [&'static str] {
+    match language {
+        "rust" => &["Cargo.toml"],
+        "python" => &[
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "requirements.txt",
+            "Pipfile",
+        ],
+        "typescript" | "javascript" => &["tsconfig.json", "package.json"],
+        "go" => &["go.mod"],
+        "java" => &["pom.xml", "build.gradle", "build.gradle.kts"],
+        "c" | "cpp" => &["compile_commands.json", "CMakeLists.txt"],
+        "ruby" => &["Gemfile"],
+        "lua" => &[".luarc.json"],
+        _ => &[],
+    }
+}
+
+/// 从文件所在目录向上找最近的项目根(必须在 `workspace` 内)。
+fn detect_project_root(
+    file: &Path,
+    workspace: &Path,
+    language: &str,
+    configured_markers: &[String],
+) -> Option<std::path::PathBuf> {
+    let markers: Vec<String> = if configured_markers.is_empty() {
+        default_root_markers(language)
+            .iter()
+            .map(|marker| (*marker).to_owned())
+            .collect()
+    } else {
+        configured_markers.to_vec()
+    };
+    if markers.is_empty() {
+        return None;
+    }
+    let mut dir = file.parent()?;
+    loop {
+        if markers.iter().any(|marker| dir.join(marker).exists()) {
+            return Some(dir.to_path_buf());
+        }
+        if dir == workspace || !dir.starts_with(workspace) {
+            return None;
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// 解析出的 Python 解释器及其来源。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PythonInterpreter {
+    /// 解释器绝对路径;`None` 表示未找到任何解释器。
+    pub path: Option<std::path::PathBuf>,
+    /// 来源:`config` / `.venv` / `venv` / `env` / `uv` / `VIRTUAL_ENV` /
+    /// `pyproject.toml` / `system` / `unresolved`。
+    pub source: String,
+}
+
+/// 按项目约定解析 Python 解释器。
+///
+/// 顺序:项目内 `.venv` → `venv` → `env` → uv 项目环境
+/// (`UV_PROJECT_ENVIRONMENT`)→ `VIRTUAL_ENV`(指向项目内时优先已由虚拟环境
+/// 目录覆盖)→ `pyproject.toml` 声明 → 系统解释器。
+///
+/// 用错解释器会让依赖解析失败,产生大量"找不到模块"的假诊断,所以项目虚拟环境
+/// 必须优先于 `VIRTUAL_ENV`(后者可能属于别的 shell/项目)。
+pub fn resolve_python_interpreter(workspace: &Path) -> PythonInterpreter {
+    for dir_name in [".venv", "venv", "env"] {
+        if let Some(path) = python_executable_in(&workspace.join(dir_name)) {
+            return PythonInterpreter {
+                path: Some(path),
+                source: dir_name.to_owned(),
+            };
+        }
+    }
+
+    // uv 默认就在项目下建 `.venv`(已被上面覆盖);这里覆盖它用
+    // `UV_PROJECT_ENVIRONMENT` 改名的情况(相对路径相对项目根)。
+    if let Some(uv_env) = std::env::var_os("UV_PROJECT_ENVIRONMENT") {
+        let uv_env = std::path::PathBuf::from(uv_env);
+        let candidate = if uv_env.is_absolute() {
+            uv_env
+        } else {
+            workspace.join(uv_env)
+        };
+        if let Some(path) = python_executable_in(&candidate) {
+            return PythonInterpreter {
+                path: Some(path),
+                source: "uv".to_owned(),
+            };
+        }
+    }
+
+    if let Some(virtual_env) = std::env::var_os("VIRTUAL_ENV") {
+        let virtual_env = std::path::PathBuf::from(virtual_env);
+        if let Some(path) = python_executable_in(&virtual_env) {
+            return PythonInterpreter {
+                path: Some(path),
+                source: "VIRTUAL_ENV".to_owned(),
+            };
+        }
+    }
+
+    if let Some(path) = interpreter_from_pyproject(&workspace.join("pyproject.toml")) {
+        return PythonInterpreter {
+            path: Some(path),
+            source: "pyproject.toml".to_owned(),
+        };
+    }
+
+    let system = if cfg!(windows) { "python" } else { "python3" };
+    if is_command_available(system) {
+        return PythonInterpreter {
+            path: None,
+            source: "system".to_owned(),
+        };
+    }
+
+    PythonInterpreter {
+        path: None,
+        source: "unresolved".to_owned(),
+    }
+}
+
+/// 返回虚拟环境目录里的解释器可执行文件(Windows 为 `Scripts/python.exe`)。
+fn python_executable_in(venv_dir: &Path) -> Option<std::path::PathBuf> {
+    let candidates = if cfg!(windows) {
+        ["Scripts/python.exe", "python.exe"]
+    } else {
+        ["bin/python3", "bin/python"]
+    };
+    for candidate in candidates {
+        let path = venv_dir.join(candidate);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// 从 `pyproject.toml` 中读取解释器声明。
+///
+/// 支持 `[tool.pyright]` / `[tool.basedpyright]` 的 `pythonPath`,以及
+/// `venvPath` + `venv` 组合。为避免引入 TOML 依赖,这里做最小的逐行解析。
+fn interpreter_from_pyproject(pyproject: &Path) -> Option<std::path::PathBuf> {
+    let content = std::fs::read_to_string(pyproject).ok()?;
+    let mut section = String::new();
+    let mut python_path: Option<String> = None;
+    let mut venv_path: Option<String> = None;
+    let mut venv_name: Option<String> = None;
+
+    for raw_line in content.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line.trim_matches(['[', ']']).trim().to_owned();
+            continue;
+        }
+        if !(section == "tool.pyright" || section == "tool.basedpyright" || section == "tool.pylsp")
+        {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches(['"', '\'']);
+        match key.trim() {
+            "pythonPath" => python_path = Some(value.to_owned()),
+            "venvPath" => venv_path = Some(value.to_owned()),
+            "venv" => venv_name = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+
+    if let Some(python_path) = python_path {
+        let path = pyproject
+            .parent()
+            .map(|parent| parent.join(&python_path))
+            .unwrap_or_else(|| std::path::PathBuf::from(&python_path));
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    if let (Some(venv_path), Some(venv_name)) = (venv_path, venv_name) {
+        let base = pyproject
+            .parent()
+            .map(|parent| parent.join(&venv_path))
+            .unwrap_or_else(|| std::path::PathBuf::from(&venv_path));
+        if let Some(path) = python_executable_in(&base.join(venv_name)) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// 构造启动 Python LSP server 所需的环境变量。
+///
+/// - `VIRTUAL_ENV`:指向虚拟环境根;
+/// - `PATH`:前置虚拟环境的 `Scripts`/`bin`,使 server 内部的 `python` 解析到它。
+///
+/// 未找到解释器时返回空 Vec,由调用方在诊断结果里标注 `system`。
+pub fn python_interpreter_env(interpreter: &PythonInterpreter) -> Vec<(String, String)> {
+    let Some(path) = interpreter.path.as_ref() else {
+        return Vec::new();
+    };
+    let Some(bin_dir) = path.parent() else {
+        return Vec::new();
+    };
+    let venv_root = bin_dir.parent().unwrap_or(bin_dir);
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    vec![
+        ("VIRTUAL_ENV".to_owned(), venv_root.display().to_string()),
+        (
+            "PATH".to_owned(),
+            format!("{}{separator}{current_path}", bin_dir.display()),
+        ),
+    ]
+}
+
+/// `(语言, 工作区根)` 实例键。保证不同工作区根不复用同一个 server 实例。
+fn instance_key(language: &str, root: &str) -> String {
+    format!("{language}::{root}")
+}
+
+/// 把相对路径按工作区根解析为绝对路径(正斜杠规范化)。不读进程当前目录。
+fn absolutize_lsp_path(path: &str, workspace: &str) -> Option<String> {
+    let path = Path::new(path);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        Path::new(workspace).join(path)
+    };
+    normalize_lsp_path(&absolute.display().to_string())
+}
+
+/// 判断取消令牌是否已触发。
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|token| token.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// 要求 LSP 路径必须是绝对路径。
+///
+/// 相对路径一律由调用方按 `TurnEnv` 工作区解析;这里拒绝自行读取进程当前目录。
+fn require_absolute_lsp_path(path: &str) -> Result<String, String> {
+    if Path::new(path).is_absolute() {
+        Ok(path.to_owned())
+    } else {
+        Err(format!(
+            "LSP path must be absolute (caller must resolve it against the workspace): {path}"
+        ))
+    }
+}
+
+/// 判断错误是否属于传输层故障(超时/管道断开/子进程退出),这类错误值得重建实例重试。
+fn looks_like_transport_failure(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "timeout",
+        "timed out",
+        "broken pipe",
+        "eof",
+        "disconnected",
+        "channel",
+        "pty",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
 }
 
 /// 进程传输层 — 启动 LSP server 子进程,通过 stdin/stdout 通信。
@@ -1234,6 +1963,10 @@ pub struct ProcessLspTransport {
     /// 弱引用避免 ProcessLspTransport ↔ LspRegistry 的循环强引用。
     /// None 表示未关联 registry(如单元测试中独立构造的 transport)。
     registry_inner: Option<Weak<Mutex<RegistryInner>>>,
+    /// spawn 时注入子进程的附加环境变量(`VIRTUAL_ENV` / `PATH` / 用户配置)。
+    extra_env: Vec<(String, String)>,
+    /// Python 解释器路径,用于向 server 声明 `python.pythonPath`。
+    interpreter: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for ProcessLspTransport {
@@ -1269,6 +2002,19 @@ impl ProcessLspTransport {
         server_command: impl Into<String>,
         args: Vec<String>,
     ) -> Self {
+        Self::with_args_env(language, root_path, server_command, args, Vec::new(), None)
+    }
+
+    /// 创建带命令行参数、环境变量与解释器绑定的 transport。
+    #[must_use]
+    pub fn with_args_env(
+        language: impl Into<String>,
+        root_path: Option<String>,
+        server_command: impl Into<String>,
+        args: Vec<String>,
+        extra_env: Vec<(String, String)>,
+        interpreter: Option<std::path::PathBuf>,
+    ) -> Self {
         Self {
             language: language.into(),
             root_path,
@@ -1284,6 +2030,8 @@ impl ProcessLspTransport {
             reader_stop: Arc::new(AtomicBool::new(false)),
             pending_responses: Arc::new(Mutex::new(HashMap::new())),
             registry_inner: None,
+            extra_env,
+            interpreter,
         }
     }
 
@@ -1308,6 +2056,13 @@ impl ProcessLspTransport {
             .stderr(Stdio::null());
         if !self.server_args.is_empty() {
             cmd.args(&self.server_args);
+        }
+        if !self.extra_env.is_empty() {
+            cmd.envs(
+                self.extra_env
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            );
         }
         let mut child = cmd.spawn().map_err(|e| {
             let base = format!("failed to spawn LSP server '{}': {e}", self.server_command);
@@ -1384,11 +2139,50 @@ impl ProcessLspTransport {
         let pending = Arc::clone(&self.pending_responses);
         let registry_weak = self.registry_inner.clone();
         let language = self.language.clone();
+        let stdin_handle = self.child_stdin.clone();
 
         thread::spawn(move || {
             while !stop.load(Ordering::Acquire) {
                 match read_one_message(&stdout) {
                     Ok(msg) => {
+                        // server → client 请求(id + method 同时存在):必须回复。
+                        // rust-analyzer 启动后会发 client/registerCapability,pyright 会发
+                        // workspace/configuration;不回包会让 server 阻塞在握手阶段,
+                        // 永远不推送 publishDiagnostics(表现为"诊断超时")。
+                        if msg.get("method").is_some() && msg.get("id").is_some() {
+                            let method = msg
+                                .get("method")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or_default();
+                            let result = if method == "workspace/configuration" {
+                                let count = msg
+                                    .get("params")
+                                    .and_then(|params| params.get("items"))
+                                    .and_then(|items| items.as_array())
+                                    .map(Vec::len)
+                                    .unwrap_or(0);
+                                serde_json::json!(vec![serde_json::Value::Null; count])
+                            } else {
+                                serde_json::Value::Null
+                            };
+                            let response = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": msg.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                                "result": result,
+                            });
+                            if let Some(stdin_handle) = &stdin_handle {
+                                if let Ok(body) = serde_json::to_string(&response) {
+                                    let header = format!("Content-Length: {}\r\n\r\n", body.len());
+                                    if let Ok(mut stdin) = stdin_handle.lock() {
+                                        let _ = stdin.write_all(header.as_bytes());
+                                        let _ = stdin.write_all(body.as_bytes());
+                                        let _ = stdin.flush();
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
                         // 响应:有 id 字段,分发给 pending request
                         if let Some(id) = msg.get("id").and_then(|v| v.as_u64()) {
                             if let Some(tx) = pending.lock().ok().and_then(|mut p| p.remove(&id)) {
@@ -1475,15 +2269,7 @@ impl ProcessLspTransport {
     /// server 才能解析文件内容。此方法跟踪已 open 的文件(path → 版本号),
     /// 避免重复发送。
     pub fn ensure_did_open(&self, path: &str, language_id: &str) -> Result<(), String> {
-        let abs_path = if std::path::Path::new(path).is_absolute() {
-            path.to_owned()
-        } else {
-            std::env::current_dir()
-                .map_err(|e| e.to_string())?
-                .join(path)
-                .display()
-                .to_string()
-        };
+        let abs_path = require_absolute_lsp_path(path)?;
 
         let mut opened = self
             .opened_files
@@ -1520,15 +2306,7 @@ impl ProcessLspTransport {
     /// - 版本号由 `opened_files` 内部递增(didOpen 为 v1);
     /// - didChange 无需 languageId(与 didOpen 不同)。
     pub fn notify_did_change(&self, path: &str) -> Result<(), String> {
-        let abs_path = if std::path::Path::new(path).is_absolute() {
-            path.to_owned()
-        } else {
-            std::env::current_dir()
-                .map_err(|e| e.to_string())?
-                .join(path)
-                .display()
-                .to_string()
-        };
+        let abs_path = require_absolute_lsp_path(path)?;
 
         let version = {
             let mut opened = self
@@ -1552,6 +2330,17 @@ impl ProcessLspTransport {
         self.send_notification("textDocument/didChange", params)
     }
 
+    /// 发送 textDocument/didSave 通知。
+    ///
+    /// rust-analyzer 的 flycheck(`cargo check`)默认由 didSave 触发;只发 didChange
+    /// 时它只做语法层分析,类型错误不会出现在 publishDiagnostics 里。
+    pub fn notify_did_save(&self, path: &str) -> Result<(), String> {
+        let abs_path = require_absolute_lsp_path(path)?;
+        let uri = path_to_file_uri(&abs_path);
+        let params = serde_json::json!({ "textDocument": { "uri": uri } });
+        self.send_notification("textDocument/didSave", params)
+    }
+
     /// 构造 initialize 请求的 params。
     #[must_use]
     pub fn initialize_params(&self) -> serde_json::Value {
@@ -1563,7 +2352,7 @@ impl ProcessLspTransport {
                 format!("file:///{normalized}")
             }
         });
-        serde_json::json!({
+        let mut params = serde_json::json!({
             "processId": std::process::id(),
             "rootPath": self.root_path,
             "rootUri": root_uri,
@@ -1580,7 +2369,29 @@ impl ProcessLspTransport {
                     "synchronization": { "didOpen": true, "didChange": true, "didClose": true }
                 }
             }
-        })
+        });
+
+        // Python:把解释器显式传给 pyright / pylsp,避免 server 自行猜测系统解释器
+        // 导致依赖解析失败(大量"找不到模块"假诊断)。
+        if let Some(interpreter) = self.interpreter.as_ref() {
+            let interpreter = interpreter.display().to_string();
+            if let Some(object) = params.as_object_mut() {
+                object.insert(
+                    "initializationOptions".to_owned(),
+                    serde_json::json!({
+                        "python": { "pythonPath": interpreter },
+                        "pylsp": {
+                            "plugins": {
+                                "jedi": { "environment": interpreter },
+                                "pycodestyle": { "enabled": true }
+                            }
+                        }
+                    }),
+                );
+            }
+        }
+
+        params
     }
 
     /// 检查子进程是否已启动。
@@ -3357,7 +4168,7 @@ mod tests {
         );
         assert_eq!(
             default_lsp_server_for_language("python").unwrap().0,
-            "pylsp"
+            "pyright-langserver"
         );
         assert_eq!(
             default_lsp_server_for_language("typescript").unwrap().0,
@@ -4217,5 +5028,211 @@ mod tests {
 
         let diags = parse_publish_diagnostics(&msg);
         assert!(diags.is_empty());
+    }
+
+    // ── 多语言映射 / Python 解释器绑定 ──
+
+    /// 虚拟环境中解释器的相对路径(与 python_executable_in 的候选顺序一致)。
+    fn fake_python_rel() -> &'static str {
+        if cfg!(windows) {
+            "Scripts/python.exe"
+        } else {
+            "bin/python3"
+        }
+    }
+
+    /// 在 venv 目录里写一个占位的解释器文件(只用于路径探测,不执行)。
+    fn write_fake_python(venv: &Path) -> std::path::PathBuf {
+        let path = venv.join(fake_python_rel());
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("venv dir");
+        std::fs::write(&path, "").expect("fake interpreter");
+        path
+    }
+
+    #[test]
+    fn default_servers_are_mapped_per_language() {
+        assert_eq!(
+            default_lsp_servers_for_language("rust")[0].0,
+            "rust-analyzer"
+        );
+        let python: Vec<&str> = default_lsp_servers_for_language("python")
+            .iter()
+            .map(|(command, _)| *command)
+            .collect();
+        assert_eq!(
+            python,
+            vec!["pyright-langserver", "basedpyright-langserver", "pylsp"],
+            "Python 应优先 pyright,再 basedpyright,最后 pylsp"
+        );
+        assert_eq!(
+            default_lsp_servers_for_language("typescript")[0].0,
+            "typescript-language-server"
+        );
+        assert!(default_lsp_servers_for_language("unknown-lang").is_empty());
+    }
+
+    #[test]
+    fn project_root_detection_uses_language_markers() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path();
+        let project = workspace.join("services/api");
+        std::fs::create_dir_all(project.join("pkg")).expect("dirs");
+        std::fs::write(project.join("pyproject.toml"), "[project]\nname='x'\n").expect("marker");
+        let file = project.join("pkg/app.py");
+        std::fs::write(&file, "x = 1\n").expect("file");
+
+        assert_eq!(
+            detect_project_root(&file, workspace, "python", &[]),
+            Some(project),
+            "应按 pyproject.toml 定位项目根"
+        );
+
+        // 没有标志文件的目录不应把整个 workspace 当成项目根。
+        let stray = workspace.join("notes/scratch.py");
+        std::fs::create_dir_all(stray.parent().expect("parent")).expect("dirs");
+        std::fs::write(&stray, "x = 1\n").expect("file");
+        assert!(detect_project_root(&stray, workspace, "python", &[]).is_none());
+    }
+
+    #[test]
+    fn python_interpreter_prefers_project_venv_over_virtual_env() {
+        let _guard = crate::test_env_lock();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).expect("project");
+        let project_python = write_fake_python(&project.join(".venv"));
+
+        // 另一个项目的虚拟环境:项目内 .venv 必须优先于它,否则会解析到别人的依赖。
+        let other_env = temp.path().join("other-env");
+        write_fake_python(&other_env);
+
+        let previous = std::env::var_os("VIRTUAL_ENV");
+        std::env::set_var("VIRTUAL_ENV", &other_env);
+        let resolved = resolve_python_interpreter(&project);
+        match previous {
+            Some(value) => std::env::set_var("VIRTUAL_ENV", value),
+            None => std::env::remove_var("VIRTUAL_ENV"),
+        }
+
+        assert_eq!(resolved.source, ".venv");
+        assert_eq!(resolved.path.as_deref(), Some(project_python.as_path()));
+    }
+
+    #[test]
+    fn python_interpreter_honors_uv_project_environment() {
+        let _guard = crate::test_env_lock();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let project = temp.path().join("proj");
+        std::fs::create_dir_all(&project).expect("project");
+        let uv_python = write_fake_python(&project.join("uv-env"));
+
+        let previous_uv = std::env::var_os("UV_PROJECT_ENVIRONMENT");
+        let previous_venv = std::env::var_os("VIRTUAL_ENV");
+        std::env::set_var("UV_PROJECT_ENVIRONMENT", "uv-env");
+        std::env::remove_var("VIRTUAL_ENV");
+        let resolved = resolve_python_interpreter(&project);
+        match previous_uv {
+            Some(value) => std::env::set_var("UV_PROJECT_ENVIRONMENT", value),
+            None => std::env::remove_var("UV_PROJECT_ENVIRONMENT"),
+        }
+        match previous_venv {
+            Some(value) => std::env::set_var("VIRTUAL_ENV", value),
+            None => std::env::remove_var("VIRTUAL_ENV"),
+        }
+
+        assert_eq!(resolved.source, "uv");
+        assert_eq!(resolved.path.as_deref(), Some(uv_python.as_path()));
+    }
+
+    #[test]
+    fn python_interpreter_reads_pyproject_python_path() {
+        let _guard = crate::test_env_lock();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let project = temp.path().join("proj");
+        std::fs::create_dir_all(&project).expect("project");
+        let custom_python = write_fake_python(&project.join("custom"));
+        std::fs::write(
+            project.join("pyproject.toml"),
+            format!(
+                "[tool.pyright]\npythonPath = \"custom/{}\"\n",
+                fake_python_rel()
+            ),
+        )
+        .expect("pyproject");
+
+        let previous = std::env::var_os("VIRTUAL_ENV");
+        let previous_uv = std::env::var_os("UV_PROJECT_ENVIRONMENT");
+        std::env::remove_var("VIRTUAL_ENV");
+        std::env::remove_var("UV_PROJECT_ENVIRONMENT");
+        let resolved = resolve_python_interpreter(&project);
+        match previous {
+            Some(value) => std::env::set_var("VIRTUAL_ENV", value),
+            None => std::env::remove_var("VIRTUAL_ENV"),
+        }
+        match previous_uv {
+            Some(value) => std::env::set_var("UV_PROJECT_ENVIRONMENT", value),
+            None => std::env::remove_var("UV_PROJECT_ENVIRONMENT"),
+        }
+
+        assert_eq!(resolved.source, "pyproject.toml");
+        assert_eq!(resolved.path.as_deref(), Some(custom_python.as_path()));
+    }
+
+    #[test]
+    fn python_interpreter_reports_system_when_no_venv_found() {
+        let _guard = crate::test_env_lock();
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        let previous = std::env::var_os("VIRTUAL_ENV");
+        let previous_uv = std::env::var_os("UV_PROJECT_ENVIRONMENT");
+        std::env::remove_var("VIRTUAL_ENV");
+        std::env::remove_var("UV_PROJECT_ENVIRONMENT");
+        let resolved = resolve_python_interpreter(temp.path());
+        match previous {
+            Some(value) => std::env::set_var("VIRTUAL_ENV", value),
+            None => std::env::remove_var("VIRTUAL_ENV"),
+        }
+        match previous_uv {
+            Some(value) => std::env::set_var("UV_PROJECT_ENVIRONMENT", value),
+            None => std::env::remove_var("UV_PROJECT_ENVIRONMENT"),
+        }
+
+        assert!(resolved.path.is_none(), "系统解释器不回填绝对路径");
+        assert!(
+            resolved.source == "system" || resolved.source == "unresolved",
+            "无虚拟环境时应标注 system/unresolved,实际: {}",
+            resolved.source
+        );
+    }
+
+    #[test]
+    fn python_interpreter_env_points_at_venv_bin() {
+        let venv = Path::new("D:/proj/.venv").to_path_buf();
+        let python = venv.join(fake_python_rel());
+        let env = python_interpreter_env(&PythonInterpreter {
+            path: Some(python.clone()),
+            source: ".venv".to_owned(),
+        });
+        let lookup = |key: &str| {
+            env.iter()
+                .find(|(candidate, _)| candidate == key)
+                .map(|(_, value)| value.clone())
+        };
+        let expected_root = venv.display().to_string();
+        assert_eq!(
+            lookup("VIRTUAL_ENV").as_deref(),
+            Some(expected_root.as_str())
+        );
+        let path = lookup("PATH").expect("PATH should be set");
+        assert!(
+            path.starts_with(&python.parent().expect("bin dir").display().to_string()),
+            "PATH 应前置虚拟环境 bin 目录: {path}"
+        );
+    }
+
+    #[test]
+    fn instance_key_separates_language_and_workspace_root() {
+        assert_ne!(instance_key("rust", "D:/a"), instance_key("python", "D:/a"));
+        assert_ne!(instance_key("rust", "D:/a"), instance_key("rust", "D:/b"));
     }
 }

@@ -76,6 +76,20 @@ pub fn init_lsp_from_config(
     }
 
     for (language, server_cfg) in lsp_config.servers() {
+        let configured_env: Vec<(String, String)> = server_cfg
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+
+        // 语言级配置:解释器 / 附加环境变量 / 项目根标志文件。
+        registry.set_language_config(
+            language,
+            server_cfg.interpreter.as_deref(),
+            configured_env.clone(),
+            server_cfg.root_markers.clone(),
+        );
+
         // 注册 server 元数据
         registry.register_with_command(
             language,
@@ -87,12 +101,45 @@ pub fn init_lsp_from_config(
 
         // 尝试 spawn 真实 server 子进程
         let effective_root = server_cfg.root_path.as_deref().unwrap_or(root_str);
+        let mut extra_env = configured_env;
+        let (interpreter_path, interpreter_source) = if language == "python" {
+            // Python 必须绑定项目解释器:配置显式指定优先,否则按项目约定探测。
+            let resolved = match server_cfg
+                .interpreter
+                .as_deref()
+                .filter(|path| !path.is_empty())
+            {
+                Some(path) => runtime::lsp_client::PythonInterpreter {
+                    path: Some(std::path::PathBuf::from(path)),
+                    source: "config".to_owned(),
+                },
+                None => runtime::lsp_client::resolve_python_interpreter(std::path::Path::new(
+                    effective_root,
+                )),
+            };
+            extra_env.extend(runtime::lsp_client::python_interpreter_env(&resolved));
+            (
+                resolved
+                    .path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                Some(resolved.source),
+            )
+        } else {
+            (
+                server_cfg.interpreter.clone(),
+                server_cfg.interpreter.as_ref().map(|_| "config".to_owned()),
+            )
+        };
 
-        match registry.spawn_server(
+        match registry.spawn_server_with_env(
             language,
             &server_cfg.command,
             &server_cfg.args,
             effective_root,
+            &extra_env,
+            interpreter_path,
+            interpreter_source,
         ) {
             Ok(()) => {
                 eprintln!(
@@ -2055,12 +2102,13 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "LSP",
-            description: "Query Language Server Protocol for code intelligence. USE THIS PROACTIVELY: after editing or reading source code (.rs/.ts/.tsx/.js/.jsx/.py/.go/.java/.c/.h/.cpp/.rb/.lua), call action='diagnostics' for that file to catch compile errors and static issues early. If the result reports the LSP server is 'not in PATH', it includes the exact install command — run it via bash (ask the user first if unsure) and retry, instead of skipping. Also supports hover, definition, references, completion, symbols, format.",
+            description: "Query Language Server Protocol for code intelligence. USE THIS PROACTIVELY: after editing or reading source code (.rs/.ts/.tsx/.js/.jsx/.py/.go/.java/.c/.h/.cpp/.rb/.lua), call action='diagnostics' for that file to catch compile errors and static issues early. Pass 'paths' (array) to diagnose several files/languages in one call; results are merged per file. Each result reports 'source' ('lsp' = real language server, or a fallback check such as cargo-check / ruff / py_compile / tsc) and 'degraded' so you can tell real LSP output from fallback checks. For Python, 'interpreter'/'interpreter_source' show which interpreter the server was bound to; if it says 'system', diagnostics may be inaccurate. If the server is 'not in PATH', the result includes the install command — run it via bash (ask the user first if unsure) and retry. Also supports hover, definition, references, completion, symbols, format.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["symbols", "references", "diagnostics", "definition", "hover", "format", "completion"] },
                     "path": { "type": "string" },
+                    "paths": { "type": "array", "items": { "type": "string" } },
                     "line": { "type": "integer", "minimum": 0 },
                     "character": { "type": "integer", "minimum": 0 },
                     "query": { "type": "string" }
@@ -2318,7 +2366,7 @@ fn execute_tool_in_with_enforcer(
         "dag_define" => from_value::<dag::DagDefineInput>(input).and_then(run_dag_define),
         "dag_run" => from_value::<dag::DagRunInput>(input).and_then(run_dag_run),
         "dag_status" => from_value::<dag::DagStatusInput>(input).and_then(run_dag_status),
-        "LSP" => from_value::<LspInput>(input).and_then(run_lsp),
+        "LSP" => from_value::<LspInput>(input).and_then(|parsed| run_lsp(parsed, env)),
         "ListMcpResources" => {
             from_value::<McpResourceInput>(input).and_then(run_list_mcp_resources)
         }
@@ -2894,15 +2942,88 @@ fn run_cron_list(_input: Value) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_lsp(input: LspInput) -> Result<String, String> {
+fn run_lsp(input: LspInput, env: &TurnEnv) -> Result<String, String> {
     let registry = global_lsp_registry();
-    let action = &input.action;
-    let path = input.path.as_deref();
-    let line = input.line;
-    let character = input.character;
-    let query = input.query.as_deref();
+    let workspace = env.workspace();
+    let action = input.action.as_str();
 
-    match registry.dispatch(action, path, line, character, query) {
+    // 诊断支持一次多文件(可跨语言):逐个文件取真实 LSP 诊断,失败则降级,
+    // 最后按文件合并返回,每条结果都带 source / degraded 供模型分辨来源。
+    if action.eq_ignore_ascii_case("diagnostics") {
+        let mut files: Vec<String> = Vec::new();
+        if let Some(path) = input
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            files.push(path.to_owned());
+        }
+        if let Some(paths) = input.paths.as_deref() {
+            for path in paths
+                .iter()
+                .map(|path| path.trim())
+                .filter(|path| !path.is_empty())
+            {
+                if !files.iter().any(|existing| existing == path) {
+                    files.push(path.to_owned());
+                }
+            }
+        }
+
+        if files.is_empty() {
+            // 无 path:保持旧行为,返回已缓存的全部诊断。
+            return match registry.dispatch_in(
+                action,
+                None,
+                input.line,
+                input.character,
+                input.query.as_deref(),
+                Some(workspace),
+            ) {
+                Ok(result) => to_pretty_json(result),
+                Err(e) => to_pretty_json(json!({
+                    "action": action,
+                    "error": e,
+                    "status": "error"
+                })),
+            };
+        }
+
+        let results: Vec<Value> = files
+            .iter()
+            .map(|file| lsp_diagnostics_for_file(registry, file, workspace))
+            .collect();
+        let count: usize = results
+            .iter()
+            .map(|result| result.get("count").and_then(Value::as_u64).unwrap_or(0) as usize)
+            .sum();
+        let degraded_files = results
+            .iter()
+            .filter(|result| {
+                result
+                    .get("degraded")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .count();
+        return to_pretty_json(json!({
+            "action": "diagnostics",
+            "results": results,
+            "files": results.len(),
+            "count": count,
+            "degraded_files": degraded_files,
+        }));
+    }
+
+    match registry.dispatch_in(
+        action,
+        input.path.as_deref(),
+        input.line,
+        input.character,
+        input.query.as_deref(),
+        Some(workspace),
+    ) {
         Ok(result) => to_pretty_json(result),
         Err(e) => to_pretty_json(json!({
             "action": action,
@@ -2910,6 +3031,376 @@ fn run_lsp(input: LspInput) -> Result<String, String> {
             "status": "error"
         })),
     }
+}
+
+/// 单文件诊断:真实 LSP 优先;不可用/超时/缺服务器时降级到语言原生检查。
+///
+/// 结果始终标注 `source`(`lsp` / `cargo-check` / `ruff` / `py_compile` / `tsc`)
+/// 与 `degraded`,模型能区分"真实 LSP 诊断"和"兜底检查"。
+fn lsp_diagnostics_for_file(registry: &LspRegistry, file: &str, workspace: &Path) -> Value {
+    let started = Instant::now();
+    let dispatch =
+        registry.dispatch_in("diagnostics", Some(file), None, None, None, Some(workspace));
+
+    let (lsp_value, lsp_reason) = match dispatch {
+        Ok(value) => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unavailable");
+            if status == "ok" || status == "cancelled" {
+                let mut value = value;
+                value["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
+                return value;
+            }
+            (
+                value.clone(),
+                value.get("reason").cloned().unwrap_or(Value::Null),
+            )
+        }
+        Err(err) => (Value::Null, Value::String(err)),
+    };
+
+    let abs_path = lsp_value
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let path = Path::new(file);
+            if path.is_absolute() {
+                path.display().to_string()
+            } else {
+                workspace.join(path).display().to_string()
+            }
+        });
+    let fallback = run_fallback_diagnostics(Path::new(&abs_path), workspace);
+
+    // 降级结果里的解释器信息以"实际执行兜底检查的那个"为准:
+    // LSP 侧的 server 状态按语言缓存,跨工作区根可能是别的项目留下的旧值。
+    let interpreter = fallback
+        .interpreter
+        .clone()
+        .map(Value::String)
+        .or_else(|| {
+            lsp_value
+                .get("interpreter")
+                .filter(|value| !value.is_null())
+                .cloned()
+        })
+        .unwrap_or(Value::Null);
+    let interpreter_source = fallback
+        .interpreter_source
+        .clone()
+        .map(Value::String)
+        .or_else(|| {
+            lsp_value
+                .get("interpreter_source")
+                .filter(|value| !value.is_null())
+                .cloned()
+        })
+        .unwrap_or(Value::Null);
+
+    json!({
+        "action": "diagnostics",
+        "path": abs_path,
+        "language": lsp_value.get("language").cloned().unwrap_or(Value::Null),
+        "status": "degraded",
+        "degraded": true,
+        "source": fallback.source,
+        "lsp_reason": lsp_reason,
+        "lsp_server": lsp_value.get("server").cloned().unwrap_or(Value::Null),
+        "interpreter": interpreter,
+        "interpreter_source": interpreter_source,
+        "interpreter_warning": interpreter_warning(&interpreter_source),
+        "diagnostics": fallback.diagnostics,
+        "count": fallback.diagnostics.len(),
+        "note": fallback.note,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+    })
+}
+
+/// 使用系统解释器时的显式风险提示。
+///
+/// Python 诊断可信度取决于解释器:系统解释器看不到项目虚拟环境里的依赖,
+/// 会报大量"找不到模块"的假错误,必须在结果里让模型知道。
+fn interpreter_warning(interpreter_source: &Value) -> Value {
+    if interpreter_source.as_str() == Some("system") {
+        json!("使用系统解释器,项目依赖可能解析不到,诊断可能不准")
+    } else {
+        Value::Null
+    }
+}
+
+/// 兜底检查结果。
+struct FallbackDiagnostics {
+    /// 检查来源:`cargo-check` / `ruff` / `py_compile` / `tsc` / `none`。
+    source: &'static str,
+    /// 诊断条目(通常是单条原始输出,便于模型直接阅读)。
+    diagnostics: Vec<Value>,
+    /// 附加说明(如解释器来源、超时、缺工具)。
+    note: Option<String>,
+    /// 兜底检查使用的解释器(仅 Python 有意义)。
+    interpreter: Option<String>,
+    /// 解释器来源(`.venv` / `VIRTUAL_ENV` / `pyproject.toml` / `system` / `unresolved`)。
+    interpreter_source: Option<String>,
+}
+
+/// 语言原生兜底检查:缺 LSP server 时仍有可用结果,而不是静默为空。
+fn run_fallback_diagnostics(file: &Path, workspace: &Path) -> FallbackDiagnostics {
+    let ext = file
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match ext.as_str() {
+        "rs" => match run_cargo_check_for_file(file) {
+            Some(output) if !output.trim().is_empty() => FallbackDiagnostics {
+                source: "cargo-check",
+                diagnostics: vec![json!({ "message": output.trim() })],
+                note: None,
+                interpreter: None,
+                interpreter_source: None,
+            },
+            Some(_) => FallbackDiagnostics {
+                source: "cargo-check",
+                diagnostics: Vec::new(),
+                note: Some("cargo check reported no issues".to_owned()),
+                interpreter: None,
+                interpreter_source: None,
+            },
+            None => FallbackDiagnostics {
+                source: "none",
+                diagnostics: Vec::new(),
+                note: Some("cargo unavailable, or file is not inside a Rust project".to_owned()),
+                interpreter: None,
+                interpreter_source: None,
+            },
+        },
+        "py" => run_python_fallback(file, workspace),
+        "ts" | "tsx" | "js" | "jsx" => run_tsc_fallback(file, workspace),
+        _ => FallbackDiagnostics {
+            source: "none",
+            diagnostics: Vec::new(),
+            note: Some(format!("no fallback checker for '.{ext}'")),
+            interpreter: None,
+            interpreter_source: None,
+        },
+    }
+}
+
+/// Python 兜底:优先 `ruff check`(含未定义名/未使用导入等),否则 `py_compile`。
+///
+/// 解释器按项目约定解析(虚拟环境优先),避免用系统解释器误判依赖缺失。
+fn run_python_fallback(file: &Path, workspace: &Path) -> FallbackDiagnostics {
+    let interpreter = runtime::lsp_client::resolve_python_interpreter(workspace);
+    let python = interpreter
+        .path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "python" } else { "python3" }));
+    let interpreter_note = format!("interpreter: {} ({})", python.display(), interpreter.source);
+    let interpreter_path = interpreter
+        .path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let interpreter_source = Some(interpreter.source.clone());
+
+    let ruff_args = vec![
+        "check".to_owned(),
+        "--output-format".to_owned(),
+        "concise".to_owned(),
+        file.display().to_string(),
+    ];
+    if let Some(run) = run_check_command("ruff", &ruff_args, workspace, Duration::from_secs(15)) {
+        if !run.success || !run.output.trim().is_empty() {
+            return FallbackDiagnostics {
+                source: "ruff",
+                diagnostics: vec![json!({ "message": run.output.trim() })],
+                note: Some(interpreter_note),
+                interpreter: interpreter_path,
+                interpreter_source,
+            };
+        }
+        return FallbackDiagnostics {
+            source: "ruff",
+            diagnostics: Vec::new(),
+            note: Some(format!("ruff reported no issues; {interpreter_note}")),
+            interpreter: interpreter_path,
+            interpreter_source,
+        };
+    }
+
+    let compile_args = vec![
+        "-m".to_owned(),
+        "py_compile".to_owned(),
+        file.display().to_string(),
+    ];
+    match run_check_command(
+        &python.display().to_string(),
+        &compile_args,
+        workspace,
+        Duration::from_secs(15),
+    ) {
+        Some(run) if !run.success => FallbackDiagnostics {
+            source: "py_compile",
+            diagnostics: vec![json!({ "message": run.output.trim() })],
+            note: Some(interpreter_note),
+            interpreter: interpreter_path,
+            interpreter_source,
+        },
+        Some(_) => FallbackDiagnostics {
+            source: "py_compile",
+            diagnostics: Vec::new(),
+            note: Some(format!("syntax OK; {interpreter_note}")),
+            interpreter: interpreter_path,
+            interpreter_source,
+        },
+        None => FallbackDiagnostics {
+            source: "none",
+            diagnostics: Vec::new(),
+            note: Some(format!(
+                "neither ruff nor Python available ({interpreter_note})"
+            )),
+            interpreter: interpreter_path,
+            interpreter_source,
+        },
+    }
+}
+
+/// JS/TS 兜底:`tsc --noEmit`(优先项目 tsconfig,其次单文件)。
+fn run_tsc_fallback(file: &Path, workspace: &Path) -> FallbackDiagnostics {
+    let tsconfig = find_tsconfig(file, workspace);
+    let (args, cwd) = match tsconfig.as_deref() {
+        Some(tsconfig) => (
+            vec![
+                "--noEmit".to_owned(),
+                "-p".to_owned(),
+                tsconfig.display().to_string(),
+            ],
+            tsconfig.parent().unwrap_or(workspace).to_path_buf(),
+        ),
+        None => (
+            vec!["--noEmit".to_owned(), file.display().to_string()],
+            workspace.to_path_buf(),
+        ),
+    };
+
+    match run_check_command("tsc", &args, &cwd, Duration::from_secs(25)) {
+        Some(run) if !run.success || !run.output.trim().is_empty() => FallbackDiagnostics {
+            source: "tsc",
+            diagnostics: vec![json!({ "message": run.output.trim() })],
+            note: None,
+            interpreter: None,
+            interpreter_source: None,
+        },
+        Some(_) => FallbackDiagnostics {
+            source: "tsc",
+            diagnostics: Vec::new(),
+            note: Some("tsc reported no issues".to_owned()),
+            interpreter: None,
+            interpreter_source: None,
+        },
+        None => FallbackDiagnostics {
+            source: "none",
+            diagnostics: Vec::new(),
+            note: Some("tsc unavailable (npm install -g typescript)".to_owned()),
+            interpreter: None,
+            interpreter_source: None,
+        },
+    }
+}
+
+/// 从文件向上找最近的 `tsconfig.json`(限定在工作区内)。
+fn find_tsconfig(file: &Path, workspace: &Path) -> Option<PathBuf> {
+    let mut dir = file.parent()?;
+    loop {
+        let candidate = dir.join("tsconfig.json");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if dir == workspace || !dir.starts_with(workspace) {
+            return None;
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// 有界命令执行结果。
+struct CheckRun {
+    success: bool,
+    output: String,
+}
+
+/// 执行兜底检查命令,带硬超时;命令不存在返回 `None`。
+///
+/// 输出由独立线程读取并通过 channel 汇总,超时直接 kill,避免拖住 turn。
+fn run_check_command(
+    command: &str,
+    args: &[String],
+    cwd: &Path,
+    timeout: Duration,
+) -> Option<CheckRun> {
+    use std::io::Read;
+    use std::sync::mpsc;
+
+    let mut cmd = runtime::sandbox::quiet_command(command);
+    cmd.args(args)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().ok()?;
+
+    let mut stdout = child.stdout.take()?;
+    let mut stderr = child.stderr.take()?;
+    let (sender, receiver) = mpsc::channel::<String>();
+    let stdout_sender = sender.clone();
+    std::thread::spawn(move || {
+        let mut buffer = String::new();
+        let _ = stdout.read_to_string(&mut buffer);
+        let _ = stdout_sender.send(buffer);
+    });
+    std::thread::spawn(move || {
+        let mut buffer = String::new();
+        let _ = stderr.read_to_string(&mut buffer);
+        let _ = sender.send(buffer);
+    });
+
+    let deadline = Instant::now() + timeout;
+    let mut success = false;
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                success = status.success();
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            let _ = child.kill();
+            let _ = child.wait();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let mut output = String::new();
+    for _ in 0..2 {
+        match receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(chunk) => output.push_str(&chunk),
+            Err(_) => break,
+        }
+    }
+    let output = output.trim().to_owned();
+    let output = if timed_out {
+        format!("{output}\n[timeout after {}ms]", timeout.as_millis())
+    } else {
+        output
+    };
+
+    Some(CheckRun { success, output })
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -3707,6 +4198,8 @@ fn run_lsp_diagnostics_for_file(file_path: &Path) -> Option<String> {
         LspAutoDiagOutcome::InstallHint(hint) => python_syntax.or(Some(hint)),
         // 语言不支持/冷却期/等待推送超时:用内置 .py 校验兜底(py 无 server 时常走此分支)。
         LspAutoDiagOutcome::Skip => python_syntax,
+        // turn 已取消:不再追加任何诊断,避免拖慢取消流程。
+        LspAutoDiagOutcome::Cancelled => None,
     }
 }
 
@@ -4977,6 +5470,9 @@ struct LspInput {
     action: String,
     #[serde(default)]
     path: Option<String>,
+    /// 多文件诊断:一次调用同时覆盖多种语言,结果按文件合并返回。
+    #[serde(default)]
+    paths: Option<Vec<String>>,
     #[serde(default)]
     line: Option<u32>,
     #[serde(default)]
@@ -8419,6 +8915,9 @@ pub fn progressive_always_injected_tool_names() -> &'static [&'static str] {
         "edit_file",
         "glob_search",
         "grep_search",
+        // LSP 必须常驻:system prompt 要求"改完代码必须看 LSP 诊断",
+        // 渐进模式下若被延迟,模型只能看到指引却调不到工具。
+        "LSP",
         "ToolSearch",
         "WebSearch",
         "WebFetch",
@@ -10433,9 +10932,10 @@ mod tests {
                 "grep_search",
                 "WebFetch",
                 "WebSearch",
-                "ToolSearch"
+                "ToolSearch",
+                "LSP"
             ],
-            "渐进模式应注入核心集 + ToolSearch/WebSearch/WebFetch: {:?}",
+            "渐进模式应注入核心集 + ToolSearch/WebSearch/WebFetch/LSP: {:?}",
             names
         );
         assert!(
@@ -10462,7 +10962,7 @@ mod tests {
             "激活后应注入 replace_lines: {:?}",
             names
         );
-        assert_eq!(names.len(), 10, "9 常驻 + 1 激活");
+        assert_eq!(names.len(), 11, "10 常驻 + 1 激活");
     }
 
     /// 渐进模式对 runtime(MCP)工具同样生效:默认延迟,激活后注入。

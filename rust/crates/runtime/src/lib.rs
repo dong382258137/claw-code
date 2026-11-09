@@ -491,9 +491,3 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
-
-#[allow(dead_code)]
-fn claw_lsp_probe() -> i32 {
-    let value: i32 = "not an int";
-    value
-}
