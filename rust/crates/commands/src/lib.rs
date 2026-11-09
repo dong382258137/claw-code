@@ -144,8 +144,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "memory",
         aliases: &[],
-        summary: "Inspect loaded Claude instruction memory files",
-        argument_hint: None,
+        summary: "Inspect / review / search / retract persistent memory entries",
+        argument_hint: Some("[list|review [n]|show <n>|search <kw>|rm <n>|undo]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -1156,7 +1156,10 @@ pub enum SlashCommand {
         action: Option<String>,
         target: Option<String>,
     },
-    Memory,
+    Memory {
+        action: Option<String>,
+        target: Option<String>,
+    },
     Init,
     InitForce,
     Diff,
@@ -1486,10 +1489,14 @@ pub fn validate_slash_command_input(
             section: parse_config_section(&args)?,
         },
         "mcp" => parse_mcp_command(&args)?,
-        "memory" => {
-            validate_no_args(command, &args)?;
-            SlashCommand::Memory
-        }
+        "memory" => SlashCommand::Memory {
+            action: args.first().map(|s| s.to_ascii_lowercase()),
+            target: if args.len() > 1 {
+                Some(args[1..].join(" "))
+            } else {
+                None
+            },
+        },
         "init" => {
             validate_no_args(command, &args)?;
             SlashCommand::Init
@@ -4940,7 +4947,7 @@ pub fn handle_slash_command(
         | SlashCommand::Resume { .. }
         | SlashCommand::Config { .. }
         | SlashCommand::Mcp { .. }
-        | SlashCommand::Memory
+        | SlashCommand::Memory { .. }
         | SlashCommand::Init
         | SlashCommand::InitForce
         | SlashCommand::Diff
@@ -5375,7 +5382,10 @@ mod tests {
         );
         assert_eq!(
             SlashCommand::parse("/memory"),
-            Ok(Some(SlashCommand::Memory))
+            Ok(Some(SlashCommand::Memory {
+                action: None,
+                target: None
+            }))
         );
         assert_eq!(SlashCommand::parse("/init"), Ok(Some(SlashCommand::Init)));
         assert_eq!(

@@ -20,9 +20,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::memory_extract::{Basis, Confidence, EntryKind, MemoryOp, OpKind};
 use crate::memory_semantic::SemanticRecaller;
 use crate::memory_store::MemoryStore;
-use crate::session::{ContentBlock, ConversationMessage, MessageRole};
 
 /// Seven days expressed in milliseconds — entries whose `last_verified_at` is
 /// older than this threshold are rendered with an `[unverified]` marker.
@@ -39,16 +39,37 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// 180 天未被召回 / 验证的活跃条目降级归档（R4）。
+pub const ACTIVE_MAX_AGE_MS: i64 = 180 * 24 * 60 * 60 * 1000;
+
+/// 活跃条目硬上限（R4）。超出后按最后触碰时间淘汰最旧条目。
+pub const ACTIVE_MAX_ENTRIES: usize = 100;
+
 /// Derive a stable L1 index id from entry content. Same content → same id,
 /// so duplicate entries collapse to a single L1 slot during dedup. Uses
 /// the std default hasher (no extra dependency) — collision resistance
 /// is sufficient for an in-memory index that is rebuilt on every load.
-fn entry_id(content: &str) -> String {
+pub(crate) fn entry_id(content: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     content.hash(&mut hasher);
     format!("entry-{:016x}", hasher.finish())
+}
+
+/// Shadow entry marker. Every injected view (projection / semantic recall)
+/// must carry it so neither the model nor the user mistakes an unconfirmed
+/// shadow memory for a confirmed one.
+pub const SHADOW_PREFIX: &str = "[影子·未确认]";
+
+/// Render label for a shadow entry (marker + content).
+fn shadow_label(content: &str) -> String {
+    format!("{SHADOW_PREFIX} {content}")
+}
+
+/// Stable id for a shadow entry (derived from the labelled content).
+fn shadow_entry_id(content: &str) -> String {
+    entry_id(&shadow_label(content))
 }
 
 /// One of the three typed memory blocks mirroring Letta's core memory model.
@@ -186,6 +207,27 @@ pub struct MemoryEntry {
     /// verified. Entries older than [`UNVERIFIED_THRESHOLD_MS`] are rendered
     /// with an `[unverified]` marker.
     pub last_verified_at: i64,
+    /// 记忆类别（Phase 1：`UserProfile` 用于 Human 只读投影）。
+    #[serde(default)]
+    pub kind: EntryKind,
+    /// 归一化主体（如 `editor` / `user`），用于 subject+attribute 冲突判定。
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// 归一化属性（如 `indent_style`）。
+    #[serde(default)]
+    pub attribute: Option<String>,
+    /// 提取器给出的置信度。
+    #[serde(default)]
+    pub confidence: Confidence,
+    /// 事实来源：用户自述 / 推断 / 约束。
+    #[serde(default)]
+    pub basis: Basis,
+    /// 该事实累计出现次数（二现门槛）。
+    #[serde(default)]
+    pub evidence_count: u32,
+    /// 最后一次被召回命中的时间（ms），供 180 天降级判定。
+    #[serde(default)]
+    pub last_recalled_at: Option<i64>,
 }
 
 impl MemoryEntry {
@@ -199,6 +241,13 @@ impl MemoryEntry {
             superseded_by: None,
             source: source.into(),
             last_verified_at: now_ms,
+            kind: EntryKind::Fact,
+            subject: None,
+            attribute: None,
+            confidence: Confidence::Medium,
+            basis: Basis::Inferred,
+            evidence_count: 1,
+            last_recalled_at: None,
         }
     }
 
@@ -249,6 +298,15 @@ impl MemoryEntry {
 /// `entries` holds only currently-active facts. Superseded / expired
 /// entries are migrated to `archive` during [`PersistentMemory::consolidate`]
 /// so audit history is preserved without bloating the active view.
+/// 一条撤回记录：按 subject+attribute 拦截重新写入（A4）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetractedSubject {
+    pub subject: String,
+    /// `None` 表示该 subject 下所有 attribute 一律拦截。
+    pub attribute: Option<String>,
+    pub retracted_at: i64,
+}
+
 // Step 2.4: Eq derive 移除 — SemanticRecaller 持有 `HashMap<String, Vec<f32>>` 向量索引,
 // `Vec<f32>` 不 impl Eq(floating-point NaN 问题),导致 SemanticRecaller 也不能 impl Eq。
 // PartialEq 保留,测试用 `assert_eq!` 比较字段而非整体 struct 不受影响。
@@ -263,23 +321,44 @@ pub struct PersistentMemory {
     /// consolidation; oldest entries are dropped first.
     #[serde(default)]
     archive: Vec<MemoryEntry>,
+    /// 已撤回的 subject+attribute（A4：独立集合，不进 entries，避免内容哈希
+    /// 不一致导致去重失效）。
+    #[serde(default)]
+    retracted_subjects: Vec<RetractedSubject>,
+    /// 旧 block 是否已一次性迁移到 entries（R5：迁移后写入冻结）。
+    #[serde(default)]
+    blocks_migrated: bool,
     /// Path of the on-disk JSON file. Not serialized.
     #[serde(skip)]
     file_path: PathBuf,
     /// Snapshot captured at session start. Not serialized.
     #[serde(skip)]
     frozen_snapshot: Option<String>,
-    /// Semantic recall layer (L1 index). Not serialized — rebuilt at
+    /// 语义召回层 (L1 index)。Not serialized — rebuilt at
     /// load time from the entries list. Lives on the memory surface so
     /// the runtime can issue [`PersistentMemory::semantic_recall`] without
     /// juggling a second handle.
     #[serde(skip)]
     semantic: SemanticRecaller,
+    /// `visible` 模式下的影子条目：进内存投影、可召回，但 `#[serde(skip)]`
+    /// 保证永不写入 `memory.json`（重启即消失）。
+    #[serde(skip)]
+    shadow_entries: Vec<MemoryEntry>,
 }
 
 /// Maximum number of archived (superseded / expired) entries to retain
 /// on disk. Older entries are pruned during consolidation to bound growth.
 pub const ARCHIVE_MAX_ENTRIES: usize = 200;
+
+/// 一批 op 的应用结果（供 `/memory` 报告与埋点）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApplyReport {
+    pub applied: usize,
+    pub retracted: usize,
+    pub skipped: usize,
+    pub conflicts: usize,
+    pub evicted: u64,
+}
 
 impl PersistentMemory {
     /// Build an empty memory surface pointing at the given file path.
@@ -297,9 +376,12 @@ impl PersistentMemory {
             blocks: default_blocks(),
             entries: Vec::new(),
             archive: Vec::new(),
+            retracted_subjects: Vec::new(),
+            blocks_migrated: false,
             file_path: file_path.into(),
             frozen_snapshot: None,
             semantic: SemanticRecaller::new(),
+            shadow_entries: Vec::new(),
         };
         memory.frozen_snapshot = Some(memory.render_current());
         memory
@@ -325,10 +407,22 @@ impl PersistentMemory {
             // overwrite the bad file.
             Err(_) => Self::empty(file_path),
         };
+        // R5:旧 Persona/Human/Tasks 块一次性迁移到 entries，之后 block 写入冻结。
+        memory.migrate_blocks_once();
+        // 崩溃回放：apply 只写内存 + 追加日志，全量快照在边界落盘后才清空日志。
+        // 回放是幂等的（内容去重 + subject supersede），重复回放不会产生重复条目。
+        let pending = crate::memory_extract::load_pending_ops(
+            &crate::memory_extract::journal_path_for(file_path),
+        );
+        if !pending.is_empty() {
+            memory.apply_ops(&pending, ACTIVE_MAX_ENTRIES);
+        }
+        // R4:启动时执行遗忘规则（180 天降级 + active 上限）。
+        let now = now_ms();
+        memory.enforce_limits(now, ACTIVE_MAX_ENTRIES);
         // Rebuild semantic L1 index from entries. Only active entries are
         // indexed — superseded / expired ones are in `archive` and not
         // useful for recall.
-        let now = now_ms();
         let mut recaller = SemanticRecaller::new();
         for entry in &memory.entries {
             if entry.is_active(now) {
@@ -393,6 +487,38 @@ impl PersistentMemory {
     /// Returns an error for unknown labels.
     pub fn update_block(&mut self, label: &str, content: &str) -> Result<String, String> {
         let normalized = label.trim().to_ascii_lowercase();
+        if !matches!(normalized.as_str(), "persona" | "human" | "tasks") {
+            return Err(format!(
+                "unknown memory block '{label}': expected one of persona / human / tasks"
+            ));
+        }
+        // R5:迁移后 block 写入冻结 —— 统一写入 entries（Human 由只读投影渲染），
+        // 避免块与条目形成两个真相源。
+        if self.blocks_migrated {
+            let op = MemoryOp {
+                op: OpKind::Upsert,
+                kind: if normalized == "human" {
+                    EntryKind::UserProfile
+                } else {
+                    EntryKind::Fact
+                },
+                subject: Some(normalized.clone()),
+                attribute: None,
+                content: content.trim().to_string(),
+                confidence: Confidence::High,
+                source: "memory_update:block".to_string(),
+                explicit: true,
+                basis: Basis::UserStated,
+                ..MemoryOp::default()
+            };
+            let report = self.apply_ops(std::slice::from_ref(&op), ACTIVE_MAX_ENTRIES);
+            // turn 路径不落全量快照：写入追加日志，边界 flush 后清空。
+            crate::memory_extract::append_journal(&self.file_path, std::slice::from_ref(&op));
+            return Ok(format!(
+                "memory block '{normalized}' 已冻结，写入 entries（Human 为只读投影）；applied={} skipped={}.",
+                report.applied, report.skipped
+            ));
+        }
         // 在块借用期间完成替换,提取标量结果后结束借用,再持久化(避免
         // block 可变借用与 persist_or_warn 的 &self 冲突)。
         let (block_label, max, written, truncated) = {
@@ -484,12 +610,111 @@ impl PersistentMemory {
     fn render_current(&self) -> String {
         let mut sections = Vec::new();
         sections.push("# Persistent Memory".to_string());
-        sections.push(self.render_blocks());
-        let active: Vec<&MemoryEntry> = self.active_entries(now_ms());
+        let blocks = self.render_blocks();
+        if !blocks.is_empty() {
+            sections.push(blocks);
+        }
+        // R5:Human 槽只做 entries 的只读投影；被投影命中的条目不再重复出现在
+        // Active facts 段，避免同一条偏好注入两次。
+        let projection = self.render_projection();
+        if !projection.is_empty() {
+            sections.push(projection);
+        }
+        let active: Vec<&MemoryEntry> = self
+            .active_entries(now_ms())
+            .into_iter()
+            .filter(|entry| entry.kind != EntryKind::UserProfile)
+            .collect();
         if !active.is_empty() {
             sections.push(render_entries(&active, now_ms()));
         }
         sections.join("\n\n")
+    }
+
+    /// Human 槽的只读投影：仅由 `EntryKind::UserProfile` 的活跃条目生成。
+    ///
+    /// `visible` 模式的影子条目追加在 `## Shadow (unconfirmed)` 段，每条都带
+    /// [`SHADOW_PREFIX`] 标记，不得静默混入已确认记忆。
+    #[must_use]
+    pub fn render_projection(&self) -> String {
+        let now = now_ms();
+        let mut lines = Vec::new();
+        for entry in &self.entries {
+            if entry.is_active(now) && entry.kind == EntryKind::UserProfile {
+                lines.push(format!("- {}", entry.content));
+            }
+        }
+        let mut out = if lines.is_empty() {
+            String::new()
+        } else {
+            format!("## Human\n{}", lines.join("\n"))
+        };
+        if !self.shadow_entries.is_empty() {
+            let mut shadow = String::from("## Shadow (unconfirmed)\n");
+            for entry in &self.shadow_entries {
+                shadow.push_str(&format!("- {}\n", shadow_label(&entry.content)));
+            }
+            if out.is_empty() {
+                out = shadow.trim_end().to_string();
+            } else {
+                out.push_str("\n\n");
+                out.push_str(shadow.trim_end());
+            }
+        }
+        out
+    }
+
+    /// 影子条目（`visible` 模式；仅供 `/memory` 审阅与撤销）。
+    #[must_use]
+    pub fn shadow_entries(&self) -> &[MemoryEntry] {
+        &self.shadow_entries
+    }
+
+    /// 撤销第 `index`（0 基）条影子条目；返回被移除的条目。
+    pub fn remove_shadow_entry(&mut self, index: usize) -> Option<MemoryEntry> {
+        if index < self.shadow_entries.len() {
+            Some(self.shadow_entries.remove(index))
+        } else {
+            None
+        }
+    }
+
+    /// 旧 Persona/Human/Tasks 块一次性迁移进 entries（R5），迁移后
+    /// [`PersistentMemory::update_block`] 走冻结路径。
+    ///
+    /// 返回是否发生了迁移。失败时仍然置位 `blocks_migrated`，避免每次加载
+    /// 重复尝试。
+    pub fn migrate_blocks_once(&mut self) -> bool {
+        if self.blocks_migrated {
+            return false;
+        }
+        let now = now_ms();
+        let mut migrated: Vec<MemoryEntry> = Vec::new();
+        for block in &self.blocks {
+            let label = block.label().to_ascii_lowercase();
+            for line in block.content().lines() {
+                let text = line.trim().trim_start_matches(['-', '*']).trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let mut entry = MemoryEntry::new(text.to_string(), "block-migration", now);
+                entry.kind = if label == "human" {
+                    EntryKind::UserProfile
+                } else {
+                    EntryKind::Fact
+                };
+                entry.subject = Some(label.clone());
+                entry.basis = Basis::UserStated;
+                migrated.push(entry);
+            }
+        }
+        for block in &mut self.blocks {
+            block.replace_content(String::new());
+        }
+        self.entries.extend(migrated);
+        self.blocks_migrated = true;
+        self.persist_or_warn("migrate_blocks");
+        true
     }
 
     /// Render the three typed blocks in fixed order (Persona → Human → Tasks).
@@ -643,13 +868,365 @@ impl PersistentMemory {
                 compress_block_content(block);
             }
         }
+        // 不再在 consolidate 内落盘：turn 路径禁止全量文件写，边界统一 flush。
+    }
 
-        self.persist_or_warn("consolidate");
+    /// 一批 op 的应用结果（供 `/memory` 报告与埋点）。
+    /// 应用 worker 产出的 op（R2：**纯内存**，不做 embedding、不做全量落盘）。
+    ///
+    /// turn 路径上不允许出现全量文件写：持久化统一由
+    /// [`PersistentMemory::flush`] 在会话边界执行，崩溃由追加日志回放兜底。
+    ///
+    /// 顺序：脱敏（调用方已做）→ L1 精确去重 → L3 同 subject Jaccard 去重 →
+    /// subject+attribute 冲突 supersede → 旧式短语冲突（`detect_conflicts`）→
+    /// 遗忘规则 → `consolidate`。
+    pub fn apply_ops(&mut self, ops: &[MemoryOp], max_active: usize) -> ApplyReport {
+        let now = now_ms();
+        let mut report = ApplyReport::default();
+        for op in ops {
+            if op.shadow {
+                if self.apply_shadow_op(op, now, &mut report) {
+                    report.applied += 1;
+                }
+                continue;
+            }
+            if op.op == OpKind::Retract {
+                if self.apply_retract(op, now) {
+                    report.retracted += 1;
+                } else {
+                    report.skipped += 1;
+                }
+                continue;
+            }
+            if self.apply_upsert(op, now, &mut report) {
+                report.applied += 1;
+            }
+        }
+        report.evicted = self.enforce_limits(now, max_active);
+        // R3:遗忘（consolidate）与冲突检测（detect_conflicts）的原生产调用点
+        // 在 nudge 块内；nudge 删除后由本入口接管，不得丢失。
+        if report.evicted > 0 || self.needs_consolidation() {
+            self.consolidate();
+        }
+        report
+    }
+
+    /// 影子 op：只进内存投影（可召回），不参与持久化。
+    fn apply_shadow_op(&mut self, op: &MemoryOp, now: i64, report: &mut ApplyReport) -> bool {
+        if op.op == OpKind::Retract {
+            let before = self.shadow_entries.len();
+            self.shadow_entries.retain(|entry| {
+                let subject_hit = op
+                    .subject
+                    .as_deref()
+                    .is_some_and(|subject| entry.subject.as_deref() == Some(subject));
+                let target_hit = op
+                    .target
+                    .as_deref()
+                    .is_some_and(|target| entry.content.contains(target));
+                !(subject_hit || target_hit)
+            });
+            if self.shadow_entries.len() < before {
+                report.retracted += 1;
+                return true;
+            }
+            report.skipped += 1;
+            return false;
+        }
+        let content = op.content.trim();
+        if content.is_empty() || self.is_retracted(op.subject.as_deref(), op.attribute.as_deref()) {
+            report.skipped += 1;
+            return false;
+        }
+        let exact_dup = self
+            .entries
+            .iter()
+            .chain(self.shadow_entries.iter())
+            .any(|entry| entry.is_active(now) && entry.content == content);
+        if exact_dup {
+            report.skipped += 1;
+            return false;
+        }
+        if let Some(subject) = op.subject.as_deref() {
+            let near_dup = self
+                .entries
+                .iter()
+                .chain(self.shadow_entries.iter())
+                .any(|entry| {
+                    entry.is_active(now)
+                        && entry.subject.as_deref() == Some(subject)
+                        && jaccard_similarity(&entry.content, content) > 0.95
+                });
+            if near_dup {
+                report.skipped += 1;
+                return false;
+            }
+        }
+        let mut entry = MemoryEntry::new(content.to_string(), "shadow", now);
+        entry.kind = op.kind;
+        entry.subject = op.subject.clone();
+        entry.attribute = op.attribute.clone();
+        entry.confidence = op.confidence;
+        entry.basis = op.basis;
+        entry.evidence_count = op.evidence_count.max(1);
+        if let (Some(subject), Some(attribute)) = (op.subject.as_deref(), op.attribute.as_deref()) {
+            report.conflicts += self
+                .entries
+                .iter()
+                .filter(|existing| {
+                    existing.is_active(now)
+                        && existing.subject.as_deref() == Some(subject)
+                        && existing.attribute.as_deref() == Some(attribute)
+                })
+                .count();
+        }
+        // 影子条目也进 L1 索引，但内容带可辨识前缀，召回注入时人和模型都能看出
+        // 它尚未被确认（`/memory rm` 可当场撤销）。
+        self.semantic
+            .add_l1_entry(&shadow_entry_id(content), &shadow_label(content), "shadow");
+        self.shadow_entries.push(entry);
+        true
+    }
+
+    fn apply_upsert(&mut self, op: &MemoryOp, now: i64, report: &mut ApplyReport) -> bool {
+        let content = op.content.trim();
+        if content.is_empty() {
+            report.skipped += 1;
+            return false;
+        }
+        if self.is_retracted(op.subject.as_deref(), op.attribute.as_deref()) {
+            report.skipped += 1;
+            return false;
+        }
+        // L1：内容完全相同的活跃条目 → 刷新验证时间，不重复插入。
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_active(now) && entry.content == content)
+        {
+            existing.last_verified_at = now;
+            existing.evidence_count = existing.evidence_count.saturating_add(1);
+            return true;
+        }
+        // L3：同 subject 下语义近重复（>0.95）跳过，避免脑补改写。
+        if let Some(subject) = op.subject.as_deref() {
+            let near_dup = self.entries.iter().any(|entry| {
+                entry.is_active(now)
+                    && entry.subject.as_deref() == Some(subject)
+                    && jaccard_similarity(&entry.content, content) > 0.95
+            });
+            if near_dup {
+                report.skipped += 1;
+                return false;
+            }
+        }
+
+        let mut new_entry = MemoryEntry::new(content.to_string(), op.source.clone(), now);
+        new_entry.kind = op.kind;
+        new_entry.subject = op.subject.clone();
+        new_entry.attribute = op.attribute.clone();
+        new_entry.confidence = op.confidence;
+        new_entry.basis = op.basis;
+        new_entry.evidence_count = op.evidence_count.max(1);
+
+        // subject+attribute 命中 → 旧条目 supersede（upsert 语义）。
+        let mut conflicts: Vec<usize> = Vec::new();
+        if let (Some(subject), Some(attribute)) = (op.subject.as_deref(), op.attribute.as_deref()) {
+            for (idx, entry) in self.entries.iter().enumerate() {
+                if entry.is_active(now)
+                    && entry.subject.as_deref() == Some(subject)
+                    && entry.attribute.as_deref() == Some(attribute)
+                {
+                    conflicts.push(idx);
+                }
+            }
+        }
+        // R3：保留旧式短语冲突检测（偏好/always 等），确保删 nudge 后不丢失。
+        conflicts.extend(detect_conflicts(&new_entry, &self.entries));
+        conflicts.sort_unstable();
+        conflicts.dedup();
+        report.conflicts += conflicts.len();
+        for idx in conflicts {
+            if let Some(entry) = self.entries.get_mut(idx) {
+                entry.supersede(content.to_string(), now);
+            }
+        }
+
+        let id = entry_id(content);
+        self.semantic.add_l1_entry(&id, content, &new_entry.source);
+        self.entries.push(new_entry);
+        true
+    }
+
+    fn apply_retract(&mut self, op: &MemoryOp, now: i64) -> bool {
+        if let Some(subject) = op.subject.as_deref() {
+            let attribute = op.attribute.clone();
+            self.retracted_subjects.push(RetractedSubject {
+                subject: subject.to_string(),
+                attribute: attribute.clone(),
+                retracted_at: now,
+            });
+            let mut removed = 0usize;
+            let mut kept = Vec::with_capacity(self.entries.len());
+            for mut entry in std::mem::take(&mut self.entries) {
+                let hits_attribute = match attribute.as_deref() {
+                    Some(attr) => entry.attribute.as_deref() == Some(attr),
+                    None => true,
+                };
+                if entry.is_active(now)
+                    && entry.subject.as_deref() == Some(subject)
+                    && hits_attribute
+                {
+                    entry.supersede(format!("retracted:{subject}"), now);
+                    self.archive.push(entry);
+                    removed += 1;
+                } else {
+                    kept.push(entry);
+                }
+            }
+            self.entries = kept;
+            return removed > 0;
+        }
+        if let Some(target) = op.target.as_deref() {
+            return self.remove_entry(target);
+        }
+        false
+    }
+
+    /// 是否命中撤回集合（R4/A4：subject+attribute 拦截，挡得住重抽）。
+    #[must_use]
+    pub fn is_retracted(&self, subject: Option<&str>, attribute: Option<&str>) -> bool {
+        let Some(subject) = subject else {
+            return false;
+        };
+        self.retracted_subjects.iter().any(|retracted| {
+            retracted.subject == subject
+                && match (&retracted.attribute, attribute) {
+                    (None, _) => true,
+                    (Some(a), Some(b)) => a == b,
+                    (Some(_), None) => false,
+                }
+        })
+    }
+
+    /// 遗忘硬规则（R4）：180 天未召回/验证降级归档 + active 上限淘汰。
+    ///
+    /// 返回本次降级/淘汰的条目数。执行点：`apply_ops`、`load_and_freeze`、
+    /// `on_memory_boundary`（经 `apply_ops`/显式调用）。
+    pub fn enforce_limits(&mut self, now: i64, max_active: usize) -> u64 {
+        let mut evicted = 0u64;
+        let mut kept = Vec::with_capacity(self.entries.len());
+        for mut entry in std::mem::take(&mut self.entries) {
+            let last_touch = entry
+                .last_recalled_at
+                .unwrap_or(entry.last_verified_at)
+                .max(entry.last_verified_at)
+                .max(entry.valid_from);
+            if entry.is_active(now) && now - last_touch > ACTIVE_MAX_AGE_MS {
+                entry.supersede("ttl:180d", now);
+                self.archive.push(entry);
+                evicted += 1;
+            } else {
+                kept.push(entry);
+            }
+        }
+        self.entries = kept;
+
+        if self.entries.len() > max_active {
+            let mut active = std::mem::take(&mut self.entries);
+            active.sort_by_key(|entry| {
+                entry
+                    .last_recalled_at
+                    .unwrap_or(entry.last_verified_at)
+                    .max(entry.valid_from)
+            });
+            let drop_count = active.len() - max_active;
+            for mut entry in active.drain(0..drop_count) {
+                entry.supersede("cap:active", now);
+                self.archive.push(entry);
+                evicted += 1;
+            }
+            self.entries = active;
+        }
+        evicted
+    }
+
+    /// 边界巩固（R1）：执行遗忘规则，必要时 consolidate。
+    ///
+    /// 只做内存操作与落盘，不做 embedding、不调用 LLM；失败静默。
+    pub fn sweep(&mut self) -> u64 {
+        let now = now_ms();
+        let evicted = self.enforce_limits(now, ACTIVE_MAX_ENTRIES);
+        if evicted > 0 || self.needs_consolidation() {
+            self.consolidate();
+        }
+        evicted
+    }
+
+    /// 撤销最近一次撤回（`/memory undo`）：移除墓碑，允许该事实重新写入。
+    pub fn unretract_last(&mut self) -> Option<RetractedSubject> {
+        let removed = self.retracted_subjects.pop();
+        if removed.is_some() {
+            self.persist_or_warn("unretract");
+        }
+        removed
+    }
+
+    /// 撤回集合（`/memory` 审查面展示用）。
+    #[must_use]
+    pub fn retracted_subjects(&self) -> &[RetractedSubject] {
+        &self.retracted_subjects
+    }
+
+    /// 审阅用：这条 op 若此刻生效，会被判成"新增 / 去重 / 覆盖 / 拦截"。
+    #[must_use]
+    pub fn preview_op(&self, op: &MemoryOp) -> String {
+        let now = now_ms();
+        if self.is_retracted(op.subject.as_deref(), op.attribute.as_deref()) {
+            return "拦截（subject 已撤回）".to_string();
+        }
+        if op.op == OpKind::Retract {
+            return match op.subject.as_deref() {
+                Some(subject) => format!("撤回（subject={subject}）"),
+                None => "撤回（按 target 匹配）".to_string(),
+            };
+        }
+        let content = op.content.trim();
+        if let Some(existing) = self
+            .entries
+            .iter()
+            .find(|entry| entry.is_active(now) && entry.content == content)
+        {
+            return format!("去重（已存在：{}）", existing.content);
+        }
+        if let (Some(subject), Some(attribute)) = (op.subject.as_deref(), op.attribute.as_deref()) {
+            let conflicts = self
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.is_active(now)
+                        && entry.subject.as_deref() == Some(subject)
+                        && entry.attribute.as_deref() == Some(attribute)
+                })
+                .count();
+            if conflicts > 0 {
+                return format!("覆盖（与 {conflicts} 条同 subject+attribute 条目冲突）");
+            }
+        }
+        "新增".to_string()
     }
 
     /// Persist the current in-memory state to disk.
     fn persist(&self) -> std::io::Result<()> {
         MemoryStore::new(self.file_path.clone()).save(self)
+    }
+
+    /// 边界全量落盘：会话切换 / 进程退出 / serve worker 回收时调用。
+    ///
+    /// turn 路径上的 `apply_ops` 只改内存；崩溃后由追加日志回放兜底。
+    /// 影子条目是 `#[serde(skip)]`，不会被写入。
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        self.persist()
     }
 
     /// Persist and surface failures via stderr instead of silently
@@ -722,6 +1299,15 @@ impl PersistentMemory {
     /// matched `pattern`.
     pub fn remove_entry(&mut self, pattern: &str) -> bool {
         let now = now_ms();
+        // 影子条目优先按内容撤销（`/memory rm` 当场否掉影子记忆）。
+        if let Some(idx) = self
+            .shadow_entries
+            .iter()
+            .position(|entry| entry.content.contains(pattern))
+        {
+            self.shadow_entries.remove(idx);
+            return true;
+        }
         let mut found_idx: Option<usize> = None;
         for (idx, entry) in self.entries.iter().enumerate() {
             if entry.is_active(now) && entry.content.contains(pattern) {
@@ -776,6 +1362,34 @@ fn dedup_latest(entries: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
     }
     deduped.reverse();
     deduped
+}
+
+/// 归一化字符二元组 Jaccard 相似度（A6：只用于同 subject 内 >0.95 的跳过判定）。
+fn jaccard_similarity(a: &str, b: &str) -> f64 {
+    use std::collections::HashSet;
+    fn bigrams(text: &str) -> HashSet<String> {
+        let chars: Vec<char> = text
+            .chars()
+            .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
+            .flat_map(char::to_lowercase)
+            .collect();
+        if chars.len() < 2 {
+            return chars.into_iter().map(|c| c.to_string()).collect();
+        }
+        chars.windows(2).map(|pair| pair.iter().collect()).collect()
+    }
+    let left = bigrams(a);
+    let right = bigrams(b);
+    if left.is_empty() && right.is_empty() {
+        return if a == b { 1.0 } else { 0.0 };
+    }
+    let intersection = left.intersection(&right).count();
+    let union = left.union(&right).count();
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
 }
 
 /// Detect entries that conflict with a proposed new entry.
@@ -918,370 +1532,6 @@ fn compress_block_content(block: &mut MemoryBlock) {
     let truncated: String = content.chars().take(keep).collect();
     let compressed = format!("{truncated}\n… [memory block compressed]");
     block.replace_content(compressed);
-}
-
-/// Configuration for periodic memory curation (P3-11).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NudgeConfig {
-    /// Number of turns between nudge evaluations.
-    pub interval_turns: usize,
-    /// How many recent turns to scan for candidate facts.
-    pub lookback_turns: usize,
-    /// Maximum number of actions returned per nudge.
-    pub max_entries_per_nudge: usize,
-}
-
-impl Default for NudgeConfig {
-    fn default() -> Self {
-        Self {
-            interval_turns: 5,
-            lookback_turns: 3,
-            max_entries_per_nudge: 3,
-        }
-    }
-}
-
-/// One curation action proposed by the rule-based nudge extractor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NudgeAction {
-    /// Append a brand-new fact.
-    Add { content: String, source: String },
-    /// Replace an existing fact matching `old_pattern` with `new_content`.
-    Replace {
-        old_pattern: String,
-        new_content: String,
-        source: String,
-    },
-    /// Remove any fact whose content matches `pattern`.
-    Remove {
-        pattern: String,
-        /// Provenance tag for telemetry / debugging.
-        source: String,
-    },
-}
-
-/// Decide whether a nudge should fire this turn.
-#[must_use]
-pub fn should_nudge(turns_since_last_nudge: usize, config: &NudgeConfig) -> bool {
-    turns_since_last_nudge >= config.interval_turns
-}
-
-/// Trigger phrases that signal a correction to a previously held fact.
-const CORRECTION_PHRASES: &[&str] = &[
-    "no, i meant",
-    "actually,",
-    "correction:",
-    "don't do that",
-    "i meant",
-    "不对",
-    "我意思是",
-    "更正",
-];
-
-/// Trigger keywords that signal an explicit memory request.
-const REMEMBER_KEYWORDS: &[&str] = &[
-    "remember", "记住", "prefer", "always", "never", "不要", "总是", "永恒",
-];
-
-/// Trigger keywords that signal a request to forget / retire a fact.
-/// Matches produce [`NudgeAction::Remove`]. Like corrections, the actual
-/// retired entry is resolved via content match — the keyword itself is
-/// not used as the pattern.
-const FORGET_KEYWORDS: &[&str] = &["forget", "忘记", "别再记住", "stop remembering"];
-
-/// Extract candidate curation actions from the most recent conversation turns.
-///
-/// Rule-based only — no LLM fork. Three passes (highest priority first):
-/// 1. Forget keywords (`forget`, `忘记`, …). For each, the post-keyword
-///    text is used as a content pattern to retire a matching active entry.
-///    Emits [`NudgeAction::Remove`].
-/// 2. Correction phrases (`no, I meant`, `actually`, …). For each,
-///    build a candidate [`MemoryEntry`] from the post-phrase text and call
-///    [`PersistentMemory::detect_conflicts`] to find the actual prior entry
-///    that contradicts the new statement. If a conflict is found, emit a
-///    [`NudgeAction::Replace`] whose `old_pattern` is the real old entry's
-///    content — so [`PersistentMemory::replace_entry`] can supersede it.
-///    If no conflict is found (e.g. correction without a prior fact), fall
-///    back to [`NudgeAction::Add`].
-/// 3. Explicit memory keywords (`remember`, `prefer`, `always`,
-///    `never`, …). These produce [`NudgeAction::Add`] suggestions. Before
-///    adding, we also check `detect_conflicts` so a contradicting keyword
-///    (e.g. `prefer light mode` while an existing entry says `prefer dark
-///    mode`) supersedes the old fact instead of producing two active
-///    contradictions on disk.
-///
-/// At most `config.max_entries_per_nudge` actions are returned, prioritising
-/// forgets, then corrections, then adds.
-#[must_use]
-pub fn extract_nudge_actions(
-    recent_messages: &[ConversationMessage],
-    existing_memory: &PersistentMemory,
-    config: &NudgeConfig,
-) -> Vec<NudgeAction> {
-    let mut actions = Vec::new();
-    let max = config.max_entries_per_nudge;
-    let now = now_ms();
-
-    let mut scanned = 0usize;
-    for msg in recent_messages.iter().rev() {
-        if scanned >= config.lookback_turns {
-            break;
-        }
-        if msg.role != MessageRole::User {
-            continue;
-        }
-        scanned += 1;
-        let text = collect_user_text(msg);
-        if text.is_empty() {
-            continue;
-        }
-        let lower = text.to_lowercase();
-
-        // 1. Forget keywords — highest priority.
-        for keyword in FORGET_KEYWORDS {
-            if lower.contains(keyword) {
-                let pattern = extract_after_phrase(&text, keyword).trim().to_string();
-                if !pattern.is_empty() {
-                    // Only emit Remove if an active entry actually matches
-                    // the pattern — otherwise the action would be a no-op.
-                    let matches = existing_memory
-                        .entries()
-                        .iter()
-                        .any(|e| e.is_active(now) && e.content.contains(&pattern));
-                    if matches {
-                        actions.push(NudgeAction::Remove {
-                            pattern,
-                            source: "nudge-forget".to_string(),
-                        });
-                        if actions.len() >= max {
-                            return actions;
-                        }
-                    }
-                }
-                break; // one forget keyword per message
-            }
-        }
-
-        // 2. Corrections — second priority. Multiple correction phrases may
-        //    fire on the same message (e.g. "No, I meant …" matches both
-        //    "no, i meant" and "i meant"); break after the first match to
-        //    avoid emitting duplicate actions for the same user turn.
-        //    A correction also subsumes any later "remember"/"prefer"
-        //    keyword in the same message — the correction phrase already
-        //    captured the user's intent.
-        let mut correction_emitted = false;
-        for phrase in CORRECTION_PHRASES {
-            if lower.contains(phrase) {
-                let content = extract_after_phrase(&text, phrase).trim().to_string();
-                if content.is_empty() {
-                    continue;
-                }
-                let new_entry = MemoryEntry::new(content.clone(), "nudge-correction", now);
-                let conflicts = existing_memory.detect_conflicts(&new_entry);
-                if let Some(&idx) = conflicts.first() {
-                    // Real prior fact found — supersede it.
-                    let old_content = existing_memory.entries()[idx].content.clone();
-                    actions.push(NudgeAction::Replace {
-                        old_pattern: old_content,
-                        new_content: content,
-                        source: "nudge-correction".to_string(),
-                    });
-                } else {
-                    // No prior fact to correct — treat as a fresh add.
-                    actions.push(NudgeAction::Add {
-                        content,
-                        source: "nudge-correction".to_string(),
-                    });
-                }
-                correction_emitted = true;
-                if actions.len() >= max {
-                    return actions;
-                }
-                break; // one correction per message
-            }
-        }
-        if correction_emitted {
-            continue; // next message — keyword pass subsumed by correction
-        }
-
-        // 3. Explicit memory keywords — lowest priority.
-        for keyword in REMEMBER_KEYWORDS {
-            if lower.contains(keyword) {
-                let content = extract_after_phrase(&text, keyword).trim().to_string();
-                if !content.is_empty() {
-                    let new_entry = MemoryEntry::new(content.clone(), "nudge-keyword", now);
-                    let conflicts = existing_memory.detect_conflicts(&new_entry);
-                    if let Some(&idx) = conflicts.first() {
-                        let old_content = existing_memory.entries()[idx].content.clone();
-                        actions.push(NudgeAction::Replace {
-                            old_pattern: old_content,
-                            new_content: content,
-                            source: "nudge-keyword".to_string(),
-                        });
-                    } else {
-                        actions.push(NudgeAction::Add {
-                            content,
-                            source: "nudge-keyword".to_string(),
-                        });
-                    }
-                    if actions.len() >= max {
-                        return actions;
-                    }
-                }
-                break; // one keyword per message
-            }
-        }
-    }
-
-    actions
-}
-
-/// Concatenate every text block from a user message into one string.
-fn collect_user_text(message: &ConversationMessage) -> String {
-    let mut buf = String::new();
-    for block in &message.blocks {
-        if let ContentBlock::Text { text } = block {
-            if !buf.is_empty() {
-                buf.push('\n');
-            }
-            buf.push_str(text);
-        }
-    }
-    buf
-}
-
-/// Return the substring following the first occurrence of `phrase`.
-///
-/// Used to lift the actionable content out of trigger phrases like
-/// "remember I prefer dark mode" — returns "I prefer dark mode". Returns an
-/// empty string when the phrase is not found.
-fn extract_after_phrase(text: &str, phrase: &str) -> String {
-    let lower = text.to_lowercase();
-    let Some(start) = lower.find(phrase) else {
-        return String::new();
-    };
-    let after = start + phrase.len();
-    text.get(after..)
-        .unwrap_or("")
-        .trim_start_matches([':', ' '])
-        .to_string()
-}
-
-// ===== Q5(2026-10-13):逐轮用户风格/偏好观察 =====
-//
-// 用户诉求:「提取我的每一次发言，从中理解我的喜好和风格，并固化到记忆中」。
-// 既有 `extract_nudge_actions` 只在「显式记忆关键词」(remember/prefer/记住…)
-// 命中且有 5 轮节流时才动作,覆盖不到**每一条发言**的风格信号。本模块补一条
-// **纯确定性**(零 LLM 调用 ⇒ 零成本、可单测、可每轮运行)的观察通道:
-// 对每条 user 消息做模式匹配,产出短小风格事实,去重后写入记忆
-// (source = "style-observer")。写入遵循既有 frozen-snapshot 语义:
-// 本会话经语义召回可见,下个会话进入 system 前缀,不扰动当前前缀缓存。
-
-/// 从单条用户发言中提取确定性的喜好/风格信号(零 LLM)。
-///
-/// 返回短小、可直接持久化为记忆条目的风格事实;无信号时返回空 vec。
-/// 只做**保守**判定(高质量信号优于数量),避免把噪音写进长期记忆。
-#[must_use]
-pub fn extract_style_signals(text: &str) -> Vec<String> {
-    let mut signals = Vec::new();
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return signals;
-    }
-    let lower = trimmed.to_lowercase();
-    let contains_any = |keys: &[&str]| keys.iter().any(|k| lower.contains(k));
-
-    // 1. 语言偏好:CJK 存在 ⇒ 用户以中文交流,默认用中文回复。
-    if trimmed
-        .chars()
-        .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
-    {
-        signals.push("user writes in Chinese; reply in Chinese by default".to_string());
-    }
-
-    // 2. 简洁 vs 详尽。
-    if contains_any(&[
-        "简洁",
-        "简短",
-        "精简",
-        "别啰嗦",
-        "concise",
-        "be brief",
-        "keep it short",
-    ]) {
-        signals.push("user prefers concise, to-the-point answers".to_string());
-    }
-    if contains_any(&[
-        "详细",
-        "展开",
-        "具体说明",
-        "逐条",
-        "in detail",
-        "elaborate",
-        "explain fully",
-    ]) {
-        signals.push("user wants thorough, detailed explanations".to_string());
-    }
-
-    // 3. 结构化输出偏好。
-    if contains_any(&["表格", "列表", "清单", "table", "bullet"]) {
-        signals.push("user likes structured output (tables/lists)".to_string());
-    }
-
-    // 4. 自主性:用户明确表示不要被反问。
-    if contains_any(&[
-        "不要问我",
-        "别问我",
-        "自行决策",
-        "自己决定",
-        "don't ask me",
-        "decide yourself",
-        "no questions",
-    ]) {
-        signals
-            .push("user wants autonomous decisions — do not ask, decide and proceed".to_string());
-    }
-
-    // 5. 严谨性:第一性原理 / 权威来源。
-    if contains_any(&["第一性原理", "first principle"]) {
-        signals.push("user values first-principles reasoning".to_string());
-    }
-    if contains_any(&[
-        "论文",
-        "权威",
-        "引用",
-        "paper",
-        "citation",
-        "cite",
-        "reference",
-    ]) {
-        signals.push("user expects authoritative sources/citations for claims".to_string());
-    }
-
-    signals
-}
-
-/// 把逐轮风格信号折入记忆:仅添加**尚未记录**的信号(按活跃条目的内容精确
-/// 去重,含 source=`style-observer` 的历史写入),返回新增条目数。
-///
-/// 传入的 `texts` 通常是最近若干条 user 发言(至少含本轮发言)。零副作用于
-/// 已存在信号 ⇒ 重复发言不会无限膨胀记忆。
-pub fn observe_user_style(memory: &mut PersistentMemory, texts: &[String]) -> usize {
-    let now = now_ms();
-    let mut added = 0usize;
-    for text in texts {
-        for signal in extract_style_signals(text) {
-            let exists = memory
-                .entries()
-                .iter()
-                .any(|entry| entry.is_active(now) && entry.content == signal);
-            if !exists {
-                memory.add_entry(&signal, "style-observer");
-                added += 1;
-            }
-        }
-    }
-    added
 }
 
 #[cfg(test)]
@@ -1656,225 +1906,6 @@ mod tests {
     // --- P3-11: Periodic nudge ------------------------------------------
 
     #[test]
-    fn should_nudge_returns_true_after_interval() {
-        let cfg = NudgeConfig::default();
-        assert!(!should_nudge(cfg.interval_turns - 1, &cfg));
-        assert!(should_nudge(cfg.interval_turns, &cfg));
-        assert!(should_nudge(cfg.interval_turns + 5, &cfg));
-    }
-
-    #[test]
-    fn extract_nudge_actions_detects_remember_keyword() {
-        let mem = PersistentMemory::empty(temp_path());
-        let cfg = NudgeConfig::default();
-        let msgs = vec![ConversationMessage::user_text(
-            "Remember I prefer dark mode for code review",
-        )];
-        let actions = extract_nudge_actions(&msgs, &mem, &cfg);
-        assert!(!actions.is_empty());
-        match &actions[0] {
-            NudgeAction::Add { content, .. } => {
-                assert!(content.contains("dark mode"));
-            }
-            other => panic!("expected Add action, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn extract_nudge_actions_detects_correction() {
-        // Pre-seed a contradicting fact so the correction has a real
-        // target to supersede. With no prior fact, the correction would
-        // fall back to Add (no prior fact to correct).
-        let path = temp_path();
-        let mut mem = PersistentMemory::empty(&path);
-        mem.add_entry("user prefers dark mode", "seed");
-        let cfg = NudgeConfig::default();
-        let msgs = vec![ConversationMessage::user_text(
-            "No, I meant I prefer light mode",
-        )];
-        let actions = extract_nudge_actions(&msgs, &mem, &cfg);
-        assert!(!actions.is_empty());
-        match &actions[0] {
-            NudgeAction::Replace {
-                old_pattern,
-                new_content,
-                ..
-            } => {
-                assert!(new_content.contains("light mode"));
-                // old_pattern must point at the real prior entry content,
-                // NOT at the trigger phrase "no, i meant" (B1 regression guard).
-                assert!(
-                    old_pattern.contains("dark mode"),
-                    "old_pattern should reference the superseded fact, got: {old_pattern}"
-                );
-                assert_ne!(old_pattern, "no, i meant");
-            }
-            other => panic!("expected Replace action, got {other:?}"),
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn extract_nudge_actions_correction_without_prior_fact_falls_back_to_add() {
-        // No prior fact to correct — should produce Add, not Replace
-        // with a meaningless old_pattern pointing at the trigger phrase.
-        let mem = PersistentMemory::empty(temp_path());
-        let cfg = NudgeConfig::default();
-        let msgs = vec![ConversationMessage::user_text(
-            "No, I meant I prefer light mode",
-        )];
-        let actions = extract_nudge_actions(&msgs, &mem, &cfg);
-        assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            NudgeAction::Add { content, .. } => {
-                assert!(content.contains("light mode"));
-            }
-            other => panic!("expected Add action for correction-without-prior-fact, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn extract_nudge_actions_keyword_supersedes_contradicting_prior_entry() {
-        // "remember I prefer light mode" while an existing entry says
-        // "user prefers dark mode" — should produce Replace, not a
-        // second contradicting Add.
-        let path = temp_path();
-        let mut mem = PersistentMemory::empty(&path);
-        mem.add_entry("user prefers dark mode", "seed");
-        let cfg = NudgeConfig::default();
-        let msgs = vec![ConversationMessage::user_text(
-            "Remember I prefer light mode",
-        )];
-        let actions = extract_nudge_actions(&msgs, &mem, &cfg);
-        assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            NudgeAction::Replace {
-                old_pattern,
-                new_content,
-                ..
-            } => {
-                assert!(old_pattern.contains("dark mode"));
-                assert!(new_content.contains("light mode"));
-            }
-            other => panic!("expected Replace for contradicting keyword, got {other:?}"),
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn extract_nudge_actions_forget_keyword_emits_remove_when_entry_exists() {
-        // B8 regression guard: previously NudgeAction::Remove was a dead
-        // branch — extract never emitted it and conversation.rs silently
-        // skipped the match arm. Now forget keywords emit Remove and
-        // remove_entry retires the matching active entry into archive.
-        let path = temp_path();
-        let mut mem = PersistentMemory::empty(&path);
-        mem.add_entry("user likes rust", "seed");
-        let cfg = NudgeConfig::default();
-        let msgs = vec![ConversationMessage::user_text("forget rust")];
-        let actions = extract_nudge_actions(&msgs, &mem, &cfg);
-        assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            NudgeAction::Remove { pattern, .. } => {
-                assert!(pattern.contains("rust"));
-            }
-            other => panic!("expected Remove for forget keyword, got {other:?}"),
-        }
-        // Apply the action — entry should be retired into archive.
-        for action in actions {
-            if let NudgeAction::Remove { pattern, .. } = action {
-                assert!(
-                    mem.remove_entry(&pattern),
-                    "remove_entry should retire matching entry"
-                );
-            }
-        }
-        let now = now_ms();
-        assert!(
-            mem.entries()
-                .iter()
-                .all(|e| !e.is_active(now) || !e.content.contains("rust")),
-            "rust entry should no longer be active"
-        );
-        assert!(
-            mem.archive().iter().any(|e| e.content.contains("rust")),
-            "retired entry should be retained in archive"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn extract_nudge_actions_forget_keyword_no_match_emits_nothing() {
-        // forget with no matching active entry should not emit Remove
-        // (avoids no-op actions clogging the nudge budget).
-        let mem = PersistentMemory::empty(temp_path());
-        let cfg = NudgeConfig::default();
-        let msgs = vec![ConversationMessage::user_text("forget non-existent thing")];
-        let actions = extract_nudge_actions(&msgs, &mem, &cfg);
-        assert!(
-            actions.is_empty(),
-            "expected no actions for unmatched forget"
-        );
-    }
-
-    #[test]
-    fn extract_nudge_actions_respects_max_entries() {
-        let mem = PersistentMemory::empty(temp_path());
-        let cfg = NudgeConfig {
-            interval_turns: 1,
-            lookback_turns: 5,
-            max_entries_per_nudge: 2,
-        };
-        let msgs = vec![
-            ConversationMessage::user_text("Remember I like rust"),
-            ConversationMessage::user_text("Remember I like go"),
-            ConversationMessage::user_text("Remember I like python"),
-        ];
-        let actions = extract_nudge_actions(&msgs, &mem, &cfg);
-        assert_eq!(actions.len(), cfg.max_entries_per_nudge);
-    }
-
-    // --- P2: memory_update 工具 — 模型主动管理 PersistentMemory ------------
-
-    #[test]
-    fn extract_style_signals_detects_preferences() {
-        let zh = extract_style_signals("请你简洁一点，不要问我，自行决策，参考权威论文");
-        assert!(
-            zh.iter().any(|s| s.contains("Chinese")),
-            "应检出中文偏好: {zh:?}"
-        );
-        assert!(
-            zh.iter().any(|s| s.contains("concise")),
-            "应检出简洁偏好: {zh:?}"
-        );
-        assert!(
-            zh.iter().any(|s| s.contains("autonomous")),
-            "应检出自主性: {zh:?}"
-        );
-        assert!(
-            zh.iter().any(|s| s.contains("authoritative")),
-            "应检出引用要求: {zh:?}"
-        );
-        // 无信号文本 ⇒ 空(不写噪音)。
-        assert!(extract_style_signals("ok").is_empty());
-        assert!(extract_style_signals("   ").is_empty());
-    }
-
-    #[test]
-    fn observe_user_style_is_idempotent() {
-        let mut mem = PersistentMemory::empty(temp_path());
-        let texts = vec!["please be concise".to_string()];
-        let first = observe_user_style(&mut mem, &texts);
-        assert_eq!(first, 1, "首次应写入 1 条风格条目");
-        let again = observe_user_style(&mut mem, &texts);
-        assert_eq!(again, 0, "重复观测应去重、不膨胀");
-        assert!(
-            mem.entries().iter().any(|e| e.source == "style-observer"),
-            "条目来源应为 style-observer"
-        );
-    }
-
-    #[test]
     fn update_block_updates_persona_human_tasks() {
         let path = temp_path();
         let mut mem = PersistentMemory::empty(&path);
@@ -1968,5 +1999,208 @@ mod tests {
             spec["input_schema"]["properties"]["op"]["enum"][2],
             "remove_entry"
         );
+    }
+}
+
+// ----- Phase 1 closed-loop migration tests (R3/R4/R5) -----
+#[cfg(test)]
+mod phase1_tests {
+    use super::*;
+
+    fn temp_path(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("claw-memory-phase1-{tag}-{nanos}.json"))
+    }
+
+    fn upsert(content: &str) -> MemoryOp {
+        MemoryOp {
+            op: OpKind::Upsert,
+            content: content.to_string(),
+            source: "test".to_string(),
+            basis: Basis::UserStated,
+            ..MemoryOp::default()
+        }
+    }
+
+    #[test]
+    fn upsert_same_subject_attribute_supersedes_old() {
+        let path = temp_path("upsert");
+        let mut memory = PersistentMemory::empty(&path);
+        let mut op = upsert("缩进用 tabs");
+        op.subject = Some("editor".to_string());
+        op.attribute = Some("indent".to_string());
+        let first = memory.apply_ops(std::slice::from_ref(&op), ACTIVE_MAX_ENTRIES);
+        assert_eq!(first.applied, 1);
+
+        let mut second = upsert("缩进用 spaces");
+        second.subject = Some("editor".to_string());
+        second.attribute = Some("indent".to_string());
+        let report = memory.apply_ops(std::slice::from_ref(&second), ACTIVE_MAX_ENTRIES);
+        assert_eq!(report.applied, 1);
+        assert!(
+            report.conflicts >= 1,
+            "should supersede the conflicting entry"
+        );
+
+        let now = now_ms();
+        let active: Vec<&MemoryEntry> = memory
+            .entries()
+            .iter()
+            .filter(|entry| entry.is_active(now))
+            .collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].content, "缩进用 spaces");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn retract_subject_blocks_reinsert() {
+        let path = temp_path("retract");
+        let mut memory = PersistentMemory::empty(&path);
+        let mut op = upsert("不要动 vendor 目录");
+        op.subject = Some("project".to_string());
+        op.attribute = Some("vendor_dir".to_string());
+        assert_eq!(
+            memory
+                .apply_ops(std::slice::from_ref(&op), ACTIVE_MAX_ENTRIES)
+                .applied,
+            1
+        );
+
+        let retract = MemoryOp {
+            op: OpKind::Retract,
+            subject: Some("project".to_string()),
+            attribute: Some("vendor_dir".to_string()),
+            ..MemoryOp::default()
+        };
+        let report = memory.apply_ops(std::slice::from_ref(&retract), ACTIVE_MAX_ENTRIES);
+        assert_eq!(report.retracted, 1);
+        assert!(memory.is_retracted(Some("project"), Some("vendor_dir")));
+
+        let again = memory.apply_ops(std::slice::from_ref(&op), ACTIVE_MAX_ENTRIES);
+        assert_eq!(again.applied, 0);
+        assert_eq!(again.skipped, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ttl_downgrades_entries_older_than_180_days() {
+        let path = temp_path("ttl");
+        let mut memory = PersistentMemory::empty(&path);
+        memory.add_entry("old fact", "test");
+        let now = now_ms();
+        if let Some(entry) = memory.entries.first_mut() {
+            entry.valid_from = now - ACTIVE_MAX_AGE_MS - 1_000;
+            entry.last_verified_at = now - ACTIVE_MAX_AGE_MS - 1_000;
+            entry.last_recalled_at = None;
+        }
+        let evicted = memory.enforce_limits(now, ACTIVE_MAX_ENTRIES);
+        assert_eq!(evicted, 1);
+        assert!(memory.entries.is_empty());
+        assert_eq!(memory.archive.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn active_cap_evicts_oldest_entries() {
+        let path = temp_path("cap");
+        let mut memory = PersistentMemory::empty(&path);
+        for index in 0..5 {
+            memory.add_entry(&format!("fact {index}"), "test");
+        }
+        let evicted = memory.enforce_limits(now_ms(), 3);
+        assert_eq!(evicted, 2);
+        assert_eq!(memory.entries.len(), 3);
+        assert_eq!(memory.archive.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn blocks_migrate_once_and_then_freeze() {
+        let path = temp_path("blocks");
+        let mut memory = PersistentMemory::empty(&path);
+        memory.update_block("human", "喜欢深色模式").expect("human");
+        assert!(memory.blocks()[1].content().contains("深色"));
+
+        assert!(memory.migrate_blocks_once());
+        assert!(memory.blocks()[1].content().is_empty());
+        assert!(memory.render_projection().contains("喜欢深色模式"));
+
+        // 迁移后 block 写入冻结：写入 entries，不再改块。
+        memory
+            .update_block("human", "偏好浅色")
+            .expect("frozen write");
+        assert!(memory.blocks()[1].content().is_empty());
+        assert!(
+            memory
+                .entries()
+                .iter()
+                .any(|entry| entry.content == "偏好浅色"),
+            "frozen block writes must land in entries"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn human_projection_and_entries_do_not_duplicate() {
+        let path = temp_path("projection");
+        let mut memory = PersistentMemory::empty(&path);
+        let mut profile = upsert("用户是后端工程师");
+        profile.kind = EntryKind::UserProfile;
+        let fact = upsert("项目使用 Rust");
+        memory.apply_ops(&[profile, fact], ACTIVE_MAX_ENTRIES);
+
+        let rendered = memory.render_current();
+        assert_eq!(
+            rendered.matches("用户是后端工程师").count(),
+            1,
+            "projected entry must not be rendered twice: {rendered}"
+        );
+        assert!(rendered.contains("## Human"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_phrase_conflict_detection_still_runs_after_nudge_removal() {
+        let path = temp_path("conflict");
+        let mut memory = PersistentMemory::empty(&path);
+        memory.apply_ops(&[upsert("I prefer tabs")], ACTIVE_MAX_ENTRIES);
+        memory.apply_ops(&[upsert("I prefer spaces")], ACTIVE_MAX_ENTRIES);
+        let now = now_ms();
+        let active = memory
+            .entries()
+            .iter()
+            .filter(|entry| entry.is_active(now))
+            .count();
+        assert_eq!(
+            active, 1,
+            "contradicting phrase must supersede the old entry"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_moves_superseded_entries_to_archive() {
+        let path = temp_path("consolidate");
+        let mut memory = PersistentMemory::empty(&path);
+        let mut first = upsert("old value");
+        first.subject = Some("k".to_string());
+        first.attribute = Some("v".to_string());
+        let mut second = upsert("new value");
+        second.subject = Some("k".to_string());
+        second.attribute = Some("v".to_string());
+        memory.apply_ops(&[first, second], ACTIVE_MAX_ENTRIES);
+        memory.consolidate();
+        assert!(
+            memory
+                .archive
+                .iter()
+                .any(|entry| entry.content == "old value"),
+            "superseded entry should be archived by consolidate"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

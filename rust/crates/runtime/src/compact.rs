@@ -160,9 +160,16 @@ fn sanitize_llm_summary(text: &str) -> String {
         .trim_end_matches("</summary>")
         .trim();
     let mut lines = Vec::new();
+    let mut memory_line: Option<String> = None;
     for line in body.lines() {
         let line = line.trim();
         if line.is_empty() {
+            continue;
+        }
+        // R6:单行 `MEMORY_JSON:` 尾行必须原样保留 —— 加 `- ` 前缀会被
+        // merge/compress 当作普通 bullet 打散，字段解析随之失效。
+        if line.starts_with("MEMORY_JSON:") {
+            memory_line = Some(line.to_string());
             continue;
         }
         // 确保每行是 bullet,否则 extract_summary_highlights 提取不到。
@@ -174,6 +181,9 @@ fn sanitize_llm_summary(text: &str) -> String {
     }
     if lines.is_empty() {
         lines.push("- (LLM summary returned empty content)".to_string());
+    }
+    if let Some(memory_line) = memory_line {
+        lines.push(memory_line);
     }
     format!(
         "<summary>\nConversation summary:\n{}\n</summary>",
@@ -1057,6 +1067,10 @@ fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) ->
     let new_formatted_summary = format_compact_summary(new_summary);
     let new_highlights = extract_summary_highlights(&new_formatted_summary);
     let new_timeline = extract_summary_timeline(&new_formatted_summary);
+    // R6:`MEMORY_JSON:` 尾行不参与 highlights 重拼，但必须搬运到合并结果，
+    // 否则第二轮压缩后任务/教训字段全部丢失。新摘要优先，旧摘要兜底。
+    let memory_line = extract_memory_json_line(new_summary)
+        .or_else(|| extract_memory_json_line(existing_summary));
 
     let mut lines = vec!["<summary>".to_string(), "Conversation summary:".to_string()];
 
@@ -1084,8 +1098,21 @@ fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) ->
         lines.extend(new_timeline.into_iter().map(|line| format!("  {line}")));
     }
 
+    if let Some(memory_line) = memory_line {
+        lines.push(memory_line);
+    }
+
     lines.push("</summary>".to_string());
     lines.join("\n")
+}
+
+/// 提取摘要中的单行 `MEMORY_JSON:` 尾行（R6）。
+fn extract_memory_json_line(summary: &str) -> Option<String> {
+    summary
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("MEMORY_JSON:"))
+        .map(str::to_string)
 }
 
 fn summarize_block(block: &ContentBlock) -> String {

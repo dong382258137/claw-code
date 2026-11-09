@@ -12,10 +12,8 @@ use crate::compact::{
 };
 use crate::config::{ConfigLoader, RuntimeFeatureConfig, RuntimeHookConfig};
 use crate::hooks::{HookAbortSignal, HookEvent, HookProgressReporter, HookRunResult, HookRunner};
-use crate::memory::{
-    extract_nudge_actions, observe_user_style, should_nudge, NudgeAction, NudgeConfig,
-    PersistentMemory,
-};
+use crate::memory::{PersistentMemory, ACTIVE_MAX_ENTRIES};
+use crate::memory_extract::{MemorySessionBoundary, MemoryWorker, TurnEvidence};
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
@@ -1801,10 +1799,13 @@ pub struct ConversationRuntime<C, T> {
     /// turn 结束后一次性推送。闭包 `Send`，可捕获可 `Clone` 的 channel sender。
     stream_event_callback: Option<Box<dyn Fn(AssistantEvent) + Send>>,
     session_tracer: Option<SessionTracer>,
-    /// Optional persistent memory surface. When present, the runtime runs a
-    /// rule-based nudge pass every `NudgeConfig::interval_turns` turns to keep
-    /// the memory layer fresh without an LLM call.
+    /// Optional persistent memory surface. When present, extraction is handled
+    /// by an in-process worker (see [`crate::memory_extract`]) — the turn path
+    /// only enqueues evidence and drains pre-computed ops from memory.
     persistent_memory: Option<PersistentMemory>,
+    /// Phase 1 记忆提取 worker：turn 路径只做 `try_send`，绝不等待（R1/R2）。
+    /// 进程级共享（`memory_extract::global_worker`），跨 runtime 重建存活。
+    memory_worker: Option<Arc<MemoryWorker>>,
     /// 任务状态(task anchor,episodic memory)内存缓存。
     ///
     /// 每 turn 结束自动更新并持久化到 `.claw/task_state.json`;会话经历过
@@ -1835,9 +1836,6 @@ pub struct ConversationRuntime<C, T> {
     /// 决策是否注入「成本提示/警示」`[runtime]` 注记(频率上限在 meter 内部,
     /// 普通提示每 ~5 次工具调用一条、警示每 ~10K output 一条)。
     cost_meter: crate::cost_meter::CostMeter,
-    /// Turns elapsed since the last nudge fired. Reset to 0 whenever a nudge
-    /// runs.
-    turns_since_last_nudge: usize,
     /// Phase 3(self-evolving harness):自进化 turn 计数器,每 `evolution_interval`
     /// turn 触发一次 evolve()。见 docs/2026-07-24-p3-self-evolving-harness-design.md。
     turns_since_last_evolution: usize,
@@ -2528,12 +2526,12 @@ where
             stream_event_callback: None,
             session_tracer: None,
             persistent_memory: None,
+            memory_worker: None,
             task_state: None,
             fixed_memory: None,
             last_request_at_ms: None,
             sufficiency_contract: crate::sufficiency::SufficiencyContract::default(),
             cost_meter: crate::cost_meter::CostMeter::default(),
-            turns_since_last_nudge: 0,
             turns_since_last_evolution: 0,
             harness_archive: None,
             recovery_orchestrator: RecoveryOrchestrator::default(),
@@ -2707,14 +2705,14 @@ where
 
     /// Attach a persistent memory surface to the runtime.
     ///
-    /// When set, the runtime runs a rule-based nudge pass at the end of every
-    /// `NudgeConfig::interval_turns` turns, scanning recent user messages for
-    /// `remember` / `prefer` / correction phrases and applying them to the
-    /// memory layer. The snapshot captured at load time is the only view
-    /// surfaced to the system prompt within the current session, so mid-turn
-    /// mutations do not destabilize the prompt-cache prefix.
+    /// 写入由进程内 worker 异步完成（见 [`crate::memory_extract`]）：turn 尾只
+    /// `try_send` 证据，turn 头 drain 已产出的 op（纯内存 + 落盘）。冻结快照
+    /// 仍是本会话唯一进入 system prompt 前缀的记忆视图，保证缓存前缀稳定。
     #[must_use]
     pub fn with_persistent_memory(mut self, memory: PersistentMemory) -> Self {
+        if self.memory_worker.is_none() {
+            self.memory_worker = Some(crate::memory_extract::global_worker(memory.file_path()));
+        }
         self.persistent_memory = Some(memory);
         self
     }
@@ -2723,6 +2721,100 @@ where
     #[must_use]
     pub fn persistent_memory(&self) -> Option<&PersistentMemory> {
         self.persistent_memory.as_ref()
+    }
+
+    /// 会话边界信号（R1）：会话切换 / 关闭 / 进程退出 / 空闲兜底。
+    ///
+    /// **等待上限 0**：只通知 worker、drain 已产出的 op、执行遗忘规则；
+    /// 不等待提取器、不等待向量、不重启线程。失败静默。
+    pub fn on_memory_boundary(&mut self, boundary: MemorySessionBoundary) {
+        if let Some(worker) = self.memory_worker.as_ref() {
+            worker.notify_boundary(boundary);
+        }
+        self.drain_memory_ops();
+        let mut persisted = false;
+        if let Some(memory) = self.persistent_memory.as_mut() {
+            memory.sweep();
+            if boundary == MemorySessionBoundary::Exited {
+                // 退出前最后扫一遍：把已被淘汰的活跃条目并入 archive 上限。
+                memory.sweep();
+            }
+            // 边界全量落盘：会话切换 / 进程退出 / serve worker 回收。
+            // turn 路径不再写全量快照，崩溃由追加日志回放兜底。
+            persisted = memory.flush().is_ok();
+        }
+        if persisted {
+            if let Some(worker) = self.memory_worker.as_ref() {
+                worker.clear_pending_log();
+            }
+        }
+    }
+
+    /// 取出 worker 产出的 op 与预计算向量并应用（turn 头调用，纯内存）。
+    fn drain_memory_ops(&mut self) {
+        let Some(worker) = self.memory_worker.as_ref() else {
+            return;
+        };
+        let ops = worker.take_ops();
+        let vectors = worker.take_vectors();
+        if ops.is_empty() && vectors.is_empty() {
+            return;
+        }
+        let Some(memory) = self.persistent_memory.as_mut() else {
+            return;
+        };
+        if !ops.is_empty() {
+            let _ = memory.apply_ops(&ops, ACTIVE_MAX_ENTRIES);
+        }
+        for (id, vector) in vectors {
+            memory.semantic_mut().insert_precomputed_vector(&id, vector);
+        }
+    }
+
+    /// turn 尾把本轮证据入队（O(1) `try_send`，绝不等待）。
+    fn enqueue_memory_evidence(
+        &self,
+        user_input: &str,
+        assistant_messages: &[ConversationMessage],
+        tool_results: &[ConversationMessage],
+    ) {
+        let Some(worker) = self.memory_worker.as_ref() else {
+            return;
+        };
+        let assistant_text = assistant_messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut failures = Vec::new();
+        for message in tool_results {
+            for block in &message.blocks {
+                if let ContentBlock::ToolResult {
+                    tool_name,
+                    output,
+                    is_error,
+                    ..
+                } = block
+                {
+                    if *is_error {
+                        let signature: String = output.chars().take(100).collect();
+                        failures.push(format!("{tool_name}: {signature}"));
+                    }
+                }
+            }
+        }
+        let evidence = TurnEvidence::build(
+            &self.session.session_id,
+            self.session.messages.len() as u64,
+            user_input,
+            &assistant_text,
+            failures,
+        );
+        worker.enqueue_evidence(evidence);
     }
 
     /// Replace the default recovery orchestrator with a custom one. Useful
@@ -3785,6 +3877,10 @@ where
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
 
+        // Phase 1 记忆闭环：turn 头 drain worker 已产出的 op（纯内存 + 落盘，
+        // 不含 embedding）。失败静默，绝不阻塞或影响本轮回答。
+        self.drain_memory_ops();
+
         // id=61 修复:每 turn 用**实时** git 状态刷新注入的 `# Project context` 段。
         // 交互式 REPL 是单个长进程,构造期捕获一次的坐标快照会永久停留会话开始时刻
         // (git commit 只改 git 状态、不改工作区文件内容 → 无任何失效触发点),导致
@@ -3900,7 +3996,11 @@ where
             let hits = memory.semantic_recall(&user_input, 3);
             if !hits.is_empty() {
                 let mut rendered = String::from("# Relevant Memories\n\n");
+                let mut has_shadow = false;
                 for (idx, hit) in hits.iter().enumerate() {
+                    if hit.entry.source == "shadow" {
+                        has_shadow = true;
+                    }
                     rendered.push_str(&format!(
                         "{}. [{}] {}\n   source: {}\n   score: {:.3}\n",
                         idx + 1,
@@ -3909,6 +4009,13 @@ where
                         hit.entry.source,
                         hit.score,
                     ));
+                }
+                if has_shadow {
+                    // visible 模式不得静默注入：显式标注来源与撤销方式。
+                    rendered.push_str(
+                        "\n注：带 [影子·未确认] 的条目为影子记忆，尚未写入持久记忆；\
+                         如不符合预期可用 `/memory rm <关键词>` 当场撤销。\n",
+                    );
                 }
                 self.pending_semantic_context = Some(rendered);
             }
@@ -5944,112 +6051,14 @@ where
         // 此处不再重复清空。Review 阶段或 P3 完成声明校验若设置了新 remediation,
         // 需要存活到下一 turn 被读取。
 
-        // Periodic nudge: if enough turns have elapsed and we have a
-        // persistent memory surface, scan recent messages for actionable
-        // patterns (user corrections, "remember" keywords, etc.) and apply
-        // them to the memory. This keeps the memory layer fresh without an
-        // LLM call. The frozen snapshot is not touched, so the prompt-cache
-        // prefix stays stable within the session — new facts only surface in
-        // the next session.
-        //
-        // Tier S #3 穷鬼模式：激活时整体跳过 nudge（虽然 nudge 当前是规则驱动
-        // 不消耗 LLM token，但仍会写入 memory.json 增加后续 prompt 体积；
-        // 穷鬼模式下用户明确希望最小化副作用）。
-        if !crate::poor_mode::is_active() {
-            // Q5(2026-10-13):逐轮用户风格观察(纯确定性,零 LLM)。与下方
-            // 节流式 nudge(每 N 轮、仅显式关键词)不同,本通道**每轮**运行:
-            // 从最近 3 条 user 发言提取喜好/风格信号,去重后写入记忆
-            // (source=style-observer)。幂等 ⇒ 重复发言不膨胀;写入遵循
-            // frozen-snapshot 语义 ⇒ 本会话经语义召回可见,下会话进前缀。
-            if let Some(memory) = &mut self.persistent_memory {
-                let style_texts: Vec<String> = {
-                    let mut picked: Vec<String> = Vec::new();
-                    for msg in self.session.messages.iter().rev() {
-                        if msg.role == MessageRole::User {
-                            let text = msg
-                                .blocks
-                                .iter()
-                                .filter_map(|b| match b {
-                                    ContentBlock::Text { text } => Some(text.as_str()),
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            if !text.trim().is_empty() {
-                                picked.push(text);
-                            }
-                            if picked.len() >= 3 {
-                                break;
-                            }
-                        }
-                    }
-                    picked
-                };
-                observe_user_style(memory, &style_texts);
-            }
-            self.turns_since_last_nudge += 1;
-            let nudge_config = NudgeConfig::default();
-            if let Some(memory) = &mut self.persistent_memory {
-                if should_nudge(self.turns_since_last_nudge, &nudge_config) {
-                    // B3 fix: previously used `take(lookback_turns * 2)`
-                    // assuming 1 turn = 2 messages. With tool calls one turn
-                    // can produce 5-10 messages (user → assistant tool_use →
-                    // tool_result → ... → assistant text), so `* 2` only
-                    // covered the most recent turn and missed the previous
-                    // user input entirely. Iterate from the newest message
-                    // backwards, counting only `MessageRole::User` messages
-                    // until we've collected `lookback_turns` of them.
-                    let lookback_msgs: Vec<_> = {
-                        let mut picked: Vec<&ConversationMessage> = Vec::new();
-                        let mut user_seen = 0usize;
-                        for msg in self.session.messages.iter().rev() {
-                            picked.push(msg);
-                            if msg.role == MessageRole::User {
-                                user_seen += 1;
-                                if user_seen >= nudge_config.lookback_turns {
-                                    break;
-                                }
-                            }
-                        }
-                        picked.into_iter().rev().cloned().collect()
-                    };
-                    let actions = extract_nudge_actions(&lookback_msgs, memory, &nudge_config);
-                    for action in actions {
-                        match action {
-                            NudgeAction::Add { content, source } => {
-                                memory.add_entry(&content, &source);
-                            }
-                            NudgeAction::Replace {
-                                old_pattern,
-                                new_content,
-                                source,
-                            } => {
-                                memory.replace_entry(&old_pattern, &new_content, &source);
-                            }
-                            NudgeAction::Remove { pattern, source: _ } => {
-                                // B8 fix: retire the matching active entry
-                                // into `archive` (audit history) rather
-                                // than leaving the variant as dead code.
-                                // No-op if nothing matches.
-                                memory.remove_entry(&pattern);
-                            }
-                        }
-                    }
-                    // After applying actions, run consolidation if the
-                    // surface has crossed a capacity threshold. This
-                    // migrates superseded / expired entries into the
-                    // archive sub-table (preserving audit history) and
-                    // compresses any over-budget block. Without this hook,
-                    // `needs_consolidation` / `consolidate` were dead code
-                    // and superseded entries accumulated indefinitely in
-                    // `entries` (bloating the on-disk file).
-                    if memory.needs_consolidation() {
-                        memory.consolidate();
-                    }
-                    self.turns_since_last_nudge = 0;
-                }
-            }
-        }
+        // Phase 1 记忆闭环：turn 尾只把本轮证据入队（O(1) try_send）。
+        // 提取由进程内 worker 异步完成；规则式 nudge / 风格观察已下线
+        // （见方案 §3.5：先迁移 consolidate / detect_conflicts，再删 nudge）。
+        self.enqueue_memory_evidence(
+            &user_input,
+            &summary.assistant_messages,
+            &summary.tool_results,
+        );
 
         // Phase 3(self-evolving harness):自进化触发(同步限频)。
         // 规则式路径零 LLM 调用;只在 trace_analyzer + harness_archive 同时
@@ -6219,11 +6228,14 @@ where
                 &failures,
                 &extra_sections,
             );
-            let _ = crate::management_brain::write_digest(
-                &workspace_root,
-                &self.session.session_id,
-                &digest,
-            );
+            // 82% digest 是空壳：没有实质内容就不落盘，避免空转覆盖有效交接。
+            if crate::management_brain::digest_is_substantive(&digest) {
+                let _ = crate::management_brain::write_digest(
+                    &workspace_root,
+                    &self.session.session_id,
+                    &digest,
+                );
+            }
         }
 
         // G9.1: SessionEnd lifecycle hook — turn 完全结束(含 nudge 等清理)后触发,
@@ -8459,6 +8471,15 @@ where
             .clone()
             .unwrap_or_else(|| crate::task_state::TaskState::load(&path).unwrap_or_default());
         state.record_completed_subgoals(&succeeded);
+        // closed_tasks 105 份全空的根因：此前只有压缩摘要解析写它，正常流程
+        // 从不写。全部 step 成功即视为该计划收尾，补记 closed_tasks。
+        let all_succeeded = plan
+            .steps
+            .iter()
+            .all(|s| s.status == crate::planner::StepStatus::Succeeded);
+        if all_succeeded {
+            state.record_closed_tasks(&succeeded);
+        }
         self.task_state = Some(state);
     }
 
@@ -17201,59 +17222,6 @@ mod tests {
         );
     }
 
-    // ----- Periodic nudge integration with run_turn -----
-
-    #[test]
-    fn nudge_applies_remember_keyword_to_persistent_memory() {
-        struct SimpleApi;
-        impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                Ok(vec![
-                    AssistantEvent::TextDelta("done".to_string()),
-                    AssistantEvent::MessageStop,
-                ])
-            }
-        }
-
-        let memory_path = temp_session_path("nudge-memory");
-        let memory = PersistentMemory::empty(&memory_path);
-
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            SimpleApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        )
-        .with_persistent_memory(memory);
-
-        // Pre-warm the turn counter so the very next turn triggers a nudge
-        // (NudgeConfig::default().interval_turns == 5).
-        runtime.turns_since_last_nudge = 4;
-
-        runtime
-            .run_turn("remember to use tabs not spaces", None)
-            .expect("turn should succeed");
-
-        let memory = runtime
-            .persistent_memory()
-            .expect("persistent memory should be attached");
-        let has_tabs_entry = memory
-            .entries()
-            .iter()
-            .any(|entry| entry.content.contains("tabs"));
-        assert!(
-            has_tabs_entry,
-            "persistent memory should contain a 'tabs' entry after nudge: {:?}",
-            memory.entries()
-        );
-
-        let _ = std::fs::remove_file(&memory_path);
-    }
-
     // ----- P2: memory_update 工具(模型主动管理 PersistentMemory) -----
 
     #[test]
@@ -17491,41 +17459,6 @@ mod tests {
         let reloaded = PersistentMemory::load_and_freeze(&memory_path);
         assert!(reloaded.frozen_render().contains("完成 P2 工具"));
         let _ = std::fs::remove_file(&memory_path);
-    }
-
-    #[test]
-    fn nudge_skips_when_no_persistent_memory() {
-        struct SimpleApi;
-        impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                Ok(vec![
-                    AssistantEvent::TextDelta("done".to_string()),
-                    AssistantEvent::MessageStop,
-                ])
-            }
-        }
-
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            SimpleApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        );
-        // No persistent_memory attached — the nudge branch must be skipped
-        // without panicking even after the interval elapses.
-
-        for i in 0..6 {
-            runtime
-                .run_turn(format!("turn {i}"), None)
-                .expect("turn should succeed");
-        }
-
-        // Sanity check: still no memory surface, and we did not panic.
-        assert!(runtime.persistent_memory().is_none());
     }
 
     // ----- P0-3: NOTEBOOK 刷新提醒测试 -----

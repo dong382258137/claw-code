@@ -753,6 +753,16 @@ pub(crate) struct BuiltRuntime {
 }
 
 impl BuiltRuntime {
+    /// 会话边界：通知记忆 worker 收尾（0 等待，失败静默）。
+    pub(crate) fn on_memory_boundary(
+        &mut self,
+        boundary: runtime::memory_extract::MemorySessionBoundary,
+    ) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.on_memory_boundary(boundary);
+        }
+    }
+
     fn new(
         runtime: ConversationRuntime<Box<dyn runtime::ApiClient>, CliToolExecutor>,
         plugin_registry: PluginRegistry,
@@ -879,6 +889,15 @@ impl Drop for BuiltRuntime {
     fn drop(&mut self) {
         let _ = self.shutdown_mcp();
         let _ = self.shutdown_plugins();
+    }
+}
+
+impl Drop for LiveCli {
+    fn drop(&mut self) {
+        // 会话/进程收尾（REPL 退出、TUI 退出、serve worker 回收）：
+        // 通知记忆 worker 做边界巩固（0 等待，失败静默）。
+        self.runtime
+            .on_memory_boundary(runtime::memory_extract::MemorySessionBoundary::Exited);
     }
 }
 
@@ -1546,8 +1565,8 @@ impl LiveCli {
                 self.print_mcp(args.as_deref(), CliOutputFormat::Text)?;
                 false
             }
-            SlashCommand::Memory => {
-                self.print_memory()?;
+            SlashCommand::Memory { action, target } => {
+                self.print_memory(action.as_deref(), target.as_deref())?;
                 false
             }
             SlashCommand::Init => {
@@ -2269,6 +2288,9 @@ impl LiveCli {
             None,
             &self.workspace,
         )?;
+        // 会话切换边界：旧会话记忆先收尾（0 等待），再替换 runtime。
+        self.runtime
+            .on_memory_boundary(runtime::memory_extract::MemorySessionBoundary::Switched);
         self.replace_runtime(runtime)?;
         // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
         let content = format!(
@@ -2333,6 +2355,8 @@ impl LiveCli {
             None,
             &self.workspace,
         )?;
+        self.runtime
+            .on_memory_boundary(runtime::memory_extract::MemorySessionBoundary::Switched);
         self.replace_runtime(runtime)?;
         self.session = SessionHandle {
             id: session_id,
@@ -2358,9 +2382,45 @@ impl LiveCli {
         Ok(())
     }
 
-    fn print_memory(&self) -> Result<(), Box<dyn std::error::Error>> {
+    fn print_memory(
+        &self,
+        action: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let content = match action {
+            None | Some("") | Some("list") => render_memory_report()?,
+            Some("search") => {
+                let needle = target.unwrap_or("").trim();
+                if needle.is_empty() {
+                    "用法：/memory search <关键词>".to_string()
+                } else {
+                    render_memory_search(needle)?
+                }
+            }
+            Some("show") => {
+                let index = parse_memory_index(target);
+                render_memory_detail(index)?
+            }
+            Some("rm") | Some("delete") => {
+                let index = parse_memory_index(target);
+                if index == 0 {
+                    "用法：/memory rm <条目编号>".to_string()
+                } else {
+                    retract_memory_entry(index)?
+                }
+            }
+            Some("undo") => undo_memory_retraction()?,
+            Some("review") => {
+                let limit = target
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .filter(|&n| n > 0);
+                render_memory_review(limit)?
+            }
+            Some(other) => format!(
+                "未知 memory 子命令：{other}\n用法：/memory [list|review [n]|show <n>|search <kw>|rm <n>|undo]"
+            ),
+        };
         // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-        let content = render_memory_report()?;
         if !self.tui_println(&content) {
             println!("{content}");
         }
@@ -3092,6 +3152,8 @@ impl LiveCli {
                 compacted.summary.chars().count()
             ));
         }
+        self.runtime
+            .on_memory_boundary(runtime::memory_extract::MemorySessionBoundary::Switched);
         self.replace_runtime(runtime)?;
         self.session = SessionHandle {
             id: session_id,
@@ -4453,6 +4515,20 @@ pub(crate) fn build_runtime_with_plugin_state(
         }
         Err(e) => {
             eprintln!("[startup] PlanGeneratorClient skipped (construction failed): {e}");
+        }
+    }
+
+    // Phase 1 记忆闭环：注册记忆提取器（flash + 512 tokens，纯增量成本）。
+    // 未注册时 worker 直接跳过提取（静默），不影响主流程。
+    match crate::llm_clients::DeepSeekMemoryExtractorClient::new("deepseek-v4-flash", Some(512)) {
+        Ok(extractor) => {
+            let extractor: std::sync::Arc<dyn runtime::memory_extract::MemoryExtractorClient> =
+                std::sync::Arc::new(extractor);
+            runtime::memory_extract::set_global_memory_extractor_client(extractor);
+            eprintln!("[startup] LLM memory extractor registered (model: deepseek-v4-flash)");
+        }
+        Err(e) => {
+            eprintln!("[startup] MemoryExtractorClient skipped (construction failed): {e}");
         }
     }
 

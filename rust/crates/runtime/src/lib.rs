@@ -58,6 +58,7 @@ pub mod mcp_server;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
 pub mod memory;
+pub mod memory_extract;
 pub mod memory_store;
 // Harness C(上下文管理)层:Memory 语义检索(L1/L2/L3 三级层级 + keyword fallback)。
 // 详见 docs/harness-engineering-optimization-plan.md Step 2.4。
@@ -257,8 +258,7 @@ pub use mcp_lifecycle_hardened::{
 pub use mcp_server::{McpServer, McpServerSpec, ToolCallHandler, MCP_SERVER_PROTOCOL_VERSION};
 pub use memory::MEMORY_UPDATE_TOOL_SPEC;
 pub use memory::{
-    detect_conflicts, extract_nudge_actions, should_nudge, MemoryBlock, MemoryEntry, NudgeAction,
-    NudgeConfig, PersistentMemory, UNVERIFIED_THRESHOLD_MS,
+    detect_conflicts, MemoryBlock, MemoryEntry, PersistentMemory, UNVERIFIED_THRESHOLD_MS,
 };
 pub use memory_store::MemoryStore;
 // Step 2.4: Memory 语义检索层 embedding provider 公开 API。

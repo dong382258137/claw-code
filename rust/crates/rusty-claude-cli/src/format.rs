@@ -1247,26 +1247,305 @@ pub(crate) fn render_memory_report() -> Result<String, Box<dyn std::error::Error
         let active = memory.active_entries(now_ms);
         lines.push(format!("  活跃条目         {}", active.len()));
         if !active.is_empty() {
-            for entry in active.iter().take(10) {
+            for (index, entry) in active.iter().enumerate() {
                 let marker = if entry.is_unverified(now_ms) {
                     "[未验证] "
                 } else {
                     ""
                 };
                 let preview = entry.content.lines().next().unwrap_or("").trim();
-                lines.push(format!("    - {marker}{preview}"));
-            }
-            if active.len() > 10 {
-                lines.push(format!("    ... 还有 {} 条", active.len() - 10));
+                lines.push(format!(
+                    "    #{:<3} {marker}[{}] {preview}  · {} · {}",
+                    index + 1,
+                    kind_label(entry.kind),
+                    entry.source,
+                    format_epoch_ms(entry.valid_from),
+                ));
             }
         }
+        lines.push(format!(
+            "  撤回集合         {}",
+            memory.retracted_subjects().len()
+        ));
         lines.push(format!("  归档条目         {}", memory.archive().len()));
+        let shadow = memory.shadow_entries();
+        if !shadow.is_empty() {
+            lines.push(format!(
+                "  影子条目         {}（visible 模式，未持久化；`/memory rm <n>` 可撤销）",
+                shadow.len()
+            ));
+            for (index, entry) in shadow.iter().enumerate() {
+                lines.push(format!(
+                    "    s{:<2} {}[{}] {}  · 影子记忆·未确认",
+                    index + 1,
+                    runtime::memory::SHADOW_PREFIX,
+                    kind_label(entry.kind),
+                    entry.content.lines().next().unwrap_or("").trim(),
+                ));
+            }
+        }
+        lines.push(format!(
+            "  写入模式         {:?}（CLAW_MEMORY_MODE）",
+            runtime::memory_extract::memory_mode()
+        ));
     }
 
     Ok(lines.join(
         "
 ",
     ))
+}
+
+fn kind_label(kind: runtime::memory_extract::EntryKind) -> &'static str {
+    use runtime::memory_extract::EntryKind;
+    match kind {
+        EntryKind::UserProfile => "画像",
+        EntryKind::Lesson => "教训",
+        EntryKind::Fact => "事实",
+    }
+}
+
+fn format_epoch_ms(ms: i64) -> String {
+    // 只做粗粒度展示（天），避免引入 chrono 依赖。
+    let days = ms.div_euclid(86_400_000);
+    format!("epoch+{days}d")
+}
+
+fn epoch_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn memory_file_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    Ok(env::current_dir()?.join(".claw").join("memory.json"))
+}
+
+pub(crate) fn parse_memory_index(target: Option<&str>) -> usize {
+    target
+        .and_then(|value| value.trim().trim_start_matches('#').parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// `/memory search <kw>`：按内容 / 来源 / subject / attribute 过滤活跃条目。
+pub(crate) fn render_memory_search(needle: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let path = memory_file_path()?;
+    if !path.exists() {
+        return Ok(format!("memory.json 尚不存在：{}", path.display()));
+    }
+    let memory = runtime::PersistentMemory::load_and_freeze(&path);
+    let now = epoch_ms_now();
+    let needle_lower = needle.to_lowercase();
+    let mut lines = vec![format!("Memory 搜索  {needle}")];
+    let mut hits = 0usize;
+    for (index, entry) in memory.active_entries(now).iter().enumerate() {
+        let haystack = format!(
+            "{} {} {} {}",
+            entry.content,
+            entry.source,
+            entry.subject.as_deref().unwrap_or(""),
+            entry.attribute.as_deref().unwrap_or("")
+        )
+        .to_lowercase();
+        if haystack.contains(&needle_lower) {
+            hits += 1;
+            lines.push(format!(
+                "  #{:<3} [{}] {}  · {}",
+                index + 1,
+                kind_label(entry.kind),
+                entry.content,
+                entry.source
+            ));
+        }
+    }
+    if hits == 0 {
+        lines.push("  （无匹配条目）".to_string());
+    }
+    Ok(lines.join("\n"))
+}
+
+/// `/memory show <n>`：展示单条完整内容与来源 / 时间 / 置信度。
+pub(crate) fn render_memory_detail(index: usize) -> Result<String, Box<dyn std::error::Error>> {
+    let path = memory_file_path()?;
+    if !path.exists() {
+        return Ok(format!("memory.json 尚不存在：{}", path.display()));
+    }
+    let memory = runtime::PersistentMemory::load_and_freeze(&path);
+    let now = epoch_ms_now();
+    let active = memory.active_entries(now);
+    let Some(entry) = active.get(index.saturating_sub(1)) else {
+        return Ok(format!(
+            "条目 #{index} 不存在（当前活跃 {} 条）",
+            active.len()
+        ));
+    };
+    Ok(format!(
+        "Memory 条目 #{index}\n  内容      {}\n  类别      {}\n  来源      {}\n  依据      {:?}\n  置信度    {:?}\n  出现次数  {}\n  主体/属性 {}/{}\n  生效时间  {}\n  最后验证  {}",
+        entry.content,
+        kind_label(entry.kind),
+        entry.source,
+        entry.basis,
+        entry.confidence,
+        entry.evidence_count,
+        entry.subject.as_deref().unwrap_or("-"),
+        entry.attribute.as_deref().unwrap_or("-"),
+        format_epoch_ms(entry.valid_from),
+        format_epoch_ms(entry.last_verified_at),
+    ))
+}
+
+/// `/memory review [n]`：按轮审阅影子提议（log-only / visible 模式）。
+///
+/// 每条提议展示：轮次范围、target（kind/subject/attribute）、内容、
+/// basis / explicit / confidence，以及"此刻若生效"的判定（新增 / 去重 / 覆盖 / 拦截）。
+pub(crate) fn render_memory_review(
+    limit: Option<usize>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    render_memory_review_at(&memory_file_path()?, limit)
+}
+
+/// 审阅面实现（显式路径，便于单测）：`memory.json` + 同目录 `memory_shadow.jsonl`。
+pub(crate) fn render_memory_review_at(
+    path: &std::path::Path,
+    limit: Option<usize>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let shadow_path = path
+        .parent()
+        .map(|dir| dir.join("memory_shadow.jsonl"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".claw/memory_shadow.jsonl"));
+    let proposals = runtime::memory_extract::load_shadow_proposals(&shadow_path);
+    let memory = if path.exists() {
+        Some(runtime::PersistentMemory::load_and_freeze(path))
+    } else {
+        None
+    };
+    let mut lines = vec![format!(
+        "Memory 审阅  模式={:?}  提议数={}  文件={}",
+        runtime::memory_extract::memory_mode(),
+        proposals.len(),
+        shadow_path.display()
+    )];
+    if proposals.is_empty() {
+        lines.push("  （暂无提议；log-only / visible 模式才会记录）".to_string());
+        return Ok(lines.join("\n"));
+    }
+    let take = limit.unwrap_or(20).max(1);
+    let start = proposals.len().saturating_sub(take);
+    for proposal in &proposals[start..] {
+        let op = &proposal.op;
+        let verdict = memory.as_ref().map_or_else(
+            || "新增（无 memory.json 基线）".to_string(),
+            |m| m.preview_op(op),
+        );
+        let op_label = if op.op == runtime::memory_extract::OpKind::Retract {
+            "retract"
+        } else {
+            "upsert"
+        };
+        lines.push(format!(
+            "  轮 {} T{}-T{}  {op_label}",
+            if proposal.session_id.is_empty() {
+                "-"
+            } else {
+                proposal.session_id.as_str()
+            },
+            proposal.from_turn,
+            proposal.to_turn
+        ));
+        lines.push(format!(
+            "    目标      kind={:?} subject={} attribute={}",
+            op.kind,
+            op.subject.as_deref().unwrap_or("-"),
+            op.attribute.as_deref().unwrap_or("-")
+        ));
+        lines.push(format!("    内容      {}", op.content));
+        lines.push(format!(
+            "    依据      basis={:?} explicit={} confidence={:?} evidence={}",
+            op.basis, op.explicit, op.confidence, op.evidence_count
+        ));
+        lines.push(format!("    判定      {verdict}"));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// `/memory rm <n>`：软删除（迁入 archive）+ 墓碑，按 subject+attribute 拦截重抽。
+/// 编号落在影子条目区间（`sN` 或 > 活跃条目数）时，当场撤销该影子条目。
+pub(crate) fn retract_memory_entry(index: usize) -> Result<String, Box<dyn std::error::Error>> {
+    let path = memory_file_path()?;
+    if !path.exists() {
+        return Ok(format!("memory.json 尚不存在：{}", path.display()));
+    }
+    let mut memory = runtime::PersistentMemory::load_and_freeze(&path);
+    let now = epoch_ms_now();
+    let active_len = memory.active_entries(now).len();
+    if index > active_len {
+        // 影子条目区间：活跃条目之后按顺序编号。
+        let shadow_index = index - active_len - 1;
+        return match memory.remove_shadow_entry(shadow_index) {
+            Some(entry) => Ok(format!(
+                "已撤销影子条目 s{}：{}\n  （影子记忆未持久化，撤销即从本会话投影中移除）",
+                shadow_index + 1,
+                entry.content
+            )),
+            None => Ok(format!(
+                "条目 #{index} 不存在（活跃 {active_len} 条，影子 {} 条）",
+                memory.shadow_entries().len()
+            )),
+        };
+    }
+    let target = {
+        let active = memory.active_entries(now);
+        active.get(index.saturating_sub(1)).map(|entry| {
+            (
+                entry.content.clone(),
+                entry.subject.clone(),
+                entry.attribute.clone(),
+            )
+        })
+    };
+    let Some((content, subject, attribute)) = target else {
+        return Ok(format!("条目 #{index} 不存在，未执行删除"));
+    };
+    let op = runtime::memory_extract::MemoryOp {
+        op: runtime::memory_extract::OpKind::Retract,
+        subject: if subject.is_some() && attribute.is_some() {
+            subject
+        } else {
+            None
+        },
+        attribute,
+        target: Some(content.clone()),
+        explicit: true,
+        ..runtime::memory_extract::MemoryOp::default()
+    };
+    let report = memory.apply_ops(
+        std::slice::from_ref(&op),
+        runtime::memory::ACTIVE_MAX_ENTRIES,
+    );
+    // CLI 显式操作不属于 turn 路径：立即落盘，保证退出前可见。
+    let _ = memory.flush();
+    Ok(format!(
+        "已撤回条目 #{index}：{content}\n  applied={} retracted={} skipped={}",
+        report.applied, report.retracted, report.skipped
+    ))
+}
+
+/// `/memory undo`：撤销最近一次撤回（移除墓碑，允许重新写入）。
+pub(crate) fn undo_memory_retraction() -> Result<String, Box<dyn std::error::Error>> {
+    let path = memory_file_path()?;
+    if !path.exists() {
+        return Ok(format!("memory.json 尚不存在：{}", path.display()));
+    }
+    let mut memory = runtime::PersistentMemory::load_and_freeze(&path);
+    match memory.unretract_last() {
+        Some(retracted) => Ok(format!(
+            "已撤销撤回：subject={} attribute={}",
+            retracted.subject,
+            retracted.attribute.as_deref().unwrap_or("-")
+        )),
+        None => Ok("没有可撤销的撤回记录".to_string()),
+    }
 }
 
 pub(crate) fn render_memory_json() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -2098,6 +2377,82 @@ mod tests {
     fn parse_detection_strategy_heuristic() {
         let result = parse_detection_strategy("heuristic");
         assert_eq!(result, Some(DetectionStrategy::Heuristic));
+    }
+
+    /// 审阅面回归：按轮展示 target / 内容 / basis / explicit / 去重判定。
+    #[test]
+    fn memory_review_renders_shadow_proposals() {
+        use runtime::memory_extract::{Basis, Confidence, EntryKind, MemoryOp, ShadowProposal};
+
+        let dir = std::env::temp_dir().join(format!(
+            "claw-review-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let memory_path = dir.join("memory.json");
+
+        // 基线：一条已确认条目，用于验证"去重"判定。
+        let mut memory = runtime::PersistentMemory::load_and_freeze(&memory_path);
+        memory.add_entry("用户偏好使用 neovim 作为编辑器", "manual");
+        memory.flush().expect("persist baseline");
+
+        let proposals = vec![
+            ShadowProposal {
+                ts_ms: 0,
+                session_id: "sess-e2e".to_string(),
+                from_turn: 1,
+                to_turn: 4,
+                op: MemoryOp {
+                    kind: EntryKind::UserProfile,
+                    subject: Some("user".to_string()),
+                    attribute: Some("editor".to_string()),
+                    content: "用户偏好使用 neovim 作为编辑器".to_string(),
+                    basis: Basis::UserStated,
+                    confidence: Confidence::High,
+                    explicit: true,
+                    evidence_count: 1,
+                    ..MemoryOp::default()
+                },
+            },
+            ShadowProposal {
+                ts_ms: 0,
+                session_id: "sess-e2e".to_string(),
+                from_turn: 5,
+                to_turn: 8,
+                op: MemoryOp {
+                    kind: EntryKind::UserProfile,
+                    subject: Some("user".to_string()),
+                    attribute: Some("editor".to_string()),
+                    content: "用户偏好深色主题".to_string(),
+                    basis: Basis::Inferred,
+                    confidence: Confidence::Medium,
+                    explicit: false,
+                    evidence_count: 2,
+                    ..MemoryOp::default()
+                },
+            },
+        ];
+        let mut raw = String::new();
+        for proposal in &proposals {
+            raw.push_str(&serde_json::to_string(proposal).expect("serialize"));
+            raw.push('\n');
+        }
+        std::fs::write(dir.join("memory_shadow.jsonl"), raw).expect("write proposals");
+
+        let report = render_memory_review_at(&memory_path, None).expect("review render");
+        println!("{report}");
+        assert!(report.contains("T1-T4"), "应展示轮次范围: {report}");
+        assert!(report.contains("T5-T8"), "应展示轮次范围: {report}");
+        assert!(report.contains("去重（已存在"), "应给出重复判定: {report}");
+        assert!(
+            report.contains("explicit=false"),
+            "应展示 explicit 字段: {report}"
+        );
+        assert!(report.contains("basis=Inferred"), "应展示 basis: {report}");
+        assert!(report.contains("subject=user"), "应展示 target: {report}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

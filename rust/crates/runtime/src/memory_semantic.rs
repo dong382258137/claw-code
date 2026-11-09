@@ -347,6 +347,22 @@ impl SemanticRecaller {
         }
     }
 
+    /// 插入由 worker 线程预计算好的向量（R2：主线程不做 embedding）。
+    ///
+    /// 幂等：已存在向量的 entry 跳过；空向量忽略。失败静默。
+    pub fn insert_precomputed_vector(&mut self, id: &str, vector: Vec<f32>) {
+        if vector.is_empty() || self.vectors.contains_key(id) {
+            return;
+        }
+        self.vectors.insert(id.to_string(), vector);
+    }
+
+    /// 是否已有该 entry 的向量（避免重复预计算）。
+    #[must_use]
+    pub fn has_vector(&self, id: &str) -> bool {
+        self.vectors.contains_key(id)
+    }
+
     /// 预计算所有 L1 entry 的 embedding 并存入 vectors 索引。
     ///
     /// 幂等:已存在向量的 entry 不会被重新计算。

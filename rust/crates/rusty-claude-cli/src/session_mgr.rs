@@ -497,7 +497,7 @@ pub(crate) fn run_resume_command(
                 json: Some(handle_mcp_slash_command_json(args.as_deref(), &cwd)?),
             })
         }
-        SlashCommand::Memory => Ok(ResumeCommandOutcome {
+        SlashCommand::Memory { .. } => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_memory_report()?),
             json: Some(render_memory_json()?),

@@ -109,7 +109,13 @@ fn normalize_lines(summary: &str, max_line_chars: usize) -> NormalizedSummary {
             continue;
         }
 
-        let truncated = truncate_line(&normalized, max_line_chars);
+        // R6:`MEMORY_JSON:` 尾行是机器可解析的单行结构，不截断、不参与去重键，
+        // 否则压缩后字段解析全部失效。
+        let truncated = if normalized.starts_with("MEMORY_JSON:") {
+            normalized.clone()
+        } else {
+            truncate_line(&normalized, max_line_chars)
+        };
         let dedupe_key = dedupe_key(&truncated);
         if !seen.insert(dedupe_key) {
             removed_duplicate_lines += 1;
@@ -127,6 +133,13 @@ fn normalize_lines(summary: &str, max_line_chars: usize) -> NormalizedSummary {
 
 fn select_line_indexes(lines: &[String], budget: SummaryCompressionBudget) -> Vec<usize> {
     let mut selected = BTreeSet::<usize>::new();
+
+    // R6:`MEMORY_JSON:` 尾行优先且无条件入选（独占其自身长度预算）。
+    for (index, line) in lines.iter().enumerate() {
+        if line.starts_with("MEMORY_JSON:") {
+            selected.insert(index);
+        }
+    }
 
     for priority in 0..=3 {
         for (index, line) in lines.iter().enumerate() {
@@ -172,7 +185,11 @@ fn joined_char_count(lines: &[&str]) -> usize {
 }
 
 fn line_priority(line: &str) -> usize {
-    if line == "Summary:" || line == "Conversation summary:" || is_core_detail(line) {
+    if line.starts_with("MEMORY_JSON:")
+        || line == "Summary:"
+        || line == "Conversation summary:"
+        || is_core_detail(line)
+    {
         0
     } else if is_section_header(line) {
         1

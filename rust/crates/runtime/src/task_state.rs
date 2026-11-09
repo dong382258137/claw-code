@@ -294,6 +294,25 @@ impl TaskState {
         self.updated_at_ms = now_ms();
     }
 
+    /// 记录已收尾任务（`closed_tasks`），防止压缩后指令残留把 AI 拉回已完成任务。
+    ///
+    /// 写入时机：plan Review 阶段全部 step 成功时由
+    /// `sync_completed_subgoals_from_plan` 调用；以及压缩摘要 `[closed_tasks]`
+    /// 段解析（见 [`parse_task_state_from_summary`]）。
+    pub fn record_closed_tasks(&mut self, tasks: &[String]) {
+        for task in tasks {
+            if self.closed_tasks.len() >= TASK_FINDINGS_MAX {
+                break;
+            }
+            let task = truncate(task.trim(), TASK_FINDING_MAX_CHARS);
+            if task.is_empty() || self.closed_tasks.contains(&task) {
+                continue;
+            }
+            self.closed_tasks.push(task);
+        }
+        self.updated_at_ms = now_ms();
+    }
+
     /// 第2项:合并已完成子目标(去重 + 截断 + 上限),供 plan Review 阶段同步。
     ///
     /// 子目标来自 PlanArtifact 的 `StepStatus::Succeeded` step 描述,跨压缩/
@@ -406,6 +425,43 @@ pub struct SummaryTaskExtract {
 pub fn parse_task_state_from_summary(summary: &str) -> SummaryTaskExtract {
     let mut out = SummaryTaskExtract::default();
 
+    // R6:优先解析单行 `MEMORY_JSON:`（压缩链三层都会保留该行）；字段缺失时
+    // 再回退到人读段解析。
+    if let Some(doc) = parse_memory_json(summary) {
+        if let Some(goal) = doc
+            .get("active_task")
+            .or_else(|| doc.get("goal"))
+            .and_then(serde_json::Value::as_str)
+        {
+            if !is_none_value(goal) {
+                out.active_goal = Some(truncate(goal, TASK_GOAL_MAX_CHARS));
+            }
+        }
+        if let Some(next) = doc.get("next_action").and_then(serde_json::Value::as_str) {
+            if !is_none_value(next) {
+                out.next_action = Some(truncate(next, TASK_FINDING_MAX_CHARS));
+            }
+        }
+        if let Some(items) = doc
+            .get("closed_tasks")
+            .and_then(serde_json::Value::as_array)
+        {
+            for item in items.iter().filter_map(serde_json::Value::as_str) {
+                let item = item.trim();
+                if item.is_empty() || is_none_value(item) {
+                    continue;
+                }
+                let t = truncate(item, TASK_FINDING_MAX_CHARS);
+                if !out.closed_tasks.contains(&t) {
+                    out.closed_tasks.push(t);
+                }
+                if out.closed_tasks.len() >= TASK_FINDINGS_MAX {
+                    break;
+                }
+            }
+        }
+    }
+
     // [active_task] 段:从标记下一行到 [closed_tasks] 段(或结尾)。
     if let Some(sec) = extract_section(summary, "[active_task]", "[closed_tasks]") {
         for line in sec.lines() {
@@ -459,6 +515,16 @@ fn is_task_completion_like(t: &str) -> bool {
         return false;
     }
     !(trimmed.contains("应使用") || trimmed.contains("不要 ") || trimmed.contains("需先"))
+}
+
+/// 解析摘要中的单行 `MEMORY_JSON:` 尾行（R6 兼容解析）。
+fn parse_memory_json(summary: &str) -> Option<serde_json::Value> {
+    let line = summary
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("MEMORY_JSON:"))?;
+    let payload = line.trim_start_matches("MEMORY_JSON:").trim();
+    serde_json::from_str(payload).ok()
 }
 
 /// 截取 `start_marker` 下一行起、`end_marker` 前的文本段。

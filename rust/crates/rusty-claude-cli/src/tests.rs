@@ -3859,7 +3859,10 @@ fn parses_resume_and_config_slash_commands() {
     );
     assert_eq!(
         SlashCommand::parse("/memory"),
-        Ok(Some(SlashCommand::Memory))
+        Ok(Some(SlashCommand::Memory {
+            action: None,
+            target: None
+        }))
     );
     assert_eq!(SlashCommand::parse("/init"), Ok(Some(SlashCommand::Init)));
     assert_eq!(

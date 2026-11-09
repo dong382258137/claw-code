@@ -300,6 +300,30 @@ impl runtime::planner::PlanGeneratorClient for DeepSeekPlanGeneratorClient {
     }
 }
 
+/// 生产 `MemoryExtractorClient` 实现 — 用于
+/// `runtime::memory_extract::set_global_memory_extractor_client`。
+///
+/// 用廉价 flash 模型 + 较小 token 上限；在 worker 线程上同步调用，
+/// 不进入 turn 路径（R1/R2）。
+pub struct DeepSeekMemoryExtractorClient {
+    bridge: LlmBridge,
+}
+
+impl DeepSeekMemoryExtractorClient {
+    /// 构造记忆提取 client。
+    pub fn new(model: &str, max_tokens: Option<u32>) -> Result<Self, String> {
+        Ok(Self {
+            bridge: LlmBridge::new(model, max_tokens)?,
+        })
+    }
+}
+
+impl runtime::memory_extract::MemoryExtractorClient for DeepSeekMemoryExtractorClient {
+    fn extract(&self, prompt: &str) -> Result<String, String> {
+        self.bridge.call(prompt)
+    }
+}
+
 /// 生产 `ResearchClient` 实现 — 用于
 /// `runtime::knowledge_freshness::set_global_research_client`。
 ///
