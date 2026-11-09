@@ -32,6 +32,9 @@ target/
 .sandbox-tmp/
 **/.sandbox-tmp/
 
+# Local scratch work dir (transient, e.g. memory eval artifacts)
+.tmp/
+
 # Vendored reference sources (not a build dependency)
 .vendor/
 
