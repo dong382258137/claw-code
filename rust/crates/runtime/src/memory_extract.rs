@@ -522,19 +522,17 @@ fn worker_loop(rx: Receiver<WorkerMsg>, handles: WorkerHandles) {
                         &handles,
                         turns_seen,
                         urgent,
-                        false,
                         &mut last_evidence_ms,
                     );
                 }
             }
-            Ok(WorkerMsg::Boundary(boundary)) => {
+            Ok(WorkerMsg::Boundary(_boundary)) => {
                 flush_window(
                     &mut buffer,
                     &mut candidates,
                     &handles,
                     turns_seen,
                     false,
-                    boundary == MemorySessionBoundary::Exited,
                     &mut last_evidence_ms,
                 );
                 last_evidence_ms = now_ms();
@@ -547,7 +545,6 @@ fn worker_loop(rx: Receiver<WorkerMsg>, handles: WorkerHandles) {
                         &handles,
                         turns_seen,
                         false,
-                        false,
                         &mut last_evidence_ms,
                     );
                 }
@@ -557,21 +554,16 @@ fn worker_loop(rx: Receiver<WorkerMsg>, handles: WorkerHandles) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn flush_window(
     buffer: &mut Vec<TurnEvidence>,
     candidates: &mut HashMap<String, CandidateEntry>,
     handles: &WorkerHandles,
     _turns_seen: u64,
     urgent: bool,
-    clear_pending: bool,
     last_evidence_ms: &mut i64,
 ) {
     *last_evidence_ms = now_ms();
     if buffer.is_empty() {
-        if clear_pending {
-            let _ = std::fs::remove_file(&handles.pending_path);
-        }
         return;
     }
     let window: Vec<TurnEvidence> = std::mem::take(buffer);

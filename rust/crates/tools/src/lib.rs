@@ -13930,9 +13930,16 @@ mod tests {
             self.calls += 1;
             match self.calls {
                 1 => {
-                    // 收口架构(建议2):首轮请求 = 用户输入 + 末尾 Runtime Context
-                    // 注入块(冻结槽位,单条 user 消息)。详见 runtime conversation.rs。
-                    assert_eq!(request.messages.len(), 2);
+                    // 首轮请求 = 仅用户输入一条消息。原因是运行时的尾部
+                    // "Runtime Context" 块按"槽位全空则省略"渲染
+                    // (`ConversationRuntime::render_runtime_hints`):子智能体
+                    // 是全新会话,无 NOTEBOOK / plan / 语义召回 / 上一会话
+                    // digest;原先唯一无条件非空的槽位 `Session Summary
+                    // Prompt` 已随执行脑自写总结链路在 057bb45a 移除。
+                    // 子智能体需要的 workspace 上下文由 system prompt
+                    // (Repository Map / Environment,见 `load_system_prompt`)
+                    // 承载,与该尾部块无关,故这里没有上下文损失。
+                    assert_eq!(request.messages.len(), 1);
                     assert!(
                         request.messages[0].blocks.iter().any(|b| matches!(
                             b,
@@ -13942,12 +13949,12 @@ mod tests {
                         "first message should be the user prompt"
                     );
                     assert!(
-                        request.messages[1].blocks.iter().any(|b| matches!(
+                        !request.messages[0].blocks.iter().any(|b| matches!(
                             b,
                             runtime::ContentBlock::Text { text }
                                 if text.contains("# Runtime Context")
                         )),
-                        "last message should be the runtime context injection"
+                        "no runtime-hints tail message when every slot is empty"
                     );
                     Ok(vec![
                         AssistantEvent::ToolUse {

@@ -786,6 +786,79 @@ impl PersistentMemory {
         self.persist_or_warn("replace_entry");
     }
 
+    /// 工具路径写入（`memory_update: add_entry`）：纯内存 apply + 追加 journal。
+    ///
+    /// 与自动抽取路径同一条路：不 embedding、不全量落盘。语义 L1 索引即时
+    /// 更新（本会话关键词召回可见），向量留待下次加载时批量重建，全量持久化
+    /// 交给会话边界 [`PersistentMemory::flush`]。journal 写入失败静默，工具
+    /// 结果保持成功语义。
+    pub fn record_entry(&mut self, content: &str, source: &str) -> ApplyReport {
+        let op = MemoryOp {
+            op: OpKind::Upsert,
+            content: content.trim().to_string(),
+            source: source.to_string(),
+            confidence: Confidence::High,
+            basis: Basis::UserStated,
+            explicit: true,
+            evidence_count: 1,
+            ..MemoryOp::default()
+        };
+        self.apply_and_journal(&op)
+    }
+
+    /// 工具路径替换（`memory_update: replace_entry`）：按 `old_content_pattern`
+    /// 退休旧条目后再插入新内容，其余同 [`PersistentMemory::record_entry`]。
+    pub fn record_replacement(
+        &mut self,
+        old_content_pattern: &str,
+        new_content: &str,
+        source: &str,
+    ) -> ApplyReport {
+        let op = MemoryOp {
+            op: OpKind::Upsert,
+            content: new_content.trim().to_string(),
+            source: source.to_string(),
+            target: Some(old_content_pattern.to_string()),
+            confidence: Confidence::High,
+            basis: Basis::UserStated,
+            explicit: true,
+            evidence_count: 1,
+            ..MemoryOp::default()
+        };
+        self.apply_and_journal(&op)
+    }
+
+    /// 工具路径删除（`memory_update: remove_entry`）：按 pattern 退休条目。
+    ///
+    /// 返回是否有条目被移除；未命中不写 journal（回放同样不产生变化）。
+    pub fn retract_entry_by_pattern(&mut self, pattern: &str) -> bool {
+        let op = MemoryOp {
+            op: OpKind::Retract,
+            target: Some(pattern.to_string()),
+            source: "memory_update".to_string(),
+            basis: Basis::UserStated,
+            explicit: true,
+            ..MemoryOp::default()
+        };
+        let report = self.apply_ops(std::slice::from_ref(&op), ACTIVE_MAX_ENTRIES);
+        if report.retracted == 0 {
+            return false;
+        }
+        crate::memory_extract::append_journal(&self.file_path, std::slice::from_ref(&op));
+        true
+    }
+
+    /// 应用单条 op 并追加 journal。
+    ///
+    /// journal 写失败只影响崩溃兜底，不改变工具结果（调用方仍按已记录返回）。
+    fn apply_and_journal(&mut self, op: &MemoryOp) -> ApplyReport {
+        let report = self.apply_ops(std::slice::from_ref(op), ACTIVE_MAX_ENTRIES);
+        if report.applied > 0 {
+            crate::memory_extract::append_journal(&self.file_path, std::slice::from_ref(op));
+        }
+        report
+    }
+
     /// Semantic recall — return the top-k entries whose L1 summary best
     /// matches `query`. Default strategy is keyword fallback (no embedding
     /// API required). Hits are intended to be appended to the prompt's
@@ -998,6 +1071,21 @@ impl PersistentMemory {
             report.skipped += 1;
             return false;
         }
+        // 显式替换（`memory_update: replace_entry`）：先退休所有命中 `target`
+        // 的活跃条目，再按普通 upsert 插入新内容。走同一套 op 语义后，
+        // journal 回放能复现同样的替换结果，无需另起一套替换逻辑。
+        let explicit_replace = op.target.as_deref().is_some_and(|t| !t.is_empty());
+        if explicit_replace {
+            let target = op.target.as_deref().unwrap_or_default();
+            let mut retired = 0usize;
+            for entry in &mut self.entries {
+                if entry.is_active(now) && entry.content.contains(target) {
+                    entry.supersede(content.to_string(), now);
+                    retired += 1;
+                }
+            }
+            report.conflicts += retired;
+        }
         // L1：内容完全相同的活跃条目 → 刷新验证时间，不重复插入。
         if let Some(existing) = self
             .entries
@@ -1009,7 +1097,8 @@ impl PersistentMemory {
             return true;
         }
         // L3：同 subject 下语义近重复（>0.95）跳过，避免脑补改写。
-        if let Some(subject) = op.subject.as_deref() {
+        // 显式替换不复用该判定：模型已点名要换掉旧事实，近重复不应吞掉新内容。
+        if let Some(subject) = op.subject.as_deref().filter(|_| !explicit_replace) {
             let near_dup = self.entries.iter().any(|entry| {
                 entry.is_active(now)
                     && entry.subject.as_deref() == Some(subject)
@@ -1321,7 +1410,8 @@ impl PersistentMemory {
             // entry's audit trail records why it was retired.
             entry.supersede(pattern.to_string(), now);
             self.archive.push(entry);
-            self.persist_or_warn("remove_entry");
+            // 不再同步落盘：本方法也会被 `apply_ops`（turn 路径）调用，
+            // 全量持久化统一交给边界 `flush`，崩溃由 journal 回放兜底。
             return true;
         }
         false
@@ -1543,7 +1633,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("claw-memory-{nanos}.json"))
+        // 每个测试独占一个目录：崩溃回放的 journal 落在 memory.json 同目录
+        // (`memory_pending.jsonl`)，共用临时根目录会让测试之间互相回放对方的
+        // 待应用 op。
+        let dir = std::env::temp_dir().join(format!("claw-memory-{nanos}"));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("memory.json")
     }
 
     // --- P2-7: PersistentMemory + Mid-Session Freeze ----------------------

@@ -8177,14 +8177,14 @@ where
     ///   [`PersistentMemory::update_block`](crate::memory::PersistentMemory::update_block),
     ///   内容落盘并在**下一个会话**进入 system 前缀(本会话前缀冻结以维持
     ///   缓存命中)。
-    /// - entries 操作:
+    /// - entries 操作(与自动抽取路径同一条路:内存替换 + 追加 journal,
+    ///   全量落盘交给会话边界 flush;本会话经语义召回立即可见):
     ///   - `{"op": "add_entry", "content": "...", "source": "..."}` →
-    ///     [`PersistentMemory::add_entry`](crate::memory::PersistentMemory::add_entry),
-    ///     同步更新语义 L1 索引,**本会话**经语义召回立即可见。
+    ///     [`PersistentMemory::record_entry`](crate::memory::PersistentMemory::record_entry)。
     ///   - `{"op": "replace_entry", "pattern": "...", "content": "...", "source": "..."}` →
-    ///     [`PersistentMemory::replace_entry`](crate::memory::PersistentMemory::replace_entry)。
+    ///     [`PersistentMemory::record_replacement`](crate::memory::PersistentMemory::record_replacement)。
     ///   - `{"op": "remove_entry", "pattern": "..."}` →
-    ///     [`PersistentMemory::remove_entry`](crate::memory::PersistentMemory::remove_entry)。
+    ///     [`PersistentMemory::retract_entry_by_pattern`](crate::memory::PersistentMemory::retract_entry_by_pattern)。
     ///
     /// 需要 [`ConversationRuntime::with_persistent_memory`] 已注入 memory surface,
     /// 否则返回错误。
@@ -8222,7 +8222,7 @@ where
                         .get("content")
                         .and_then(serde_json::Value::as_str)
                         .ok_or_else(|| "memory_update: add_entry 必须提供 content 字段".to_string())?;
-                    memory.add_entry(content, source);
+                    memory.record_entry(content, source);
                     format!("已写入语义记忆 entry({} 字符)。", content.chars().count())
                 }
                 "replace_entry" => {
@@ -8234,7 +8234,7 @@ where
                         .get("content")
                         .and_then(serde_json::Value::as_str)
                         .ok_or_else(|| "memory_update: replace_entry 必须提供 content 字段".to_string())?;
-                    memory.replace_entry(pattern, content, source);
+                    memory.record_replacement(pattern, content, source);
                     format!("已替换语义记忆 entry(pattern '{pattern}' → 新内容)。")
                 }
                 "remove_entry" => {
@@ -8242,7 +8242,7 @@ where
                         .get("pattern")
                         .and_then(serde_json::Value::as_str)
                         .ok_or_else(|| "memory_update: remove_entry 必须提供 pattern 字段".to_string())?;
-                    if memory.remove_entry(pattern) {
+                    if memory.retract_entry_by_pattern(pattern) {
                         "已移除匹配的语义记忆 entry。".to_string()
                     } else {
                         format!("未找到匹配 '{pattern}' 的语义记忆 entry(无操作)。")
@@ -11307,7 +11307,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("runtime-conversation-{label}-{nanos}.json"))
+        // 每个测试独占一个目录：memory journal 落在文件同目录
+        // (`memory_pending.jsonl`)，共用临时根目录会让测试之间互相回放对方的
+        // 待应用 op。
+        let dir = std::env::temp_dir().join(format!("runtime-conversation-{label}-{nanos}"));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(format!("{label}.json"))
     }
 
     #[cfg(windows)]
@@ -17332,6 +17337,90 @@ mod tests {
             "removed entry must no longer be active"
         );
         let _ = std::fs::remove_file(&memory_path);
+    }
+
+    /// 工具路径与自动路径同一条路：内存替换 + 追加 journal，边界才全量落盘。
+    #[test]
+    fn execute_memory_update_defers_disk_write_to_boundary_then_survives_restart() {
+        let memory_path = temp_session_path("memory-update-deferred");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_persistent_memory(PersistentMemory::empty(&memory_path));
+
+        runtime
+            .execute_memory_update(
+                r#"{"op":"add_entry","content":"用户偏好用 rg 代替 grep 搜代码","source":"memory_update"}"#,
+            )
+            .expect("tool call should succeed");
+
+        // 1) 工具调用不写全量快照。
+        assert!(
+            !memory_path.exists(),
+            "memory_update must not flush the full snapshot mid-turn"
+        );
+        // 2) 本会话立即可见（L1 关键词召回，非 embedding）。
+        let hits = runtime
+            .persistent_memory()
+            .expect("memory attached")
+            .semantic_recall("rg grep", 3);
+        assert!(
+            hits.iter().any(|hit| hit.entry.summary.contains("rg")),
+            "entry must be recallable immediately: {hits:?}"
+        );
+        // 3) journal 里有待应用记录（崩溃回放凭据）。
+        let journal = crate::memory_extract::journal_path_for(&memory_path);
+        let pending = crate::memory_extract::load_pending_ops(&journal);
+        assert_eq!(pending.len(), 1, "journal should hold exactly one op");
+        assert!(pending[0].content.contains("rg"));
+
+        // 4) 边界 flush 后落盘，重启（重新 load）仍在。
+        runtime.on_memory_boundary(crate::memory_extract::MemorySessionBoundary::Exited);
+        assert!(
+            memory_path.exists(),
+            "boundary flush should create the file"
+        );
+        let reloaded = PersistentMemory::load_and_freeze(&memory_path);
+        assert!(reloaded.frozen_render().contains("rg 代替 grep"));
+    }
+
+    /// 落盘能力失效时工具仍返回成功语义，journal 里仍留有记录。
+    #[test]
+    fn execute_memory_update_stays_successful_when_flush_fails() {
+        let probe = temp_session_path("memory-update-flush-fail");
+        let dir = probe.parent().expect("temp dir").to_path_buf();
+        // 让 memory.json 指向一个目录：save 必然失败（is a directory）。
+        let blocked = dir.join("memory.json");
+        std::fs::create_dir_all(&blocked).expect("create blocking dir");
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_persistent_memory(PersistentMemory::empty(&blocked));
+
+        let output = runtime
+            .execute_memory_update(
+                r#"{"op":"add_entry","content":"用户偏好 zsh 作为登录 shell","source":"memory_update"}"#,
+            )
+            .expect("tool result must stay success-shaped when disk is unavailable");
+        assert!(output.contains("已写入语义记忆 entry"), "output: {output}");
+
+        // 边界 flush 会失败；工具早已返回成功，journal 仍留有该 op。
+        runtime.on_memory_boundary(crate::memory_extract::MemorySessionBoundary::Exited);
+        let journal = crate::memory_extract::journal_path_for(&blocked);
+        let pending = crate::memory_extract::load_pending_ops(&journal);
+        assert!(
+            pending.iter().any(|op| op.content.contains("zsh")),
+            "journal must still carry the unflushed op: {pending:?}"
+        );
     }
 
     #[test]
