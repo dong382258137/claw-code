@@ -15,6 +15,7 @@ const FILTERS = [
   { key: 'all', label: '全部' },
   { key: 'active', label: '生效中' },
   { key: 'shadowed', label: '被遮蔽' },
+  { key: 'disabled', label: '已禁用' },
 ]
 
 const TABS = [
@@ -27,7 +28,7 @@ function sourceLabel(source) {
   return SOURCE_LABELS[source] || source || '未知'
 }
 
-// 技能市场（P1）：本地目录 + 来源管理 + 安装/卸载。
+// 技能市场（P2）：本地目录 + 来源管理 + 安装/卸载 + 启停。
 export function SkillMarketPage() {
   const [data, setData] = useState(null)
   const [error, setError] = useState('')
@@ -36,6 +37,7 @@ export function SkillMarketPage() {
   const [keyword, setKeyword] = useState('')
   const [sub, setSub] = useState(() => parseSkillSub(location.hash))
   const [notice, setNotice] = useState('')
+  const [toggling, setToggling] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -70,6 +72,7 @@ export function SkillMarketPage() {
       if (view === 'list') {
         if (filter === 'active' && !skill.active) return false
         if (filter === 'shadowed' && skill.active) return false
+        if (filter === 'disabled' && skill.enabled) return false
       }
       if (!text) return true
       return (
@@ -97,6 +100,29 @@ export function SkillMarketPage() {
     load()
   }
 
+  const toggle = async (skill) => {
+    if (toggling) return
+    const next = !skill.enabled
+    if (!next && !window.confirm(`禁用 ${skill.name} 后，它不会出现在技能列表和系统提示里。继续？`)) {
+      return
+    }
+    setToggling(skill.name)
+    setNotice('')
+    try {
+      const result = await api(`/api/skills/${encodeURIComponent(skill.name)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      })
+      setNotice(result.enabled ? `已启用 ${skill.name}` : `已禁用 ${skill.name}`)
+      await load()
+    } catch (err) {
+      setError(err.message || String(err))
+    } finally {
+      setToggling('')
+    }
+  }
+
   const summary = data?.summary || {}
 
   return (
@@ -107,7 +133,8 @@ export function SkillMarketPage() {
           <p>浏览本机技能，从本地索引来源安装或卸载；卸载只会删除市场安装的副本。</p>
         </div>
         <span className="chip">
-          {summary.active ?? 0} / {summary.total ?? 0} 生效 · {summary.managed ?? 0} 已安装
+          {summary.active ?? 0} / {summary.total ?? 0} 生效 · {summary.disabled ?? 0} 已禁用 ·{' '}
+          {summary.managed ?? 0} 已安装
         </span>
       </div>
 
@@ -175,26 +202,47 @@ export function SkillMarketPage() {
                 </div>
               ) : null}
               {visible.map((skill) => (
-                <button
+                <div
                   key={`${skill.path}:${skill.name}`}
-                  type="button"
-                  className={selected === skill.name ? 'skill-item active' : 'skill-item'}
-                  onClick={() => pick(skill.name)}
+                  className={
+                    selected === skill.name
+                      ? 'skill-card active'
+                      : skill.enabled
+                        ? 'skill-card'
+                        : 'skill-card disabled'
+                  }
                 >
-                  <div className="skill-item-top">
-                    <span className="skill-name">{skill.name}</span>
-                    <span className={`skill-source ${skill.source}`}>{sourceLabel(skill.source)}</span>
-                  </div>
-                  <div className="skill-desc">{skill.description || '（无描述）'}</div>
-                  {skill.managed ? (
-                    <div className="skill-managed">
-                      市场安装 · {skill.marketplace || '未知来源'} · v{skill.version || '未知'}
+                  <button
+                    type="button"
+                    className="skill-item"
+                    onClick={() => pick(skill.name)}
+                  >
+                    <div className="skill-item-top">
+                      <span className="skill-name">{skill.name}</span>
+                      <span className={`skill-source ${skill.source}`}>{sourceLabel(skill.source)}</span>
                     </div>
-                  ) : null}
-                  {!skill.active && skill.shadowed_by ? (
-                    <div className="skill-shadowed">被{sourceLabel(skill.shadowed_by)}同名技能遮蔽</div>
-                  ) : null}
-                </button>
+                    <div className="skill-desc">{skill.description || '（无描述）'}</div>
+                    {skill.managed ? (
+                      <div className="skill-managed">
+                        市场安装 · {skill.marketplace || '未知来源'} · v{skill.version || '未知'}
+                      </div>
+                    ) : null}
+                    {!skill.enabled ? <div className="skill-disabled">已禁用</div> : null}
+                    {!skill.active && skill.shadowed_by ? (
+                      <div className="skill-shadowed">被{sourceLabel(skill.shadowed_by)}同名技能遮蔽</div>
+                    ) : null}
+                  </button>
+                  <button
+                    type="button"
+                    className={skill.enabled ? 'skill-toggle on' : 'skill-toggle'}
+                    title={skill.enabled ? '禁用' : '启用'}
+                    aria-label={skill.enabled ? `禁用 ${skill.name}` : `启用 ${skill.name}`}
+                    disabled={toggling === skill.name}
+                    onClick={() => toggle(skill)}
+                  >
+                    {skill.enabled ? '禁用' : '启用'}
+                  </button>
+                </div>
               ))}
             </div>
             <div className="skill-detail-pane">

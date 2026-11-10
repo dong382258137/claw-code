@@ -20,13 +20,16 @@ pub mod render;
 pub mod serve;
 pub mod session_mgr;
 pub mod settings;
-pub mod skill_market;
 pub mod streaming;
 pub mod suggestion;
 pub mod tool_display;
 pub mod ultraplan;
 pub mod upgrade_helper;
 pub mod voice;
+
+/// 技能市场已下沉到 `commands`（CLI `/skills install` 与 WebUI 共用同一条
+/// 原子安装流水线），此处重导出以保持 `crate::skill_market` 路径稳定。
+pub use commands::skill_market;
 
 #[cfg(feature = "full-tui")]
 pub mod tui;

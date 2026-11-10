@@ -5819,4 +5819,90 @@ mod blueprint_tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    /// 技能卸载后，**下一次真实 prompt 构建**不得再注入该技能。
+    ///
+    /// 验的不是「文件没了」，而是 `app::load_skill_catalog`（系统提示 catalog
+    /// 的真实构建函数）与缓存指纹 —— 两者共同决定下一次会话是否还带它。
+    #[test]
+    fn uninstall_removes_skill_from_next_prompt_build() {
+        let workspace = temp_dir();
+        let config_home = workspace.join("config");
+        let source = workspace.join("source").join("prompt-demo");
+        fs::create_dir_all(&source).expect("create source");
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: prompt-demo\ndescription: 提示词验证\n---\n\n正文\n",
+        )
+        .expect("write skill");
+        fs::write(
+            workspace.join("source").join("marketplace.json"),
+            format!(
+                r#"{{"schema":"{}","skills":[{{"name":"prompt-demo","version":"1.0.0","path":"prompt-demo"}}]}}"#,
+                commands::skill_market::MARKET_SCHEMA
+            ),
+        )
+        .expect("write index");
+
+        let paths = commands::skill_market::MarketPaths::with_roots(
+            config_home.join("skill-market"),
+            config_home.join("skills"),
+        );
+        // catalog 通过 CLAW_CONFIG_HOME 解析安装根；用 guard 恢复，避免污染其他用例。
+        struct Guard(Option<std::ffi::OsString>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+                    None => std::env::remove_var("CLAW_CONFIG_HOME"),
+                }
+            }
+        }
+        let _guard = Guard(std::env::var_os("CLAW_CONFIG_HOME"));
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+
+        let source_view = commands::skill_market::add_source(
+            &paths,
+            "local",
+            workspace.join("source").to_str().expect("utf8 path"),
+            Some("测试源"),
+            None,
+        )
+        .expect("add source");
+        commands::skill_market::install(
+            &paths,
+            &source_view.id,
+            "prompt-demo",
+            None,
+            false,
+            &std::sync::Mutex::new(()),
+            commands::skill_market::Fault::None,
+        )
+        .expect("install");
+
+        let before = crate::app::load_skill_catalog(&workspace).expect("catalog before");
+        assert!(
+            before.contains("prompt-demo"),
+            "安装后系统提示应包含该技能：{before}"
+        );
+        let fingerprint_before = commands::skill_catalog_fingerprint(&workspace);
+
+        commands::skill_market::uninstall(&paths, "prompt-demo", &std::sync::Mutex::new(()))
+            .expect("uninstall");
+
+        let after = crate::app::load_skill_catalog(&workspace);
+        assert!(
+            after
+                .as_deref()
+                .is_none_or(|text| !text.contains("prompt-demo")),
+            "卸载后下一次 prompt 构建不应再注入该技能：{after:?}"
+        );
+        assert_ne!(
+            fingerprint_before,
+            commands::skill_catalog_fingerprint(&workspace),
+            "卸载后技能目录指纹必须变化，否则下一次 prompt 构建会命中旧缓存"
+        );
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
 }

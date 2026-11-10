@@ -723,7 +723,11 @@ version = "2026.11.10"
 dependencies = [
  "plugins",
  "runtime",
+ "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -4066,7 +4070,6 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
- "sha2",
  "similar",
  "syntect",
  "sys-locale",

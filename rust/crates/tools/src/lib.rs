@@ -982,7 +982,7 @@ impl GlobalToolRegistry {
         // namespaced with `skill:` prefix to distinguish them from tools
         // (e.g. `skill:frontend-design`). The model can then call the
         // `Skill` tool with the bare name (without prefix) to load it.
-        let skills = commands::list_skill_summaries(self.env.workspace())
+        let skills = commands::list_enabled_skill_summaries(self.env.workspace())
             .ok()
             .map(|skills| {
                 skills.into_iter().map(|skill| SearchableToolSpec {
@@ -6558,6 +6558,16 @@ fn execute_todo_write(input: TodoWriteInput, workspace: &Path) -> Result<TodoWri
 }
 
 fn execute_skill(input: SkillInput, workspace: &Path) -> Result<SkillOutput, String> {
+    // 被显式禁用的技能对模型等同于不存在：按名加载必须返回 unknown，
+    // 与 `/skills list`、`SkillSearch`、系统提示 catalog 的口径保持一致。
+    if commands::is_skill_disabled(&input.skill) {
+        let requested = input
+            .skill
+            .trim()
+            .trim_start_matches('/')
+            .trim_start_matches('$');
+        return Err(format!("unknown skill: {requested}"));
+    }
     let skill_path = resolve_skill_path(&input.skill, workspace)?;
     let prompt = std::fs::read_to_string(&skill_path).map_err(|error| error.to_string())?;
     let description = parse_skill_description(&prompt);
@@ -8743,7 +8753,7 @@ fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
 /// candidates). `total_skills_indexed` is the total active skill count
 /// regardless of `max_results`.
 fn execute_skill_search(input: SkillSearchInput, workspace: &Path) -> SkillSearchOutput {
-    let skills = commands::list_skill_summaries(workspace).unwrap_or_default();
+    let skills = commands::list_enabled_skill_summaries(workspace).unwrap_or_default();
 
     let query = input.query.trim();
     let max_results = input.max_results.unwrap_or(5);
@@ -15906,5 +15916,67 @@ mod skill_search_tests {
             output.matches[0].score >= output.matches[1].score,
             "matches should be sorted by score descending"
         );
+    }
+}
+
+#[cfg(test)]
+mod skill_toggle_tests {
+    use super::*;
+
+    /// P2 判据：被禁用的技能对模型等同于不存在 —— `Skill` 工具按名加载必须
+    /// 返回 unknown，而不是继续返回正文。
+    #[test]
+    fn disabled_skill_loads_as_unknown() {
+        let root = std::env::temp_dir().join(format!("claw-skill-toggle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let workspace = root.join("workspace");
+        let skill_dir = workspace.join(".claude").join("skills").join("toggle-demo");
+        std::fs::create_dir_all(&skill_dir).expect("mkdir skill");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: toggle-demo\ndescription: 启停验证\n---\n\n正文\n",
+        )
+        .expect("write skill");
+
+        let state_dir = root.join("skill-market");
+        std::fs::create_dir_all(&state_dir).expect("mkdir market");
+        std::fs::write(
+            state_dir.join("state.json"),
+            r#"{"schema":"claw.skill-state/v1","disabled":[]}"#,
+        )
+        .expect("write state");
+
+        let previous = std::env::var_os("CLAW_CONFIG_HOME");
+        std::env::set_var("CLAW_CONFIG_HOME", &root);
+
+        let enabled = execute_skill(
+            SkillInput {
+                skill: "toggle-demo".into(),
+                args: None,
+            },
+            &workspace,
+        );
+        std::fs::write(
+            state_dir.join("state.json"),
+            r#"{"schema":"claw.skill-state/v1","disabled":["toggle-demo"]}"#,
+        )
+        .expect("rewrite state");
+        let disabled = execute_skill(
+            SkillInput {
+                skill: "toggle-demo".into(),
+                args: None,
+            },
+            &workspace,
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(enabled.is_ok(), "启用时应能加载：{enabled:?}");
+        let error = disabled.expect_err("禁用后按名加载必须失败");
+        assert!(error.contains("unknown skill"), "error={error}");
     }
 }

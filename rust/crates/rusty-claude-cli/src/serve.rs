@@ -23,7 +23,7 @@ use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{Html, IntoResponse, Json, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::Router;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -628,7 +628,12 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .route("/api/upload", post(api_upload))
             .route("/api/meta", get(api_meta))
             .route("/api/skills", get(api_skills))
-            .route("/api/skills/{name}", get(api_skill).delete(api_skill_uninstall))
+            .route(
+                "/api/skills/{name}",
+                get(api_skill)
+                    .delete(api_skill_uninstall)
+                    .patch(api_skill_toggle),
+            )
             .route("/api/skills/{name}/raw", get(api_skill_raw))
             .route("/api/skills/install", post(api_skill_install))
             .route(
@@ -3148,6 +3153,7 @@ fn load_all_skill_summaries(workspace: &Path) -> std::io::Result<Vec<commands::S
 fn skill_summary_json(
     skill: &commands::SkillSummary,
     installed: Option<&crate::skill_market::InstalledRecord>,
+    enabled: bool,
 ) -> Value {
     json!({
         "name": skill.name(),
@@ -3155,8 +3161,7 @@ fn skill_summary_json(
         "source": skill.source().scope_key(),
         "origin": skill.origin().api_key(),
         "path": skill.path().display().to_string(),
-        // P1 还没有独立启停状态：全部视为启用，`active` 只反映是否被同名技能遮蔽。
-        "enabled": true,
+        "enabled": enabled,
         "active": skill.is_active(),
         "shadowed_by": skill.shadowed_by().map(commands::DefinitionSource::scope_key),
         "managed": installed.is_some(),
@@ -3223,6 +3228,11 @@ async fn api_skills(State(state): State<AppState>, Query(auth): Query<AuthQuery>
     let total = skills.len();
     let active = skills.iter().filter(|skill| skill.is_active()).count();
     let installed = crate::skill_market::read_installed(&state.skill_market);
+    let disabled = crate::skill_market::read_state(&state.skill_market).disabled;
+    let disabled_count = skills
+        .iter()
+        .filter(|skill| disabled.contains(skill.name()))
+        .count();
     let managed = skills
         .iter()
         .filter(|skill| managed_record(&state, skill, &installed).is_some())
@@ -3235,13 +3245,16 @@ async fn api_skills(State(state): State<AppState>, Query(auth): Query<AuthQuery>
             "total": total,
             "active": active,
             "shadowed": total - active,
-            "disabled": 0,
+            "disabled": disabled_count,
             "managed": managed,
             "install_root": install_root,
         },
         "skills": skills
             .iter()
-            .map(|skill| skill_summary_json(skill, managed_record(&state, skill, &installed)))
+            .map(|skill| {
+                let enabled = !disabled.contains(skill.name());
+                skill_summary_json(skill, managed_record(&state, skill, &installed), enabled)
+            })
             .collect::<Vec<_>>(),
     }))
     .into_response()
@@ -3289,7 +3302,10 @@ async fn api_skill(
     }
     let installed = crate::skill_market::read_installed(&state.skill_market);
     let record = managed_record(&state, skill, &installed);
-    let mut body = skill_summary_json(skill, record);
+    let enabled = !crate::skill_market::read_state(&state.skill_market)
+        .disabled
+        .contains(skill.name());
+    let mut body = skill_summary_json(skill, record, enabled);
     body["files"] = Value::Array(files);
     body["invoke_as"] = json!(format!("${}", skill.name()));
     body["installed"] = match record {
@@ -3570,6 +3586,32 @@ async fn api_skill_uninstall(
     };
     match crate::skill_market::uninstall(&state.skill_market, &name, &state.skill_registry_lock) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => market_error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct SkillToggleRequest {
+    enabled: bool,
+}
+
+/// `PATCH /api/skills/{name}`：启用/禁用。只改 `state.json`，不碰技能目录。
+async fn api_skill_toggle(
+    UrlPath(name): UrlPath<String>,
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    Json(request): Json<SkillToggleRequest>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    match crate::skill_market::set_enabled(
+        &state.skill_market,
+        &name,
+        request.enabled,
+        &state.workspace,
+    ) {
+        Ok(enabled) => Json(json!({ "name": name, "enabled": enabled })).into_response(),
         Err(error) => market_error_response(error),
     }
 }

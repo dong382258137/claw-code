@@ -3895,7 +3895,7 @@ pub(crate) fn load_skill_catalog(cwd: &Path) -> Option<String> {
 
     // Load all active skills (shadowed ones are filtered out by
     // `list_skill_summaries`).
-    let skills = commands::list_skill_summaries(cwd).ok()?;
+    let skills = commands::list_enabled_skill_summaries(cwd).ok()?;
     if skills.is_empty() {
         return None;
     }

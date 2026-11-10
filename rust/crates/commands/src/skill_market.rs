@@ -90,7 +90,7 @@ impl MarketPaths {
     pub fn discover() -> Self {
         Self {
             root: runtime::default_config_home().join("skill-market"),
-            install_root: commands::skill_install_root().unwrap_or_default(),
+            install_root: crate::skill_install_root().unwrap_or_default(),
         }
     }
 
@@ -443,6 +443,74 @@ fn remove_disabled(paths: &MarketPaths, name: &str) -> io::Result<()> {
     write_json_atomic(&path, &value)
 }
 
+/// 技能启停状态文件版本。
+pub const STATE_SCHEMA: &str = "claw.skill-state/v1";
+
+/// `<market root>/state.json`：只记录**被禁用**的技能名。
+///
+/// 文件缺失或损坏一律按「全部启用」处理 —— 状态读失败绝不能把技能锁死。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    #[serde(default)]
+    pub disabled: BTreeSet<String>,
+}
+
+/// 读取启停状态（容错：读失败 / 解析失败 / 版本不符都按空状态处理）。
+#[must_use]
+pub fn read_state(paths: &MarketPaths) -> SkillState {
+    let Ok(text) = fs::read_to_string(paths.state_path()) else {
+        return SkillState::default();
+    };
+    let state = serde_json::from_str::<SkillState>(&text).unwrap_or_default();
+    match state.schema.as_deref() {
+        Some(STATE_SCHEMA) | None => state,
+        Some(_) => SkillState::default(),
+    }
+}
+
+fn write_state(paths: &MarketPaths, state: &SkillState) -> io::Result<()> {
+    let mut state = state.clone();
+    state.schema = Some(STATE_SCHEMA.to_string());
+    write_json_atomic(&paths.state_path(), &state)
+}
+
+/// 当前被禁用的技能名（读全局市场根；读不到即为空集）。
+#[must_use]
+pub fn disabled_skill_names() -> BTreeSet<String> {
+    read_state(&MarketPaths::discover()).disabled
+}
+
+/// 启用/禁用技能（幂等）。技能不存在返回 404。
+///
+/// 只改 `state.json`，**不碰技能目录** —— 启停不得修改文件内容或 mtime。
+pub fn set_enabled(
+    paths: &MarketPaths,
+    name: &str,
+    enabled: bool,
+    cwd: &Path,
+) -> Result<bool, MarketError> {
+    let name = crate::sanitize_skill_invocation_name(name)
+        .ok_or_else(|| MarketError::bad_request("技能名不合法"))?;
+    let exists = crate::list_skill_summaries(cwd)
+        .is_ok_and(|skills| skills.iter().any(|skill| skill.name() == name));
+    if !exists {
+        return Err(MarketError::not_found(format!("技能 {name} 不存在")));
+    }
+    let mut state = read_state(paths);
+    let changed = if enabled {
+        state.disabled.remove(&name)
+    } else {
+        state.disabled.insert(name.clone())
+    };
+    if changed {
+        write_state(paths, &state)
+            .map_err(|error| MarketError::new(500, format!("写入启停状态失败：{error}")))?;
+    }
+    Ok(enabled)
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -726,7 +794,7 @@ fn analyze_entry(root: &Path, entry: &MarketplaceEntry) -> AnalyzedEntry {
         analyzed.detail = Some("name".to_string());
         return analyzed;
     }
-    match commands::sanitize_skill_invocation_name(&raw_name) {
+    match crate::sanitize_skill_invocation_name(&raw_name) {
         Some(sanitized) if sanitized == raw_name => analyzed.install_name = Some(sanitized),
         _ => {
             analyzed.reason = Some("name_mismatch");
@@ -800,9 +868,9 @@ fn analyze_entry(root: &Path, entry: &MarketplaceEntry) -> AnalyzedEntry {
         analyzed.detail = Some(relative.to_string());
         return analyzed;
     };
-    let (declared, description) = commands::parse_skill_frontmatter(&contents);
+    let (declared, description) = crate::parse_skill_frontmatter(&contents);
     if let Some(declared) = declared.as_deref() {
-        let sanitized = commands::sanitize_skill_invocation_name(declared);
+        let sanitized = crate::sanitize_skill_invocation_name(declared);
         if sanitized.as_deref() != analyzed.install_name.as_deref() {
             analyzed.reason = Some("name_mismatch");
             analyzed.detail = Some(format!(
@@ -1026,7 +1094,7 @@ impl Drop for StagingGuard {
 
 fn copy_into_staging(source: &Path, staging: &Path) -> io::Result<()> {
     if source.is_dir() {
-        commands::copy_directory_contents(source, staging)
+        crate::copy_directory_contents(source, staging)
     } else {
         fs::copy(source, staging.join("SKILL.md")).map(|_| ())
     }
@@ -1060,9 +1128,9 @@ fn validate_staging(staging: &Path, name: &str) -> Result<String, MarketError> {
             format!("安装失败：读取 SKILL.md 失败（{error}）（已回滚）"),
         )
     })?;
-    let (declared, _) = commands::parse_skill_frontmatter(&contents);
+    let (declared, _) = crate::parse_skill_frontmatter(&contents);
     if let Some(declared) = declared.as_deref() {
-        if commands::sanitize_skill_invocation_name(declared).as_deref() != Some(name) {
+        if crate::sanitize_skill_invocation_name(declared).as_deref() != Some(name) {
             return Err(MarketError::unprocessable(format!(
                 "SKILL.md 声明的名字 {declared} 与索引 {name} 不一致"
             )));
@@ -1077,77 +1145,59 @@ fn validate_staging(staging: &Path, name: &str) -> Result<String, MarketError> {
     Ok(digest)
 }
 
-/// 安装一个本地索引条目。
+/// 已解析、已校验的安装输入 —— 市场安装与 CLI `/skills install` 共用。
+struct PreparedInstall {
+    name: String,
+    display_name: Option<String>,
+    version: String,
+    /// 已 canonicalize 的源路径（目录或单个 `.md`）。
+    source_path: PathBuf,
+    /// `Some` 时安装成功后写 `installed.json`；CLI 本地安装为 `None`。
+    registry: Option<RegistryMeta>,
+}
+
+/// 只有市场安装才有：记录来源市场与来源坐标。
+struct RegistryMeta {
+    marketplace: String,
+    source: InstalledSource,
+}
+
+/// 安装结果（两条安装路径共用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallOutcome {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub version: String,
+    pub checksum: String,
+    pub source: PathBuf,
+    pub install_path: PathBuf,
+}
+
+/// **唯一**的原子安装流水线。
 ///
-/// 顺序：校验索引 → 复制到 staging → 校验 staging →（可选）旧目录进
-/// trash → rename 入安装根 → 写注册表。5/6 失败逆序回滚。
-#[allow(clippy::too_many_arguments)]
-pub fn install(
+/// 顺序：staging → staging 校验 →（升级且目标已存在时）旧目录进 trash →
+/// rename 入安装根 → 最后写注册表。任何一步失败都按逆序回滚：不留半个技能
+/// 目录，也不留半条注册表记录。
+fn run_install_pipeline(
     paths: &MarketPaths,
-    source_id: &str,
-    name: &str,
-    client_version: Option<&str>,
+    prepared: PreparedInstall,
     upgrade: bool,
     registry_lock: &Mutex<()>,
     fault: Fault,
-) -> Result<InstalledRecord, MarketError> {
+) -> Result<InstallOutcome, MarketError> {
     if paths.install_root.as_os_str().is_empty() {
         return Err(MarketError::new(
             500,
             "无法解析技能安装目录；请设置 CLAW_CONFIG_HOME、HOME 或 USERPROFILE",
         ));
     }
-    let name = commands::sanitize_skill_invocation_name(name)
-        .ok_or_else(|| MarketError::bad_request("技能名不合法"))?;
-
-    let sources = read_sources(paths);
-    let source = sources
-        .sources
-        .iter()
-        .find(|source| source.id == source_id)
-        .ok_or_else(|| MarketError::not_found(format!("来源 {source_id} 不存在")))?;
-    if source.kind != "local" {
-        return Err(MarketError::bad_request(
-            "当前版本只支持本地来源（git 来源将在 P3 支持）",
-        ));
-    }
-    let (root, index) = load_local_index(&source.value).map_err(|(status, error)| {
-        if status == "unsupported" {
-            MarketError::unprocessable(format!(
-                "来源 {} 不受支持：{error}",
-                source.name.as_deref().unwrap_or(&source.id)
-            ))
-        } else {
-            MarketError::unprocessable(format!(
-                "来源 {} 不可用：{error}",
-                source.name.as_deref().unwrap_or(&source.id)
-            ))
-        }
-    })?;
-    let entry = index
-        .skills
-        .iter()
-        .find(|entry| {
-            entry
-                .name
-                .as_deref()
-                .and_then(commands::sanitize_skill_invocation_name)
-                .as_deref()
-                == Some(name.as_str())
-        })
-        .ok_or_else(|| MarketError::not_found(format!("技能 {name} 不存在")))?;
-    let analyzed = analyze_entry(&root, entry);
-    if analyzed.reason.is_some() {
-        return Err(MarketError::unprocessable(reason_message(&analyzed)));
-    }
-    if let Some(client_version) = client_version.map(str::trim).filter(|v| !v.is_empty()) {
-        if client_version != analyzed.version {
-            return Err(MarketError::conflict(format!(
-                "索引版本已变化（{}），请刷新后重试",
-                analyzed.version
-            )));
-        }
-    }
+    let PreparedInstall {
+        name,
+        display_name,
+        version,
+        source_path,
+        registry: registry_meta,
+    } = prepared;
 
     let target = paths.install_root.join(&name);
     let registry = read_installed(paths);
@@ -1157,7 +1207,7 @@ pub fn install(
             .get(&name)
             .map_or_else(|| "未知版本".to_string(), |record| record.version.clone());
         return Err(MarketError::conflict(format!(
-            "技能 {name} 已安装（{old_version}）；如需覆盖请勾选「升级安装」"
+            "技能 {name} 已安装（{old_version}）；如需覆盖请使用升级安装"
         )));
     }
     if target.exists()
@@ -1183,11 +1233,7 @@ pub fn install(
             format!("安装失败：创建暂存目录失败（{error}）（已回滚）"),
         )
     })?;
-    let source_path = analyzed
-        .source_path
-        .as_deref()
-        .ok_or_else(|| MarketError::new(500, "安装失败：索引条目缺少源路径（已回滚）"))?;
-    copy_into_staging(source_path, staging.path()).map_err(|error| {
+    copy_into_staging(&source_path, staging.path()).map_err(|error| {
         MarketError::new(
             500,
             format!("安装失败：复制技能文件失败（{error}）（已回滚）"),
@@ -1239,51 +1285,285 @@ pub fn install(
     }
 
     let now = now_unix_ms();
-    let installed_at = registry
-        .skills
-        .get(&name)
-        .map_or(now, |record| record.installed_at_unix_ms);
-    let record = InstalledRecord {
-        name: name.clone(),
-        display_name: analyzed.display_name.clone(),
-        version: analyzed.version.clone(),
-        marketplace: source.name.clone().unwrap_or_else(|| source.id.clone()),
-        source: InstalledSource {
-            kind: source.kind.clone(),
-            value: source.value.clone(),
-            subdir: source.subdir.clone(),
-            resolved_ref: None,
-        },
-        checksum: Some(checksum),
-        installed_at_unix_ms: installed_at,
-        updated_at_unix_ms: now,
-        managed: true,
-    };
+    if let Some(meta) = registry_meta {
+        let installed_at = registry
+            .skills
+            .get(&name)
+            .map_or(now, |record| record.installed_at_unix_ms);
+        let record = InstalledRecord {
+            name: name.clone(),
+            display_name: display_name.clone(),
+            version: version.clone(),
+            marketplace: meta.marketplace,
+            source: meta.source,
+            checksum: Some(checksum.clone()),
+            installed_at_unix_ms: installed_at,
+            updated_at_unix_ms: now,
+            managed: true,
+        };
 
-    let write_result = {
-        let _guard = registry_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut latest = read_installed(paths);
-        latest.schema = installed_schema();
-        latest.skills.insert(name.clone(), record.clone());
-        remove_disabled(paths, &name).and_then(|()| write_installed(paths, &latest))
-    };
-    if let Err(error) = write_result {
-        let _ = remove_any(&target);
-        if let Some(trash_path) = &trash {
-            let _ = fs::rename(trash_path, &target);
+        let write_result = {
+            let _guard = registry_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut latest = read_installed(paths);
+            latest.schema = installed_schema();
+            latest.skills.insert(name.clone(), record.clone());
+            remove_disabled(paths, &name).and_then(|()| write_installed(paths, &latest))
+        };
+        if let Err(error) = write_result {
+            let _ = remove_any(&target);
+            if let Some(trash_path) = &trash {
+                let _ = fs::rename(trash_path, &target);
+            }
+            return Err(MarketError::new(
+                500,
+                format!("安装失败：{error}（已回滚）"),
+            ));
         }
-        return Err(MarketError::new(
-            500,
-            format!("安装失败：{error}（已回滚）"),
-        ));
     }
 
     if let Some(trash_path) = &trash {
         let _ = remove_any(trash_path);
     }
-    Ok(record)
+    Ok(InstallOutcome {
+        name,
+        display_name,
+        version,
+        checksum,
+        source: source_path,
+        install_path: target,
+    })
+}
+
+/// 安装一个本地索引条目（WebUI 市场路径）。
+///
+/// 负责来源/索引解析与条目校验，真正的落盘交给 [`run_install_pipeline`]。
+#[allow(clippy::too_many_arguments)]
+pub fn install(
+    paths: &MarketPaths,
+    source_id: &str,
+    name: &str,
+    client_version: Option<&str>,
+    upgrade: bool,
+    registry_lock: &Mutex<()>,
+    fault: Fault,
+) -> Result<InstalledRecord, MarketError> {
+    if paths.install_root.as_os_str().is_empty() {
+        return Err(MarketError::new(
+            500,
+            "无法解析技能安装目录；请设置 CLAW_CONFIG_HOME、HOME 或 USERPROFILE",
+        ));
+    }
+    let name = crate::sanitize_skill_invocation_name(name)
+        .ok_or_else(|| MarketError::bad_request("技能名不合法"))?;
+
+    let sources = read_sources(paths);
+    let source = sources
+        .sources
+        .iter()
+        .find(|source| source.id == source_id)
+        .ok_or_else(|| MarketError::not_found(format!("来源 {source_id} 不存在")))?;
+    if source.kind != "local" {
+        return Err(MarketError::bad_request(
+            "当前版本只支持本地来源（git 来源将在 P3 支持）",
+        ));
+    }
+    let (root, index) = load_local_index(&source.value).map_err(|(status, error)| {
+        if status == "unsupported" {
+            MarketError::unprocessable(format!(
+                "来源 {} 不受支持：{error}",
+                source.name.as_deref().unwrap_or(&source.id)
+            ))
+        } else {
+            MarketError::unprocessable(format!(
+                "来源 {} 不可用：{error}",
+                source.name.as_deref().unwrap_or(&source.id)
+            ))
+        }
+    })?;
+    let entry = index
+        .skills
+        .iter()
+        .find(|entry| {
+            entry
+                .name
+                .as_deref()
+                .and_then(crate::sanitize_skill_invocation_name)
+                .as_deref()
+                == Some(name.as_str())
+        })
+        .ok_or_else(|| MarketError::not_found(format!("技能 {name} 不存在")))?;
+    let analyzed = analyze_entry(&root, entry);
+    if analyzed.reason.is_some() {
+        return Err(MarketError::unprocessable(reason_message(&analyzed)));
+    }
+    if let Some(client_version) = client_version.map(str::trim).filter(|v| !v.is_empty()) {
+        if client_version != analyzed.version {
+            return Err(MarketError::conflict(format!(
+                "索引版本已变化（{}），请刷新后重试",
+                analyzed.version
+            )));
+        }
+    }
+    let source_path = analyzed
+        .source_path
+        .clone()
+        .ok_or_else(|| MarketError::new(500, "安装失败：索引条目缺少源路径（已回滚）"))?;
+
+    run_install_pipeline(
+        paths,
+        PreparedInstall {
+            name: name.clone(),
+            display_name: analyzed.display_name,
+            version: analyzed.version,
+            source_path,
+            registry: Some(RegistryMeta {
+                marketplace: source.name.clone().unwrap_or_else(|| source.id.clone()),
+                source: InstalledSource {
+                    kind: source.kind.clone(),
+                    value: source.value.clone(),
+                    subdir: source.subdir.clone(),
+                    resolved_ref: None,
+                },
+            }),
+        },
+        upgrade,
+        registry_lock,
+        fault,
+    )?;
+
+    read_installed(paths)
+        .skills
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| MarketError::new(500, "安装成功但注册表缺少记录"))
+}
+
+/// `/skills install <path>`：本地目录或单个 `.md` 也走**同一条**原子流水线。
+///
+/// 与市场安装的差别只有两点：没有索引来源；不写 `installed.json`（CLI 安装
+/// 不属于市场受管技能，因此不能从 WebUI 卸载，但可以禁用）。
+pub fn install_local(
+    paths: &MarketPaths,
+    source: &str,
+    cwd: &Path,
+    upgrade: bool,
+    registry_lock: &Mutex<()>,
+    fault: Fault,
+) -> Result<InstallOutcome, MarketError> {
+    if paths.install_root.as_os_str().is_empty() {
+        return Err(MarketError::new(
+            500,
+            "无法解析技能安装目录；请设置 CLAW_CONFIG_HOME、HOME 或 USERPROFILE",
+        ));
+    }
+    let resolved = resolve_local_source(source, cwd)?;
+    let root = resolved
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| resolved.clone());
+    let relative = resolved
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .ok_or_else(|| MarketError::bad_request("技能源路径不合法"))?;
+    let name = derive_local_install_name(&resolved)?;
+    let entry = MarketplaceEntry {
+        name: Some(name),
+        version: None,
+        path: Some(relative),
+        description: None,
+        tags: Vec::new(),
+        sha256: None,
+        min_claw_version: None,
+    };
+    let analyzed = analyze_entry(&root, &entry);
+    if analyzed.reason.is_some() {
+        return Err(MarketError::unprocessable(reason_message(&analyzed)));
+    }
+    let source_path = analyzed
+        .source_path
+        .clone()
+        .ok_or_else(|| MarketError::new(500, "安装失败：源路径缺失（已回滚）"))?;
+
+    run_install_pipeline(
+        paths,
+        PreparedInstall {
+            name: analyzed.install_name.unwrap_or_default(),
+            display_name: analyzed.display_name,
+            version: analyzed.version,
+            source_path,
+            registry: None,
+        },
+        upgrade,
+        registry_lock,
+        fault,
+    )
+}
+
+/// 把 `/skills install` 的入参解析成已 canonicalize 的源路径。
+fn resolve_local_source(source: &str, cwd: &Path) -> Result<PathBuf, MarketError> {
+    let candidate = PathBuf::from(source);
+    let source = if candidate.is_absolute() {
+        candidate
+    } else {
+        cwd.join(candidate)
+    };
+    let source = fs::canonicalize(&source)
+        .map_err(|error| MarketError::bad_request(format!("技能源不可读：{error}")))?;
+    if source.is_dir() {
+        if !source.join("SKILL.md").is_file() {
+            return Err(MarketError::bad_request(format!(
+                "技能目录 '{}' 必须包含 SKILL.md",
+                source.display()
+            )));
+        }
+        return Ok(source);
+    }
+    if source
+        .extension()
+        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("md"))
+    {
+        return Ok(source);
+    }
+    Err(MarketError::bad_request(format!(
+        "技能源 '{}' 必须是含 SKILL.md 的目录或 markdown 文件",
+        source.display()
+    )))
+}
+
+/// 本地安装的技能名：SKILL.md 声明名优先，否则目录名 / 文件名。
+fn derive_local_install_name(resolved: &Path) -> Result<String, MarketError> {
+    let (prompt, fallback) = if resolved.is_dir() {
+        (
+            resolved.join("SKILL.md"),
+            resolved
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string()),
+        )
+    } else {
+        (
+            resolved.to_path_buf(),
+            resolved
+                .file_stem()
+                .map(|n| n.to_string_lossy().to_string()),
+        )
+    };
+    if let Ok(contents) = fs::read_to_string(&prompt) {
+        let (declared, _) = crate::parse_skill_frontmatter(&contents);
+        if let Some(name) = declared
+            .as_deref()
+            .and_then(crate::sanitize_skill_invocation_name)
+        {
+            return Ok(name);
+        }
+    }
+    fallback
+        .as_deref()
+        .and_then(crate::sanitize_skill_invocation_name)
+        .ok_or_else(|| {
+            MarketError::bad_request(format!("无法从 '{}' 推导技能名", resolved.display()))
+        })
 }
 
 /// 卸载市场安装的技能：目录先进 trash，注册表写成功后才真正删除。
@@ -1298,7 +1578,7 @@ pub fn uninstall(
             "无法解析技能安装目录；请设置 CLAW_CONFIG_HOME、HOME 或 USERPROFILE",
         ));
     }
-    let name = commands::sanitize_skill_invocation_name(name)
+    let name = crate::sanitize_skill_invocation_name(name)
         .ok_or_else(|| MarketError::bad_request("技能名不合法"))?;
     let registry = read_installed(paths);
     let Some(record) = registry.skills.get(&name) else {
@@ -1369,6 +1649,10 @@ mod tests {
             }
         }
     }
+
+    /// 同一进程内改写 `CLAW_CONFIG_HOME` 的用例必须串行，否则并行时互相
+    /// 覆盖对方的环境变量，导致技能发现指向别人的临时目录。
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct Fixture {
         _tmp: TempDir,
@@ -1624,6 +1908,9 @@ mod tests {
             ]),
         );
         let previous_config_home = std::env::var_os("CLAW_CONFIG_HOME");
+        let _env_lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config_home = fixture.paths.install_root.parent().expect("config home");
         std::env::set_var("CLAW_CONFIG_HOME", config_home);
         let env_guard = EnvGuard(previous_config_home);
@@ -1639,27 +1926,24 @@ mod tests {
         )
         .expect("install aaa-demo");
 
-        let before = crate::app::load_skill_catalog(&fixture.workspace)
-            .expect("prompt catalog before uninstall");
+        let before = crate::list_skill_summaries(&fixture.workspace).expect("summaries");
         assert!(
-            before.contains("aaa-demo"),
-            "安装后系统提示应包含技能：{before}"
+            before.iter().any(|skill| skill.name() == "aaa-demo"),
+            "安装后技能列表应包含该技能"
         );
-        let fingerprint_before = commands::skill_catalog_fingerprint(&fixture.workspace);
+        let fingerprint_before = crate::skill_catalog_fingerprint(&fixture.workspace);
 
         uninstall(&fixture.paths, "aaa-demo", &Mutex::new(())).expect("uninstall");
         assert!(!fixture.paths.install_root.join("aaa-demo").exists());
         assert!(read_installed(&fixture.paths).skills.is_empty());
         assert!(trash_is_empty(&fixture.paths));
 
-        let after = crate::app::load_skill_catalog(&fixture.workspace);
+        let after = crate::list_skill_summaries(&fixture.workspace).expect("summaries");
         assert!(
-            after
-                .as_deref()
-                .is_none_or(|text| !text.contains("aaa-demo")),
-            "卸载后系统提示不应再包含技能：{after:?}"
+            !after.iter().any(|skill| skill.name() == "aaa-demo"),
+            "卸载后技能列表不应再包含该技能"
         );
-        let fingerprint_after = commands::skill_catalog_fingerprint(&fixture.workspace);
+        let fingerprint_after = crate::skill_catalog_fingerprint(&fixture.workspace);
         assert_ne!(
             fingerprint_before, fingerprint_after,
             "卸载后技能目录指纹必须变化，否则下一次 prompt 构建会命中旧缓存"
@@ -1775,5 +2059,100 @@ mod tests {
             .expect_err("unmanaged uninstall must fail");
         assert_eq!(error.status, 409);
         assert!(fixture.paths.install_root.join("manual").is_dir());
+    }
+
+    /// 目录快照：相对路径 + 大小 + 修改时间。启停前后必须完全一致。
+    fn snapshot_tree(root: &Path) -> Vec<(String, u64, u128)> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64, u128)>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(root, &path, out);
+                    continue;
+                }
+                let metadata = entry.metadata().ok();
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string();
+                let len = metadata.as_ref().map_or(0, std::fs::Metadata::len);
+                let mtime = metadata
+                    .and_then(|meta| meta.modified().ok())
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |duration| duration.as_millis());
+                out.push((relative, len, mtime));
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// P2 判据：开关只写 `state.json`，列表口径随之变化，技能目录一个字节都不动；
+    /// 新开一次 `read_state`（等价重启 WebUI）仍保持禁用。
+    #[test]
+    fn toggle_filters_lists_without_touching_skill_dir() {
+        let fixture = fixture();
+        let config_home = fixture
+            .paths
+            .install_root
+            .parent()
+            .expect("config home")
+            .to_path_buf();
+        let previous = std::env::var_os("CLAW_CONFIG_HOME");
+        let _env_lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        let _guard = EnvGuard(previous);
+
+        install_demo(&fixture, false, Fault::None).expect("install demo");
+        let skill_dir = fixture.paths.install_root.join("demo");
+        let before = snapshot_tree(&skill_dir);
+
+        let visible = crate::list_skill_summaries_filtered(&fixture.workspace, &BTreeSet::new())
+            .expect("summaries");
+        assert!(visible.iter().any(|skill| skill.name() == "demo"));
+
+        let disabled = set_enabled(&fixture.paths, "demo", false, &fixture.workspace);
+        assert!(
+            disabled.is_ok(),
+            "禁用失败：{:?}",
+            disabled.err().map(|error| (error.status, error.message))
+        );
+        // 重新读盘 = WebUI 重启后的状态。
+        let persisted = read_state(&fixture.paths);
+        assert!(persisted.disabled.contains("demo"), "禁用状态必须落盘");
+
+        let hidden = crate::list_skill_summaries_filtered(&fixture.workspace, &persisted.disabled)
+            .expect("summaries");
+        assert!(
+            !hidden.iter().any(|skill| skill.name() == "demo"),
+            "禁用后列表不应再出现该技能"
+        );
+        assert_eq!(snapshot_tree(&skill_dir), before, "启停不得修改技能目录");
+
+        assert!(set_enabled(&fixture.paths, "demo", true, &fixture.workspace).expect("enable"));
+        let restored = crate::list_skill_summaries_filtered(
+            &fixture.workspace,
+            &read_state(&fixture.paths).disabled,
+        )
+        .expect("summaries");
+        assert!(restored.iter().any(|skill| skill.name() == "demo"));
+        assert_eq!(snapshot_tree(&skill_dir), before, "启停不得修改技能目录");
+    }
+
+    #[test]
+    fn toggle_unknown_skill_is_not_found() {
+        let fixture = fixture();
+        let error = set_enabled(&fixture.paths, "no-such-skill", false, &fixture.workspace)
+            .expect_err("unknown skill must fail");
+        assert_eq!(error.status, 404);
+        assert!(read_state(&fixture.paths).disabled.is_empty());
     }
 }

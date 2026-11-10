@@ -1,8 +1,14 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// 技能市场：来源、原子安装/卸载与安装注册表。
+///
+/// 放在 `commands` 而不是 CLI crate，是为了让 `/skills install` 与 WebUI
+/// 市场安装共用**同一条**原子安装流水线，避免两套安装语义并存。
+pub mod skill_market;
 
 use plugins::{PluginError, PluginLoadFailure, PluginManager, PluginSummary};
 use runtime::{
@@ -2490,12 +2496,6 @@ struct InstalledSkill {
     installed_path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SkillInstallSource {
-    Directory { root: PathBuf, prompt_path: PathBuf },
-    MarkdownFile { path: PathBuf },
-}
-
 #[allow(clippy::too_many_lines)]
 pub fn handle_plugins_slash_command(
     action: Option<&str>,
@@ -2685,17 +2685,19 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
     match normalize_optional_args(args) {
         None | Some("list") => {
             let roots = discover_skill_roots(cwd);
-            let skills = load_skills_from_roots(&roots)?;
+            let mut skills = load_skills_from_roots(&roots)?;
+            retain_enabled(&mut skills);
             Ok(render_skills_report(&skills))
         }
         Some(args) if args.starts_with("list ") => {
             let filter = args["list ".len()..].trim().to_lowercase();
             let roots = discover_skill_roots(cwd);
             let skills = load_skills_from_roots(&roots)?;
-            let filtered: Vec<_> = skills
+            let mut filtered: Vec<_> = skills
                 .into_iter()
                 .filter(|s| s.name.to_lowercase().contains(&filter))
                 .collect();
+            retain_enabled(&mut filtered);
             Ok(render_skills_report(&filtered))
         }
         Some("show" | "info" | "describe") => {
@@ -2750,17 +2752,19 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
     match normalize_optional_args(args) {
         None | Some("list") => {
             let roots = discover_skill_roots(cwd);
-            let skills = load_skills_from_roots(&roots)?;
+            let mut skills = load_skills_from_roots(&roots)?;
+            retain_enabled(&mut skills);
             Ok(render_skills_report_json(&skills))
         }
         Some(args) if args.starts_with("list ") => {
             let filter = args["list ".len()..].trim().to_lowercase();
             let roots = discover_skill_roots(cwd);
             let skills = load_skills_from_roots(&roots)?;
-            let filtered: Vec<_> = skills
+            let mut filtered: Vec<_> = skills
                 .into_iter()
                 .filter(|s| s.name.to_lowercase().contains(&filter))
                 .collect();
+            retain_enabled(&mut filtered);
             Ok(render_skills_report_json(&filtered))
         }
         Some("show" | "info" | "describe") => {
@@ -2916,6 +2920,16 @@ pub fn skill_catalog_fingerprint(cwd: &Path) -> u64 {
         }
         for value in [mtime_ms, len] {
             hash ^= value;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    // 启停状态同样影响 catalog：禁用/启用后指纹必须变化，否则跨会话缓存
+    // 会继续注入已禁用的技能。
+    for name in skill_market::disabled_skill_names() {
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        for byte in name.as_bytes() {
+            hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(FNV_PRIME);
         }
     }
@@ -3585,53 +3599,29 @@ pub fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
     roots
 }
 
+/// `/skills install <path>`：与 WebUI 市场安装共用**同一条**原子安装流水线。
+///
+/// 历史上这里有一套独立的「建目录 + 递归复制」实现（无回滚、无并发锁、
+/// 无校验），与市场安装语义分叉。现在统一委派给
+/// [`skill_market::install_local`]：staging → 校验 → rename → 注册表，
+/// 任一步失败都回到安装前状态。
 fn install_skill(source: &str, cwd: &Path) -> std::io::Result<InstalledSkill> {
-    let registry_root = skill_install_root()?;
-    install_skill_into(source, cwd, &registry_root)
-}
-
-fn install_skill_into(
-    source: &str,
-    cwd: &Path,
-    registry_root: &Path,
-) -> std::io::Result<InstalledSkill> {
-    let source = resolve_skill_install_source(source, cwd)?;
-    let prompt_path = source.prompt_path();
-    let contents = fs::read_to_string(prompt_path)?;
-    let display_name = parse_skill_frontmatter(&contents).0;
-    let invocation_name = derive_skill_install_name(&source, display_name.as_deref())?;
-    let installed_path = registry_root.join(&invocation_name);
-
-    if installed_path.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!(
-                "skill '{invocation_name}' is already installed at {}",
-                installed_path.display()
-            ),
-        ));
-    }
-
-    fs::create_dir_all(&installed_path)?;
-    let install_result = match &source {
-        SkillInstallSource::Directory { root, .. } => {
-            copy_directory_contents(root, &installed_path)
-        }
-        SkillInstallSource::MarkdownFile { path } => {
-            fs::copy(path, installed_path.join("SKILL.md")).map(|_| ())
-        }
-    };
-    if let Err(error) = install_result {
-        let _ = fs::remove_dir_all(&installed_path);
-        return Err(error);
-    }
-
+    let paths = skill_market::MarketPaths::discover();
+    let outcome = skill_market::install_local(
+        &paths,
+        source,
+        cwd,
+        false,
+        &std::sync::Mutex::new(()),
+        skill_market::Fault::None,
+    )
+    .map_err(|error| std::io::Error::other(error.message))?;
     Ok(InstalledSkill {
-        invocation_name,
-        display_name,
-        source: source.report_path().to_path_buf(),
-        registry_root: registry_root.to_path_buf(),
-        installed_path,
+        invocation_name: outcome.name,
+        display_name: outcome.display_name,
+        source: outcome.source,
+        registry_root: paths.install_root,
+        installed_path: outcome.install_path,
     })
 }
 
@@ -3664,67 +3654,6 @@ fn skill_install_root_from(config_home: PathBuf) -> std::io::Result<PathBuf> {
         ));
     }
     Ok(config_home.join("skills"))
-}
-
-fn resolve_skill_install_source(source: &str, cwd: &Path) -> std::io::Result<SkillInstallSource> {
-    let candidate = PathBuf::from(source);
-    let source = if candidate.is_absolute() {
-        candidate
-    } else {
-        cwd.join(candidate)
-    };
-    let source = fs::canonicalize(&source)?;
-
-    if source.is_dir() {
-        let prompt_path = source.join("SKILL.md");
-        if !prompt_path.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "skill directory '{}' must contain SKILL.md",
-                    source.display()
-                ),
-            ));
-        }
-        return Ok(SkillInstallSource::Directory {
-            root: source,
-            prompt_path,
-        });
-    }
-
-    if source
-        .extension()
-        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("md"))
-    {
-        return Ok(SkillInstallSource::MarkdownFile { path: source });
-    }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        format!(
-            "skill source '{}' must be a directory with SKILL.md or a markdown file",
-            source.display()
-        ),
-    ))
-}
-
-fn derive_skill_install_name(
-    source: &SkillInstallSource,
-    declared_name: Option<&str>,
-) -> std::io::Result<String> {
-    for candidate in [declared_name, source.fallback_name().as_deref()] {
-        if let Some(candidate) = candidate.and_then(sanitize_skill_invocation_name) {
-            return Ok(candidate);
-        }
-    }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        format!(
-            "unable to derive an installable invocation name from '{}'",
-            source.report_path().display()
-        ),
-    ))
 }
 
 /// 把候选名字归一成可安装/可调用的技能名（小写 `[a-z0-9._-]`）。
@@ -3779,33 +3708,6 @@ pub fn copy_directory_contents(source: &Path, destination: &Path) -> std::io::Re
         }
     }
     Ok(())
-}
-
-impl SkillInstallSource {
-    fn prompt_path(&self) -> &Path {
-        match self {
-            Self::Directory { prompt_path, .. } => prompt_path,
-            Self::MarkdownFile { path } => path,
-        }
-    }
-
-    fn fallback_name(&self) -> Option<String> {
-        match self {
-            Self::Directory { root, .. } => root
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string()),
-            Self::MarkdownFile { path } => path
-                .file_stem()
-                .map(|name| name.to_string_lossy().to_string()),
-        }
-    }
-
-    fn report_path(&self) -> &Path {
-        match self {
-            Self::Directory { root, .. } => root,
-            Self::MarkdownFile { path } => path,
-        }
-    }
 }
 
 fn push_unique_root(
@@ -4216,6 +4118,33 @@ pub fn list_skill_summaries(cwd: &Path) -> std::io::Result<Vec<SkillSummary>> {
     Ok(skills)
 }
 
+/// 只返回**已启用**的技能摘要（显式传入禁用集，供测试与调用方注入）。
+///
+/// `/skills list`、`SkillSearch`、系统提示 catalog 全部走这条过滤，保证三处
+/// 口径一致 —— 禁用必须"一次生效、处处不见"。
+pub fn list_skill_summaries_filtered(
+    cwd: &Path,
+    disabled: &BTreeSet<String>,
+) -> std::io::Result<Vec<SkillSummary>> {
+    let mut skills = list_skill_summaries(cwd)?;
+    if !disabled.is_empty() {
+        skills.retain(|skill| !disabled.contains(skill.name()));
+    }
+    Ok(skills)
+}
+
+/// 读全局启停状态后过滤的技能摘要（生产入口）。
+pub fn list_enabled_skill_summaries(cwd: &Path) -> std::io::Result<Vec<SkillSummary>> {
+    list_skill_summaries_filtered(cwd, &skill_market::disabled_skill_names())
+}
+
+/// 技能是否被显式禁用（`Skill` 按名加载时据此返回 unknown）。
+#[must_use]
+pub fn is_skill_disabled(name: &str) -> bool {
+    let name = name.trim().trim_start_matches('/').trim_start_matches('$');
+    !name.is_empty() && skill_market::disabled_skill_names().contains(name)
+}
+
 /// 注入 catalog 的常显单行数上限。
 ///
 /// 超过后软折叠(超量技能收进一行计数提示,由 `SkillSearch` 语义发现):
@@ -4393,6 +4322,14 @@ fn agent_detail(agent: &AgentSummary) -> String {
         parts.push(reasoning.clone());
     }
     parts.join(" · ")
+}
+
+/// 从列表中剔除被显式禁用的技能（`<config home>/skill-market/state.json`）。
+fn retain_enabled(skills: &mut Vec<SkillSummary>) {
+    let disabled = skill_market::disabled_skill_names();
+    if !disabled.is_empty() {
+        skills.retain(|skill| !disabled.contains(&skill.name));
+    }
 }
 
 fn render_skills_report(skills: &[SkillSummary]) -> String {
@@ -6887,12 +6824,28 @@ other: value
         fs::create_dir_all(&script_dir).expect("script dir");
         fs::write(script_dir.join("run.sh"), "#!/bin/sh\necho help\n").expect("write script");
 
-        let installed = super::install_skill_into(
+        // `/skills install` 与市场安装共用同一条原子流水线，这里直接验证该
+        // 流水线的本地入口（详见 skill_market::install_local）。
+        let market = super::skill_market::MarketPaths::with_roots(
+            workspace.join("skill-market"),
+            install_root.clone(),
+        );
+        let outcome = super::skill_market::install_local(
+            &market,
             source_root.to_str().expect("utf8 skill path"),
             &workspace,
-            &install_root,
+            false,
+            &std::sync::Mutex::new(()),
+            super::skill_market::Fault::None,
         )
         .expect("skill should install");
+        let installed = super::InstalledSkill {
+            invocation_name: outcome.name,
+            display_name: outcome.display_name,
+            source: outcome.source,
+            registry_root: market.install_root.clone(),
+            installed_path: outcome.install_path,
+        };
 
         assert_eq!(installed.invocation_name, "help");
         assert_eq!(installed.display_name.as_deref(), Some("help"));

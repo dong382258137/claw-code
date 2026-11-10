@@ -516,12 +516,12 @@
   5. 卸载后目录消失、`installed.json.skills` 为 `{}`、`trash\` 为空。
   6. 两个终端同时 `POST install` 同名 → 一个 201、一个 409（文案含「正在安装」）。
 - 回滚：删 `~/.claw/skill-market/` 与已装技能目录；卸掉路由。已安装技能本身就是普通目录，回退后 CLI 仍可用。
-- **实现偏差（2026-11-10）**：`install_skill_into` 未被市场复用 —— 它直接写最终目录，不满足「staging → 校验 → rename → 注册表」的原子性要求。市场流水线改为复用 `commands::copy_directory_contents` 与 `commands::sanitize_skill_invocation_name`（两者已公开），`/skills install` 行为不变。git 来源在 P1 接受落盘但固定 `status=unreadable`、不参与安装（P3 实现）。
+- **实现偏差与收口（2026-11-10）**：P1 初版未复用 `install_skill_into`（它直接写最终目录，不满足原子性要求），导致仓库里短暂存在两套安装逻辑。**已收口**：`skill_market` 整体下沉到 `commands` crate，`/skills install` 与 WebUI 市场安装共用同一条流水线（`skill_market::install_local` / `install` → `run_install_pipeline`），旧的 `install_skill_into`、`SkillInstallSource` 及其两个私有 helper 已删除。两条路径只保留一个差异：CLI 本地安装不写 `installed.json`（不属于市场受管技能），其余（staging → 校验 → rename → 回滚顺序）完全一致。git 来源在 P1 接受落盘但固定 `status=unreadable`、不参与安装（P3 实现）。
 - **P1 实测记录（2026-11-10，本机 Windows）**：
 
   | 判据 | 实测 |
   | --- | --- |
-  | 单测 | `cargo test -p rusty-claude-cli skill_market::tests`：9 passed（原子安装、两种故障注入回滚、并发一胜一负、卸载+prompt 重建、路径逃逸、校验和不匹配） |
+  | 单测 | `cargo test -p commands skill_market::tests`：9 passed（原子安装、两种故障注入回滚、并发一胜一负、卸载+prompt 重建、路径逃逸、校验和不匹配）；模块下沉到 `commands` 后原样通过 |
   | 判据 1：安装落盘 | `D:\tmp\p1-config\skills\demo\SKILL.md` 存在；`installed.json` 1 条记录，checksum `sha256:4f5ac45b…` |
   | 判据 2：CLI 可见 | `claw --output-format json skills list` 含 `demo`（source=`user_claw_config_home`） |
   | 判据 3：重复安装 | `upgrade:false` → 409「技能 demo 已安装（1.2.0）；如需覆盖请勾选「升级安装」」；目录 mtime `2026-11-10T09:22:33.0974406Z` 前后一致 |
@@ -529,7 +529,7 @@
   | 判据 5：卸载 | 204；目录消失；`installed.json.skills == {}`；`trash\` 与 `staging\` 均为 0 项 |
   | 判据 6：并发同名 | 两个并发 POST（.NET `HttpClient`）→ 201 + 409「技能 broken 正在安装，请稍候」；仅 1 个目录、1 条记录、staging 0 项 |
   | 故障注入回滚 | `Fault::ValidateAfterCopy` / `Fault::RenameToTarget`：新装与升级两条路径均恢复安装前状态（旧目录内容逐字节一致，staging/trash 清空，注册表不变） |
-  | prompt 重建 | 单测调用真实 `app::load_skill_catalog`：安装后 catalog 含 `aaa-demo`，卸载后不再包含（`skill_catalog_fingerprint` 覆盖 SKILL.md mtime/长度，缓存自然失效） |
+  | prompt 重建 | `cargo test -p rusty-claude-cli --lib uninstall_removes_skill_from_next_prompt_build`：安装后 `app::load_skill_catalog` 含 `prompt-demo`，卸载后不再包含，且 `skill_catalog_fingerprint` 变化（指纹含 SKILL.md mtime/长度与启停状态，缓存自然失效） |
   | 浏览器 | `#/skills/sources` 显示 p1-market「可用」并展开 demo/broken 与安装按钮；`#/skills` 三页签正常、列表 145 条；`#/skills/installed` 空状态文案正确 |
   | 安全 | 路径逃逸 422、无 SKILL.md 422、索引名不一致 422、校验和不匹配 422 |
   | 回归 | `cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo fmt --all -- --check` 通过；`cargo test --workspace` 除既有 flake `session_list_surfaces_saved_dirty_abandoned_lifecycle`（单跑通过）外全绿 |
@@ -545,6 +545,19 @@
   3. 关闭某内置技能（如 `frontend-design`）后，重启 WebUI 仍保持禁用（`state.json` 持久化）。
   4. 对比禁用前后 `skills\demo` 目录的 `mtime` 与文件列表，完全一致（证明未动目录）。
 - 回滚：删除 `state.json`（等价于全部启用）；路由保留也不影响，因为过滤函数对空集合是恒等。
+- **实现说明（2026-11-10）**：`state.json` 走 `skill_market::read_state/write_state`（原子写），只改状态文件；`commands::list_skill_summaries_filtered` 被 `/skills list`、`SkillSearch`、系统提示 `app::load_skill_catalog`、`Skill` 按名加载共用；`Skill` 工具对被禁用名字直接返回 `unknown skill: <name>`。`skill_catalog_fingerprint` 额外混入禁用集合，确保开关后下一次 prompt 构建不命中旧缓存。
+- **P2 实测记录（2026-11-10，本机 Windows）**：
+
+  | 判据 | 实测 |
+  | --- | --- |
+  | 单测 | `cargo test -p commands skill_market::tests`：11 passed（新增 `toggle_filters_lists_without_touching_skill_dir`、`toggle_unknown_skill_is_not_found`）；`cargo test -p tools disabled_skill_loads_as_unknown`：1 passed |
+  | 判据 1：禁用 | `PATCH /api/skills/demo-loc {"enabled":false}` → `enabled=false`；`GET /api/skills` 该条 `enabled=false`、`summary.disabled=1`；`state.json` 为 `{"schema":"claw.skill-state/v1","disabled":["demo-loc"]}`；`claw skills list` 由「73 available skills」降为「72」且无 `demo-loc` |
+  | 判据 1：Skill 工具 | `commands` 与 `tools` 两层单测：禁用后 `execute_skill` 返回 `unknown skill: toggle-demo`；启用时正常返回正文 |
+  | 判据 2：重新启用 | 两次 PATCH 恢复 → `summary.disabled=0`，`claw skills list` 回到 73 且含 `demo-loc` |
+  | 判据 3：重启保持 | 禁用内置 `brainstorming` 后重启 serve → 该技能 `enabled=false`（`summary.disabled` 计入 2 个同名发现项）；`state.json` 未丢 |
+  | 判据 4：不动目录 | 禁用前后 `skills\demo-loc` 的 `FullName\|Length\|LastWriteTimeUtc` 快照完全一致（单测另用相对路径 + 大小 + mtime 快照断言） |
+  | 统一安装路径实测 | `claw skills install D:\tmp\p2src\demo-loc` → 安装根只有 `skills\demo-loc`（无 `installed.json`）；重复安装 → 「技能 demo-loc 已安装（未知版本）；如需覆盖请使用升级安装」，目录快照前后一致；201 文件目录 → 「技能目录过大（超过 2MB 或 200 个文件）」，`skills\too-many` 不存在、`staging`/`trash` 均为 0 项 |
+  | 回归 | `cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo fmt --all -- --check` 通过；`cargo test -p commands` 66 passed；`npm run build` 后 `dist/index.html` 已更新 |
 
 ### P3：git 来源 + 超时/并发
 

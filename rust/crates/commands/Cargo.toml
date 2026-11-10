@@ -11,4 +11,11 @@ workspace = true
 [dependencies]
 plugins = { path = "../plugins" }
 runtime = { path = "../runtime" }
+serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+# 技能市场：索引条目可选 sha256 树摘要校验 + 暂存目录唯一命名。
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

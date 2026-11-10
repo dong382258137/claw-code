@@ -25,8 +25,6 @@ runtime = { path = "../runtime" }
 plugins = { path = "../plugins" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
-# 技能市场：索引条目可选 sha256 树摘要校验。
-sha2 = "0.10"
 # 流式错误格式化需要展开 reqwest::Error 的 source 链。配置与 api 对齐
 # （default-features=false + rustls-tls），确保与 api::ApiError::Http
 # 持有同一个 reqwest 实例。
