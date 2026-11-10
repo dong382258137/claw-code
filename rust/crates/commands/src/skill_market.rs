@@ -195,6 +195,9 @@ pub struct SourceRecord {
     /// git 来源最近一次 clone 的短 commit（本地来源为空）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_ref: Option<String>,
+    /// 最近一次解析成功的时间；失败刷新不会覆盖它，用于「上次成功」提示。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,22 +267,24 @@ pub struct SourceView {
     pub checked_at_unix_ms: u64,
     /// git 来源最近一次 clone 的短 commit；本地来源恒为 `null`。
     pub git_ref: Option<String>,
+    /// 最近一次成功解析的时间；从未成功为 `null`。
+    pub last_success_at_unix_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledBrief {
     pub version: String,
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketSkillView {
     pub name: String,
     pub version: String,
     pub description: String,
     pub tags: Vec<String>,
     pub installable: bool,
-    pub reason: Option<&'static str>,
+    pub reason: Option<String>,
     pub reason_detail: Option<String>,
     pub installed: Option<InstalledBrief>,
     pub checksum: Option<String>,
@@ -301,6 +306,13 @@ pub struct MarketSourceBrief {
 pub struct MarketIndexView {
     pub source: MarketSourceBrief,
     pub skills: Vec<MarketSkillView>,
+    /// `true` 表示索引这次真的读到了（可能同时是刷新失败但镜像可读）。
+    /// 为 `false` 时 `skills` 来自缓存，只能查看，不能安装。
+    pub live: bool,
+    /// `true` 表示当前返回的是上次成功解析的快照，而不是刚读到的最新索引。
+    pub cached: bool,
+    /// 这份快照的生成/最后成功时间。
+    pub cached_at_unix_ms: Option<u64>,
 }
 
 /// 安装故障注入点：仅用于单测确定性验证回滚，生产固定 `None`。
@@ -813,20 +825,41 @@ fn git_error(status: &str, message: String) -> MarketError {
 }
 
 fn source_view(record: &SourceRecord, resolved: &ResolvedSource) -> SourceView {
+    // 已落盘的失败优先展示：git 刷新失败后镜像仍可读（resolve 返回 ok），
+    // 但用户必须看到「上次刷新失败了」以及上一次成功的时间。
+    let (status, last_error) = match resolved.status {
+        "ok" => match record.status.as_deref().filter(|status| *status != "ok") {
+            Some(failure) => (failure.to_string(), record.last_error.clone()),
+            None => ("ok".to_string(), None),
+        },
+        // 现场解析失败时，落盘的失败原因通常更具体（例如 clone 失败的真实
+        // 报错），优先展示；没有落盘失败再用现场错误兜底。
+        live => match record.status.as_deref().filter(|status| *status != "ok") {
+            Some(failure) => (
+                failure.to_string(),
+                record
+                    .last_error
+                    .clone()
+                    .or_else(|| resolved.last_error.clone()),
+            ),
+            None => (live.to_string(), resolved.last_error.clone()),
+        },
+    };
     SourceView {
         id: record.id.clone(),
         kind: record.kind.clone(),
         value: record.value.clone(),
         name: record.name.clone(),
         subdir: record.subdir.clone(),
-        status: resolved.status.to_string(),
+        status,
         skill_count: resolved
             .index
             .as_ref()
             .map_or(0, |index| index.skills.len()),
-        last_error: resolved.last_error.clone(),
+        last_error,
         checked_at_unix_ms: record.checked_at_unix_ms.unwrap_or_else(now_unix_ms),
         git_ref: record.git_ref.clone(),
+        last_success_at_unix_ms: record.last_success_at_unix_ms,
     }
 }
 
@@ -867,6 +900,7 @@ pub fn add_source(
         last_error: None,
         checked_at_unix_ms: None,
         git_ref: None,
+        last_success_at_unix_ms: None,
     };
     // git 来源立即 clone 一次；失败也落盘，让用户能修正地址后重试。
     let resolved = match sync_if_git(paths, &mut record) {
@@ -881,6 +915,9 @@ pub fn add_source(
     record.status = Some(resolved.status.to_string());
     record.last_error = resolved.last_error.clone();
     record.checked_at_unix_ms = Some(now_unix_ms());
+    if resolved.status == "ok" {
+        record.last_success_at_unix_ms = record.checked_at_unix_ms;
+    }
     registry.sources.push(record.clone());
     write_sources(paths, &registry)
         .map_err(|error| MarketError::new(500, format!("保存来源失败：{error}")))?;
@@ -918,10 +955,18 @@ pub fn refresh_source(paths: &MarketPaths, id: &str) -> Result<SourceView, Marke
     // 刷新是用户主动触发的操作，git 失败必须报错（§4.2 第 7 条）。
     let synced = sync_if_git(paths, &mut record);
     let resolved = resolve_source(paths, &record);
-    registry.sources[position].status = Some(resolved.status.to_string());
-    registry.sources[position].last_error = resolved.last_error.clone();
+    // 失败状态覆盖「镜像仍可读」的 ok：否则刷新失败在界面上会瞬间消失。
+    let (status, last_error) = match &synced {
+        Ok(()) => (resolved.status.to_string(), resolved.last_error.clone()),
+        Err((status, error)) => ((*status).to_string(), Some(error.clone())),
+    };
+    registry.sources[position].status = Some(status.clone());
+    registry.sources[position].last_error = last_error;
     registry.sources[position].checked_at_unix_ms = Some(now_unix_ms());
     registry.sources[position].git_ref = record.git_ref.clone();
+    if status == "ok" {
+        registry.sources[position].last_success_at_unix_ms = Some(now_unix_ms());
+    }
     let updated = registry.sources[position].clone();
     write_sources(paths, &registry)
         .map_err(|error| MarketError::new(500, format!("保存来源失败：{error}")))?;
@@ -929,6 +974,36 @@ pub fn refresh_source(paths: &MarketPaths, id: &str) -> Result<SourceView, Marke
         return Err(git_error(status, error));
     }
     Ok(source_view(&updated, &resolved))
+}
+
+/// 索引快照：来源不可用时用上次成功解析的结果兜底（§P4 降级要求）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IndexCache {
+    #[serde(default)]
+    schema: Option<String>,
+    cached_at_unix_ms: u64,
+    source_name: Option<String>,
+    skills: Vec<MarketSkillView>,
+}
+
+const INDEX_CACHE_SCHEMA: &str = "claw.skill-index-cache/v1";
+
+/// 来源 id 只允许安全字符，避免缓存路径被构造到目录外。
+fn index_cache_path(paths: &MarketPaths, id: &str) -> Option<PathBuf> {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        return None;
+    }
+    Some(paths.root.join("index-cache").join(format!("{id}.json")))
+}
+
+fn read_index_cache(path: &Path) -> Option<IndexCache> {
+    let text = fs::read_to_string(path).ok()?;
+    // 结构对不上（旧版本/手改）就当作没有缓存。
+    serde_json::from_str(&text).ok()
 }
 
 pub fn market_index(paths: &MarketPaths, source_id: &str) -> Result<MarketIndexView, MarketError> {
@@ -941,8 +1016,9 @@ pub fn market_index(paths: &MarketPaths, source_id: &str) -> Result<MarketIndexV
         return Err(MarketError::not_found(format!("来源 {source_id} 不存在")));
     };
     let resolved = resolve_source(paths, record);
+    let view = source_view(record, &resolved);
     let installed = read_installed(paths);
-    let skills = match (resolved.root.as_deref(), resolved.index.as_ref()) {
+    let live_skills = match (resolved.root.as_deref(), resolved.index.as_ref()) {
         (Some(root), Some(index)) => index
             .skills
             .iter()
@@ -966,7 +1042,7 @@ pub fn market_index(paths: &MarketPaths, source_id: &str) -> Result<MarketIndexV
                     description: analyzed.description.clone(),
                     tags: analyzed.tags.clone(),
                     installable: analyzed.reason.is_none(),
-                    reason: analyzed.reason,
+                    reason: analyzed.reason.map(str::to_string),
                     reason_detail: analyzed.detail.clone(),
                     installed: installed_brief,
                     checksum: analyzed.expected_sha256.clone(),
@@ -975,19 +1051,50 @@ pub fn market_index(paths: &MarketPaths, source_id: &str) -> Result<MarketIndexV
             .collect(),
         _ => Vec::new(),
     };
+    let live_ok = resolved.index.is_some();
+    // 刷新失败但镜像还能读时，内容来自本地镜像，同样按缓存标注。
+    let cached = !live_ok || view.status != "ok";
+    let cache_path = index_cache_path(paths, &record.id);
+    let (skills, cached_at_unix_ms) = if cached {
+        if live_ok {
+            let cached_at = record.last_success_at_unix_ms.or_else(|| {
+                cache_path
+                    .as_deref()
+                    .and_then(read_index_cache)
+                    .map(|cache| cache.cached_at_unix_ms)
+            });
+            (live_skills, cached_at)
+        } else {
+            match cache_path.as_deref().and_then(read_index_cache) {
+                Some(cache) => (cache.skills, Some(cache.cached_at_unix_ms)),
+                None => (Vec::new(), record.last_success_at_unix_ms),
+            }
+        }
+    } else {
+        if let Some(path) = cache_path.as_deref() {
+            let snapshot = IndexCache {
+                schema: Some(INDEX_CACHE_SCHEMA.to_string()),
+                cached_at_unix_ms: now_unix_ms(),
+                source_name: view.name.clone(),
+                skills: live_skills.clone(),
+            };
+            let _ = write_json_atomic(path, &snapshot);
+        }
+        (live_skills, None)
+    };
     Ok(MarketIndexView {
         source: MarketSourceBrief {
             id: record.id.clone(),
             kind: record.kind.clone(),
-            name: record
-                .name
-                .clone()
-                .or_else(|| resolved.index.as_ref().and_then(|index| index.name.clone())),
-            status: resolved.status.to_string(),
-            last_error: resolved.last_error.clone(),
-            resolved_ref: None,
+            name: view.name.clone(),
+            status: view.status,
+            last_error: view.last_error,
+            resolved_ref: record.git_ref.clone(),
         },
         skills,
+        live: live_ok,
+        cached,
+        cached_at_unix_ms,
     })
 }
 
@@ -2280,6 +2387,39 @@ mod tests {
         assert!(list_sources(&fixture.paths).is_empty());
         let missing = delete_source(&fixture.paths, &id).expect_err("delete twice");
         assert_eq!(missing.status, 404);
+    }
+
+    /// 来源不可用时用上次成功解析的快照兜底，并标注 `cached` / 时间。
+    #[test]
+    fn market_index_serves_cache_when_source_breaks() {
+        let fixture = fixture();
+        let id = source_id(&fixture);
+        let live = market_index(&fixture.paths, &id).expect("live index");
+        assert!(live.live);
+        assert!(!live.cached);
+        assert_eq!(live.skills.len(), 2);
+
+        fs::remove_file(fixture.source_root.join("marketplace.json")).expect("break source");
+        let degraded = market_index(&fixture.paths, &id).expect("degraded index");
+        assert!(!degraded.live, "索引读不到时必须标非 live");
+        assert!(degraded.cached, "必须有缓存兜底");
+        assert!(degraded.cached_at_unix_ms.is_some(), "必须带最后更新时间");
+        assert_eq!(degraded.skills.len(), 2, "缓存内容照常展示");
+    }
+
+    /// 刷新失败不能覆盖「上次成功」时间，否则用户不知道上次成功是什么时候。
+    #[test]
+    fn refresh_failure_keeps_last_success_time() {
+        let fixture = fixture();
+        let id = source_id(&fixture);
+        let success = list_sources(&fixture.paths)[0]
+            .last_success_at_unix_ms
+            .expect("首次成功必须有时间");
+        fs::remove_file(fixture.source_root.join("marketplace.json")).expect("break source");
+        let failed = refresh_source(&fixture.paths, &id).expect("local refresh returns view");
+        assert_eq!(failed.status, "unreadable");
+        assert!(failed.last_error.is_some());
+        assert_eq!(failed.last_success_at_unix_ms, Some(success));
     }
 
     /// 命令行安装不写 `installed.json`，但落在安装根内，WebUI 必须能卸载。

@@ -13,6 +13,14 @@ const REASON_LABELS = {
   checksum_mismatch: '校验失败',
 }
 
+// 后端时间戳是 unix 毫秒；缺失时返回空串，由调用方决定文案。
+function formatTime(value) {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleString('zh-CN', { hour12: false })
+}
+
 // 某个来源的技能索引：逐条安装/升级。
 export function SkillInstallList({ sourceId, onChanged }) {
   const [market, setMarket] = useState(null)
@@ -88,13 +96,24 @@ export function SkillInstallList({ sourceId, onChanged }) {
         <h3>{market.source.name || market.source.id}</h3>
         <span className="chip">{market.skills.length} 个条目</span>
       </div>
-      {market.source.status !== 'ok' ? (
+      {market.cached ? (
+        <div className="skill-notice warn">
+          {market.live
+            ? `来源刷新失败${market.source.last_error ? `：${market.source.last_error}` : ''}。以下内容来自本地镜像`
+            : market.skills.length
+              ? `索引当前不可用${market.source.last_error ? `：${market.source.last_error}` : ''}。以下为上次缓存内容，只能查看，无法安装`
+              : `索引当前不可用${market.source.last_error ? `：${market.source.last_error}` : ''}。暂无可用缓存`}
+          {market.cached_at_unix_ms ? `（最后更新于 ${formatTime(market.cached_at_unix_ms)}）` : ''}
+        </div>
+      ) : market.source.status !== 'ok' ? (
         <div className="skill-notice warn">{market.source.last_error || market.source.status}</div>
       ) : null}
       {notice ? <div className="skill-notice">{notice}</div> : null}
 
       {market.skills.length === 0 ? (
-        <div className="skill-list-empty">这个来源没有可安装的技能。</div>
+        <div className="skill-list-empty">
+          {market.live ? '这个来源没有可安装的技能。' : '索引不可用，也没有可用的缓存内容。'}
+        </div>
       ) : null}
 
       {market.skills.map((skill) => (
@@ -118,7 +137,7 @@ export function SkillInstallList({ sourceId, onChanged }) {
           <button
             type="button"
             className="skill-refresh"
-            disabled={!skill.installable || busy === skill.name}
+            disabled={!skill.installable || !market.live || busy === skill.name}
             onClick={() => install(skill)}
           >
             {busy === skill.name ? '安装中…' : skill.installed ? '升级安装' : '安装'}

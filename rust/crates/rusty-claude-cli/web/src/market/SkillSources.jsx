@@ -11,6 +11,14 @@ const STATUS_LABELS = {
   timeout: '超时',
 }
 
+// 后端时间戳是 unix 毫秒；缺失时返回空串，由调用方决定文案。
+function formatTime(value) {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleString('zh-CN', { hour12: false })
+}
+
 // 来源市场：本地/远程索引来源的增删查，以及选中来源的安装列表。
 export function SkillSources() {
   const [sources, setSources] = useState([])
@@ -161,8 +169,21 @@ export function SkillSources() {
               <span>{source.kind === 'git' ? 'git' : '本地'}</span>
               <span>{source.skill_count} 个技能</span>
               {source.git_ref ? <span>commit {source.git_ref}</span> : null}
-              {source.last_error ? <span className="skill-source-error">{source.last_error}</span> : null}
+              <span>
+                {source.last_success_at_unix_ms
+                  ? `上次成功：${formatTime(source.last_success_at_unix_ms)}`
+                  : '从未成功'}
+              </span>
             </div>
+            {source.status !== 'ok' ? (
+              <div className="skill-notice warn">
+                {STATUS_LABELS[source.status] || source.status}
+                {source.last_error ? ` · ${source.last_error}` : ''}
+                {source.last_success_at_unix_ms
+                  ? `（上次成功：${formatTime(source.last_success_at_unix_ms)}）`
+                  : '（从未成功）'}
+              </div>
+            ) : null}
             <div className="skill-source-actions">
               <span
                 role="button"

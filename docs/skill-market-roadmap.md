@@ -590,6 +590,24 @@
 - 判据：`npm run build` 后 `dist/index.html` 体积增量 < 60 KB；连续安装/卸载 20 次后 `skill-market/` 下无残留 `staging`/`trash` 目录；§4.6 每个错误码至少手动触发一次且文案一致。
 - 回滚：纯前端，回退 `dist` 即可。
 
+- **实现说明（2026-11-10）**：本期 P4 只做交付前必须的两条，其余范围项（标签筛选、批量刷新）未做，已知限制见 `docs/skill-market-usage.md` §8。
+  1. **失败可见**：`SourceRecord` 新增 `last_success_at_unix_ms`，成功解析/刷新时更新，失败刷新不覆盖；`source_view` 在「已落盘失败」与「现场解析失败」之间优先展示更具体的失败原因（例如 git clone 的真实报错，而不是「尚未拉取仓库」）；`SourceView` 透出该时间。
+  2. **索引降级**：每次成功读取索引后写 `<skill-market>/index-cache/<source_id>.json`（schema `claw.skill-index-cache/v1`）；来源不可读时读回快照。`MarketIndexView` 新增 `live`（这次是否真的读到索引）、`cached`（内容是否来自快照）、`cached_at_unix_ms`（快照时间）。缓存路径只接受 `[A-Za-z0-9_-]` 的来源 id，避免越出目录。
+  3. **前端**：来源卡片显示「上次成功：… / 从未成功」，失败状态用黄色提示条展示「状态标签 · 具体原因 · 上次成功时间」；安装列表在 `cached` 时显示横幅（刷新失败但镜像可读：说明内容来自本地镜像；索引完全不可读：说明只能查看、无法安装，并标注最后更新时间）；`live=false` 时安装按钮禁用，不出现白屏或无限转圈。
+
+- **P4 实测记录（2026-11-10，本机 Windows，临时 `CLAW_CONFIG_HOME` + 端口 4397）**：
+
+  | 判据 | 实测 |
+  | --- | --- |
+  | 失败可见（本地源） | 添加本地来源 → `status=ok`、`last_success_at_unix_ms=1794316256543`；删除 `marketplace.json` 后刷新 → `200 status=unreadable`，`last_error` 为「读取 …marketplace.json 失败：系统找不到指定的文件。(os error 2)」，`last_success_at_unix_ms` 保持 `1794316256543`；`GET /api/skill-sources` 同值 |
+  | 失败可见（git 源） | 正常 git 来源 `status=ok`、`git_ref=a2541b4`；远端目录改名后刷新 → `502`「拉取仓库失败：fatal: … does not appear to be a git repository」；来源列表与索引接口均返回该真实原因，`last_success` 保留 |
+  | 从未成功 | 新增不存在的 git 地址 → `201 status=clone_failed`、`last_success_at_unix_ms=null`；索引 `live=false`、`skills=[]`，前端显示「索引不可用，也没有可用的缓存内容」 |
+  | 缓存降级（本地源） | 来源损坏后 `GET /api/skill-market` → `200 live=false cached=true cached_at_unix_ms=1794316256551 skills=["demo"]`；恢复后刷新 → `live=true cached=false`，缓存时间清空 |
+  | 缓存降级（git 源） | 远端消失、镜像仍在 → 索引 `live=true cached=true cached_at_unix_ms=<上次成功>`、`skills=["gitdemo"]`，前端横幅「来源刷新失败：… 以下内容来自本地镜像（最后更新于 …）」 |
+  | 页面可见性 | 浏览器实测「来源市场」：`s_02` 行显示「拉取失败」「上次成功：2026/11/10 21:10:56」，`s_03` 行显示「从未成功」；点选后下方出现「索引当前不可用」+ 具体 clone 报错，无白屏/转圈 |
+  | 体积 | `dist/index.html` 582090 → 583184 字节（+1094 B），未新增前端依赖 |
+  | 回归 | `cargo test -p commands` 69 passed（新增 2 条缓存/上次成功用例）；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`scripts/fmt.sh --check` 通过；`npm run build` 后 `dist` 已更新 |
+
 ---
 
 ## 7. 风险与不做的事
