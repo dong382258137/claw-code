@@ -18,7 +18,7 @@ export function SkillSources() {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [selected, setSelected] = useState('')
-  const [form, setForm] = useState({ type: 'local', value: '', name: '' })
+  const [form, setForm] = useState({ type: 'local', value: '', name: '', subdir: '' })
   const [adding, setAdding] = useState(false)
 
   const load = useCallback(async () => {
@@ -48,10 +48,15 @@ export function SkillSources() {
         type: form.type,
         value: form.value,
         name: form.name.trim() || null,
+        subdir: form.type === 'git' ? form.subdir.trim() || null : null,
       })
-      setNotice(`已添加来源 ${created.name || created.id}`)
+      setNotice(
+        created.status === 'ok'
+          ? `已添加来源 ${created.name || created.id}`
+          : `来源已添加，但拉取失败：${created.last_error || created.status}`,
+      )
       setSelected(created.id)
-      setForm({ type: 'local', value: '', name: '' })
+      setForm({ type: 'local', value: '', name: '', subdir: '' })
       await load()
     } catch (err) {
       setError(err.message || String(err))
@@ -96,14 +101,25 @@ export function SkillSources() {
           onChange={(event) => setForm((prev) => ({ ...prev, type: event.target.value }))}
         >
           <option value="local">本地目录 / marketplace.json</option>
-          <option value="git" disabled>git 仓库（P3 支持）</option>
+          <option value="git">git 仓库（clone 到本地镜像）</option>
         </select>
         <input
           value={form.value}
           onChange={(event) => setForm((prev) => ({ ...prev, value: event.target.value }))}
-          placeholder="D:\\tmp\\market 或 ...\\marketplace.json"
+          placeholder={
+            form.type === 'git'
+              ? 'https://example.com/skills.git'
+              : 'D:\\tmp\\market 或 ...\\marketplace.json'
+          }
           required
         />
+        {form.type === 'git' ? (
+          <input
+            value={form.subdir}
+            onChange={(event) => setForm((prev) => ({ ...prev, subdir: event.target.value }))}
+            placeholder="仓库内子目录（可选）"
+          />
+        ) : null}
         <input
           value={form.name}
           onChange={(event) => setForm((prev) => ({ ...prev, name: event.target.value }))}
@@ -142,7 +158,9 @@ export function SkillSources() {
             </div>
             <div className="skill-desc">{source.value}</div>
             <div className="skill-source-meta">
+              <span>{source.kind === 'git' ? 'git' : '本地'}</span>
               <span>{source.skill_count} 个技能</span>
+              {source.git_ref ? <span>commit {source.git_ref}</span> : null}
               {source.last_error ? <span className="skill-source-error">{source.last_error}</span> : null}
             </div>
             <div className="skill-source-actions">

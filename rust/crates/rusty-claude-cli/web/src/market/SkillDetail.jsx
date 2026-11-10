@@ -102,7 +102,7 @@ export function SkillDetail({ name, onRemoved }) {
           >
             原文
           </button>
-          {detail.installed?.managed ? (
+          {detail.uninstallable ? (
             <button
               type="button"
               className="skill-danger"

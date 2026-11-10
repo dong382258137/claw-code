@@ -545,7 +545,7 @@
   3. 关闭某内置技能（如 `frontend-design`）后，重启 WebUI 仍保持禁用（`state.json` 持久化）。
   4. 对比禁用前后 `skills\demo` 目录的 `mtime` 与文件列表，完全一致（证明未动目录）。
 - 回滚：删除 `state.json`（等价于全部启用）；路由保留也不影响，因为过滤函数对空集合是恒等。
-- **实现说明（2026-11-10）**：`state.json` 走 `skill_market::read_state/write_state`（原子写），只改状态文件；`commands::list_skill_summaries_filtered` 被 `/skills list`、`SkillSearch`、系统提示 `app::load_skill_catalog`、`Skill` 按名加载共用；`Skill` 工具对被禁用名字直接返回 `unknown skill: <name>`。`skill_catalog_fingerprint` 额外混入禁用集合，确保开关后下一次 prompt 构建不命中旧缓存。
+- **实现说明（2026-11-10）**：`state.json` 走 `skill_market::read_state/write_state`（原子写），只改状态文件；`commands::list_skill_summaries_filtered` 被 `/skills list`、`SkillSearch`、系统提示 `app::load_skill_catalog`、`Skill` 按名加载共用；`Skill` 工具对被禁用名字直接返回 `unknown skill: <name>`。`skill_catalog_fingerprint` 额外混入禁用集合，确保开关后下一次 prompt 构建不命中旧缓存。卸载判定同时收口为「副本是否落在安装根」（API 字段 `uninstallable`）：命令行安装没有 `installed.json` 记录也能从 WebUI 卸载，注册表只负责市场版本/来源展示；项目级与内置技能仍只能禁用。
 - **P2 实测记录（2026-11-10，本机 Windows）**：
 
   | 判据 | 实测 |
@@ -557,6 +557,7 @@
   | 判据 3：重启保持 | 禁用内置 `brainstorming` 后重启 serve → 该技能 `enabled=false`（`summary.disabled` 计入 2 个同名发现项）；`state.json` 未丢 |
   | 判据 4：不动目录 | 禁用前后 `skills\demo-loc` 的 `FullName\|Length\|LastWriteTimeUtc` 快照完全一致（单测另用相对路径 + 大小 + mtime 快照断言） |
   | 统一安装路径实测 | `claw skills install D:\tmp\p2src\demo-loc` → 安装根只有 `skills\demo-loc`（无 `installed.json`）；重复安装 → 「技能 demo-loc 已安装（未知版本）；如需覆盖请使用升级安装」，目录快照前后一致；201 文件目录 → 「技能目录过大（超过 2MB 或 200 个文件）」，`skills\too-many` 不存在、`staging`/`trash` 均为 0 项 |
+  | 命令行安装可在网页卸载 | 命令行装 `cli-only` 后 `GET /api/skills`：`managed=false`、`installed=null`、`uninstallable=true`；`DELETE /api/skills/cli-only` 成功，目录删除、`staging`/`trash` 为空、未生成 `installed.json` |
   | 回归 | `cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo fmt --all -- --check` 通过；`cargo test -p commands` 66 passed；`npm run build` 后 `dist/index.html` 已更新 |
 
 ### P3：git 来源 + 超时/并发
@@ -568,6 +569,20 @@
   3. 用 PATH 里去掉 git 的环境启动 serve → 502 文案为「本机未找到 git」。
   4. 用一个会阻塞的假 git（PATH 前置一个 sleep 脚本）→ 30s 后 504，无残留目录。
 - 回滚：来源条目标 `unreadable`，已安装技能不受影响；代码回退只需删 git 分支。
+
+- **实现说明（2026-11-10）**：git 来源 clone 到 `<skill-market>/mirrors/<source_id>`，新增来源与显式刷新时才访问网络；`GET /api/skill-sources`、索引读取、安装都只读镜像，避免列表请求触发 clone。`git clone --depth 1 --quiet` 带 30 秒硬超时（`GIT_TERMINAL_PROMPT=0`），失败分类为 `git_not_found`（PATH 无 git）/ `clone_failed`（命令失败）/ `timeout`（超时被杀）；`subdir` 经 canonical 化后必须仍在镜像内。新增/刷新/安装三个端点改为 `spawn_blocking`，clone 期间不阻塞 async worker。`resolved_ref` 在安装时写入注册表；来源记录新增 `git_ref` 字段并展示在来源列表。
+- **P3 实测记录（2026-11-10，本机 Windows）**：
+
+  | 判据 | 实测 |
+  | --- | --- |
+  | 判据 1：本地仓库安装 | `git init D:\tmp\p3git\repo`（含 `marketplace.json` + `skills/git-demo`）→ `POST /api/skill-sources {type:"git",value:"D:\\tmp\\p3git\\repo"}` 201 `status=ok`、`git_ref=5edbdba`；`POST /api/skills/install` 201；`installed.json.source.resolved_ref` = `git rev-parse --short HEAD`（`44d5e7e`）；`claw skills list` 可见 `git-demo` |
+  | 判据 2：错误地址 | `value=D:\tmp\p3git\does-not-exist` → 201 `status=clone_failed`，`last_error` 为 `拉取仓库失败：fatal: ... does not appear to be a git repository`；`staging`/`trash` 均 0 项 |
+  | 判据 3：无 git | 以 `PATH=C:\Windows\System32;C:\Windows` 启动 serve → 新增 git 来源 201 `status=git_not_found`，文案「本机未找到 git」 |
+  | 判据 4：超时 | PATH 前置 `git.exe`（Sleep 40s）→ 新增来源 `status=timeout`，耗时 30159ms；`POST /refresh` 同一来源返回 504 |
+  | 并发 | 同名两次安装（node 并发 fetch）→ `201` + `409 技能 git-demo 正在安装，请稍候`；`staging`/`trash` 为空 |
+  | 不阻塞 | 慢 clone 进行中 `GET /api/meta` 4ms 返回 200（`spawn_blocking` 生效） |
+  | 一致性 | 刷新后 `git_ref` 由 `5edbdba` → `44d5e7e` → `366714e`；索引版本改为 1.1.0 后，带旧 `version=1.0.0` 安装返回 409「索引版本已变化」 |
+  | 回归 | `cargo test -p commands` 67 passed；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo fmt --all -- --check` 通过；`npm run build` 后 `dist/index.html` 已更新 |
 
 ### P4：体验收尾
 

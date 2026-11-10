@@ -12,10 +12,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -115,6 +116,14 @@ impl MarketPaths {
         self.root.join("staging")
     }
 
+    /// git 来源的本地镜像：`<skill-market>/mirrors/<source_id>`。
+    ///
+    /// 只在新增来源/显式刷新时 clone；列表与索引读取都走镜像，避免每次
+    /// `GET /api/skill-sources` 都触发网络。
+    fn mirror_dir(&self) -> PathBuf {
+        self.root.join("mirrors")
+    }
+
     fn trash_dir(&self) -> PathBuf {
         self.root.join("trash")
     }
@@ -183,6 +192,9 @@ pub struct SourceRecord {
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked_at_unix_ms: Option<u64>,
+    /// git 来源最近一次 clone 的短 commit（本地来源为空）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +262,8 @@ pub struct SourceView {
     pub skill_count: usize,
     pub last_error: Option<String>,
     pub checked_at_unix_ms: u64,
+    /// git 来源最近一次 clone 的短 commit；本地来源恒为 `null`。
+    pub git_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -534,26 +548,9 @@ fn non_empty(value: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-/// 解析本地来源：返回 marketplace.json 所在目录（canonical）与索引。
-fn load_local_index(value: &str) -> Result<(PathBuf, MarketplaceIndex), (String, String)> {
-    let raw = PathBuf::from(value);
-    let canonical = fs::canonicalize(&raw).map_err(|error| {
-        (
-            "unreadable".to_string(),
-            format!("路径不可读：{value}（{error}）"),
-        )
-    })?;
-    let (root, file) = if canonical.is_dir() {
-        (canonical.clone(), canonical.join("marketplace.json"))
-    } else {
-        (
-            canonical
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| canonical.clone()),
-            canonical,
-        )
-    };
+/// 从一个已确定的索引目录读 `marketplace.json`。
+fn read_index(root: &Path) -> Result<MarketplaceIndex, (String, String)> {
+    let file = root.join("marketplace.json");
     let text = fs::read_to_string(&file).map_err(|error| {
         (
             "unreadable".to_string(),
@@ -575,40 +572,243 @@ fn load_local_index(value: &str) -> Result<(PathBuf, MarketplaceIndex), (String,
             ));
         }
     }
+    Ok(index)
+}
+
+/// 解析本地来源：返回 marketplace.json 所在目录（canonical）与索引。
+fn load_local_index(value: &str) -> Result<(PathBuf, MarketplaceIndex), (String, String)> {
+    let raw = PathBuf::from(value);
+    let canonical = fs::canonicalize(&raw).map_err(|error| {
+        (
+            "unreadable".to_string(),
+            format!("路径不可读：{value}（{error}）"),
+        )
+    })?;
+    let root = if canonical.is_dir() {
+        canonical
+    } else {
+        canonical
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| canonical.clone())
+    };
+    let index = read_index(&root)?;
     Ok((root, index))
 }
 
-fn resolve_source(record: &SourceRecord) -> ResolvedSource {
-    if record.kind != "local" {
-        let message = if record.kind == "git" {
-            "git 来源将在 P3 支持".to_string()
-        } else {
-            format!("未知来源类型：{}", record.kind)
-        };
-        return ResolvedSource {
-            status: "unreadable",
-            last_error: Some(message),
-            root: None,
-            index: None,
-        };
+/// git 来源的索引目录：镜像根 + 可选 `subdir`，canonical 后必须仍在镜像内。
+fn git_index_root(mirror: &Path, subdir: Option<&str>) -> Result<PathBuf, String> {
+    // 必须 canonical 化：Windows 上 canonicalize 带 `\\?\` 前缀，
+    // 与未规范化的镜像路径混用会让 `analyze_entry` 的越界检查误报。
+    let base = fs::canonicalize(mirror).map_err(|error| format!("仓库镜像不可读：{error}"))?;
+    let Some(subdir) = subdir.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(base);
+    };
+    let candidate = fs::canonicalize(mirror.join(subdir))
+        .map_err(|error| format!("子目录 {subdir} 不可读：{error}"))?;
+    if !candidate.starts_with(&base) {
+        return Err(format!("子目录 {subdir} 越出仓库根"));
     }
-    match load_local_index(&record.value) {
-        Ok((root, index)) => ResolvedSource {
-            status: "ok",
-            last_error: None,
-            root: Some(root),
-            index: Some(index),
-        },
-        Err((status, error)) => ResolvedSource {
-            status: if status == "unsupported" {
-                "unsupported"
-            } else {
-                "unreadable"
+    Ok(candidate)
+}
+
+/// 解析来源状态。git 只读本地镜像，不在这里发起网络请求。
+fn resolve_source(paths: &MarketPaths, record: &SourceRecord) -> ResolvedSource {
+    match record.kind.as_str() {
+        "local" => match load_local_index(&record.value) {
+            Ok((root, index)) => ResolvedSource {
+                status: "ok",
+                last_error: None,
+                root: Some(root),
+                index: Some(index),
             },
-            last_error: Some(error),
+            Err((status, error)) => ResolvedSource {
+                status: if status == "unsupported" {
+                    "unsupported"
+                } else {
+                    "unreadable"
+                },
+                last_error: Some(error),
+                root: None,
+                index: None,
+            },
+        },
+        "git" => {
+            let mirror = paths.mirror_dir().join(&record.id);
+            if !mirror.is_dir() {
+                return ResolvedSource {
+                    status: "clone_failed",
+                    last_error: Some("尚未拉取仓库，请刷新来源".to_string()),
+                    root: None,
+                    index: None,
+                };
+            }
+            let root = match git_index_root(&mirror, record.subdir.as_deref()) {
+                Ok(root) => root,
+                Err(error) => {
+                    return ResolvedSource {
+                        status: "unreadable",
+                        last_error: Some(error),
+                        root: None,
+                        index: None,
+                    }
+                }
+            };
+            match read_index(&root) {
+                Ok(index) => ResolvedSource {
+                    status: "ok",
+                    last_error: None,
+                    root: Some(root),
+                    index: Some(index),
+                },
+                Err((status, error)) => ResolvedSource {
+                    status: if status == "unsupported" {
+                        "unsupported"
+                    } else {
+                        "unreadable"
+                    },
+                    last_error: Some(error),
+                    root: None,
+                    index: None,
+                },
+            }
+        }
+        other => ResolvedSource {
+            status: "unreadable",
+            last_error: Some(format!("未知来源类型：{other}")),
             root: None,
             index: None,
         },
+    }
+}
+
+/// 拉取仓库超时上限（路线 §4.3）。
+const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn git_short_ref(dir: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .arg("rev-parse")
+        .arg("--short")
+        .arg("HEAD")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+/// `git clone --depth 1`，30 秒硬超时；失败归类为 `git_not_found` / `clone_failed` / `timeout`。
+fn clone_with_timeout(value: &str, dest: &Path) -> Result<(), (&'static str, String)> {
+    let mut child = Command::new("git")
+        .arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .arg("--quiet")
+        .arg("--")
+        .arg(value)
+        .arg(dest)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                (
+                    "git_not_found",
+                    "本机未找到 git，无法安装 git 来源的技能".to_string(),
+                )
+            } else {
+                ("clone_failed", format!("启动 git 失败：{error}"))
+            }
+        })?;
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                let first = stderr
+                    .lines()
+                    .next()
+                    .unwrap_or("未知错误")
+                    .trim()
+                    .to_string();
+                return Err((
+                    "clone_failed",
+                    format!("拉取仓库失败：{first}。请检查网络或仓库地址"),
+                ));
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err((
+                        "timeout",
+                        "拉取仓库超时（30 秒），请重试或改用本地来源".to_string(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(("clone_failed", format!("等待 git 失败：{error}")));
+            }
+        }
+    }
+}
+
+/// 重新克隆并把旧镜像原子替换掉；失败时清空临时目录。返回短 commit。
+fn sync_git_mirror(
+    paths: &MarketPaths,
+    record: &SourceRecord,
+) -> Result<Option<String>, (&'static str, String)> {
+    fs::create_dir_all(paths.mirror_dir())
+        .map_err(|error| ("clone_failed", format!("创建镜像目录失败：{error}")))?;
+    let temp = paths.mirror_dir().join(format!(".tmp-{}", Uuid::new_v4()));
+    if let Err(error) = clone_with_timeout(&record.value, &temp) {
+        let _ = remove_any(&temp);
+        return Err(error);
+    }
+    let git_ref = git_short_ref(&temp);
+    let final_dir = paths.mirror_dir().join(&record.id);
+    if final_dir.exists() {
+        remove_any(&final_dir)
+            .map_err(|error| ("clone_failed", format!("替换旧镜像失败：{error}")))?;
+    }
+    fs::rename(&temp, &final_dir).map_err(|error| {
+        let _ = remove_any(&temp);
+        ("clone_failed", format!("保存仓库镜像失败：{error}"))
+    })?;
+    // 子目录越界/不可读在这里就失败，避免把坏来源标成可用。
+    git_index_root(&final_dir, record.subdir.as_deref()).map_err(|error| ("unreadable", error))?;
+    Ok(git_ref)
+}
+
+/// git 来源：clone 到镜像并回填 `git_ref`；非 git 直接返回 `Ok(())`。
+fn sync_if_git(
+    paths: &MarketPaths,
+    record: &mut SourceRecord,
+) -> Result<(), (&'static str, String)> {
+    if record.kind != "git" {
+        return Ok(());
+    }
+    record.git_ref = sync_git_mirror(paths, record)?;
+    Ok(())
+}
+
+/// git 解析失败 → HTTP 错误：无 git/拉取失败 502，超时 504。
+fn git_error(status: &str, message: String) -> MarketError {
+    match status {
+        "timeout" => MarketError::new(504, message),
+        "git_not_found" | "clone_failed" => MarketError::bad_gateway(message),
+        _ => MarketError::unprocessable(message),
     }
 }
 
@@ -626,6 +826,7 @@ fn source_view(record: &SourceRecord, resolved: &ResolvedSource) -> SourceView {
             .map_or(0, |index| index.skills.len()),
         last_error: resolved.last_error.clone(),
         checked_at_unix_ms: record.checked_at_unix_ms.unwrap_or_else(now_unix_ms),
+        git_ref: record.git_ref.clone(),
     }
 }
 
@@ -635,7 +836,7 @@ pub fn list_sources(paths: &MarketPaths) -> Vec<SourceView> {
     read_sources(paths)
         .sources
         .iter()
-        .map(|record| source_view(record, &resolve_source(record)))
+        .map(|record| source_view(record, &resolve_source(paths, record)))
         .collect()
 }
 
@@ -665,8 +866,18 @@ pub fn add_source(
         status: None,
         last_error: None,
         checked_at_unix_ms: None,
+        git_ref: None,
     };
-    let resolved = resolve_source(&record);
+    // git 来源立即 clone 一次；失败也落盘，让用户能修正地址后重试。
+    let resolved = match sync_if_git(paths, &mut record) {
+        Ok(()) => resolve_source(paths, &record),
+        Err((status, error)) => ResolvedSource {
+            status,
+            last_error: Some(error),
+            root: None,
+            index: None,
+        },
+    };
     record.status = Some(resolved.status.to_string());
     record.last_error = resolved.last_error.clone();
     record.checked_at_unix_ms = Some(now_unix_ms());
@@ -679,32 +890,43 @@ pub fn add_source(
 pub fn delete_source(paths: &MarketPaths, id: &str) -> Result<(), MarketError> {
     let mut registry = read_sources(paths);
     let before = registry.sources.len();
+    let removed: Vec<String> = registry
+        .sources
+        .iter()
+        .filter(|source| source.id == id && source.kind == "git")
+        .map(|source| source.id.clone())
+        .collect();
     registry.sources.retain(|source| source.id != id);
     if registry.sources.len() == before {
         return Err(MarketError::not_found(format!("来源 {id} 不存在")));
+    }
+    // 删除来源时一并清掉 git 镜像，避免下次同 id 复用陈旧内容。
+    for id in removed {
+        let _ = remove_any(&paths.mirror_dir().join(id));
     }
     write_sources(paths, &registry)
         .map_err(|error| MarketError::new(500, format!("保存来源失败：{error}")))
 }
 
-/// 重新解析来源并更新持久化状态。git 来源在 P1 固定 502。
+/// 重新解析来源并持久化状态。git 来源会重新 clone（`resolved_ref` 随之更新）。
 pub fn refresh_source(paths: &MarketPaths, id: &str) -> Result<SourceView, MarketError> {
     let mut registry = read_sources(paths);
     let Some(position) = registry.sources.iter().position(|source| source.id == id) else {
         return Err(MarketError::not_found(format!("来源 {id} 不存在")));
     };
-    let record = &registry.sources[position];
-    let resolved = resolve_source(record);
+    let mut record = registry.sources[position].clone();
+    // 刷新是用户主动触发的操作，git 失败必须报错（§4.2 第 7 条）。
+    let synced = sync_if_git(paths, &mut record);
+    let resolved = resolve_source(paths, &record);
     registry.sources[position].status = Some(resolved.status.to_string());
     registry.sources[position].last_error = resolved.last_error.clone();
     registry.sources[position].checked_at_unix_ms = Some(now_unix_ms());
+    registry.sources[position].git_ref = record.git_ref.clone();
     let updated = registry.sources[position].clone();
     write_sources(paths, &registry)
         .map_err(|error| MarketError::new(500, format!("保存来源失败：{error}")))?;
-    if updated.kind == "git" {
-        return Err(MarketError::bad_gateway(
-            "拉取仓库失败：当前版本仅支持本地来源（git 来源将在 P3 支持）。请改用本地来源",
-        ));
+    if let Err((status, error)) = synced {
+        return Err(git_error(status, error));
     }
     Ok(source_view(&updated, &resolved))
 }
@@ -718,7 +940,7 @@ pub fn market_index(paths: &MarketPaths, source_id: &str) -> Result<MarketIndexV
     else {
         return Err(MarketError::not_found(format!("来源 {source_id} 不存在")));
     };
-    let resolved = resolve_source(record);
+    let resolved = resolve_source(paths, record);
     let installed = read_installed(paths);
     let skills = match (resolved.root.as_deref(), resolved.index.as_ref()) {
         (Some(root), Some(index)) => index
@@ -1364,24 +1586,27 @@ pub fn install(
         .iter()
         .find(|source| source.id == source_id)
         .ok_or_else(|| MarketError::not_found(format!("来源 {source_id} 不存在")))?;
-    if source.kind != "local" {
-        return Err(MarketError::bad_request(
-            "当前版本只支持本地来源（git 来源将在 P3 支持）",
-        ));
-    }
-    let (root, index) = load_local_index(&source.value).map_err(|(status, error)| {
-        if status == "unsupported" {
-            MarketError::unprocessable(format!(
-                "来源 {} 不受支持：{error}",
-                source.name.as_deref().unwrap_or(&source.id)
-            ))
-        } else {
-            MarketError::unprocessable(format!(
-                "来源 {} 不可用：{error}",
-                source.name.as_deref().unwrap_or(&source.id)
-            ))
+    // git 来源正常在新增/刷新时已 clone；镜像丢失时补一次（30 秒超时）。
+    if source.kind == "git" && !paths.mirror_dir().join(&source.id).is_dir() {
+        if let Err((status, error)) = sync_git_mirror(paths, source) {
+            return Err(git_error(status, error));
         }
-    })?;
+    }
+    let resolved = resolve_source(paths, source);
+    let (root, index) = match (resolved.root, resolved.index) {
+        (Some(root), Some(index)) => (root, index),
+        _ => {
+            let message = resolved
+                .last_error
+                .unwrap_or_else(|| "来源不可用".to_string());
+            let label = source.name.as_deref().unwrap_or(&source.id);
+            return Err(if resolved.status == "unsupported" {
+                MarketError::unprocessable(format!("来源 {label} 不受支持：{message}"))
+            } else {
+                MarketError::unprocessable(format!("来源 {label} 不可用：{message}"))
+            });
+        }
+    };
     let entry = index
         .skills
         .iter()
@@ -1424,7 +1649,11 @@ pub fn install(
                     kind: source.kind.clone(),
                     value: source.value.clone(),
                     subdir: source.subdir.clone(),
-                    resolved_ref: None,
+                    resolved_ref: if source.kind == "git" {
+                        git_short_ref(&paths.mirror_dir().join(&source.id))
+                    } else {
+                        None
+                    },
                 },
             }),
         },
@@ -1442,8 +1671,8 @@ pub fn install(
 
 /// `/skills install <path>`：本地目录或单个 `.md` 也走**同一条**原子流水线。
 ///
-/// 与市场安装的差别只有两点：没有索引来源；不写 `installed.json`（CLI 安装
-/// 不属于市场受管技能，因此不能从 WebUI 卸载，但可以禁用）。
+/// 与市场安装的差别只有两点：没有索引来源；不写 `installed.json`（因此 WebUI
+/// 不展示市场版本/来源）。副本仍在安装根内，WebUI 按路径判定可卸载。
 pub fn install_local(
     paths: &MarketPaths,
     source: &str,
@@ -1566,7 +1795,13 @@ fn derive_local_install_name(resolved: &Path) -> Result<String, MarketError> {
         })
 }
 
-/// 卸载市场安装的技能：目录先进 trash，注册表写成功后才真正删除。
+/// 卸载安装根内的技能副本：目录先进 trash，注册表更新成功后才真正删除。
+///
+/// 判定只看「副本是否落在安装根」，不依赖 `installed.json`：命令行
+/// `/skills install` 与市场安装写入同一个根，前者没有市场元数据，
+/// 但同样必须能从 WebUI 卸载。项目级/内置技能不在安装根内，仍只能禁用。
+/// 注册表有记录时联动删除并清理 `state.json`；没有记录时只清禁用状态，
+/// 不凭空创建 `installed.json`。
 pub fn uninstall(
     paths: &MarketPaths,
     name: &str,
@@ -1581,21 +1816,17 @@ pub fn uninstall(
     let name = crate::sanitize_skill_invocation_name(name)
         .ok_or_else(|| MarketError::bad_request("技能名不合法"))?;
     let registry = read_installed(paths);
-    let Some(record) = registry.skills.get(&name) else {
-        if paths.install_root.join(&name).exists() {
-            return Err(MarketError::conflict(
-                "只能卸载从市场安装的技能；项目或内置技能请用「禁用」",
-            ));
-        }
-        return Err(MarketError::not_found(format!("技能 {name} 不存在")));
-    };
-    if !record.managed {
+    let record = registry.skills.get(&name);
+    if record.is_some_and(|record| !record.managed) {
         return Err(MarketError::conflict(
-            "只能卸载从市场安装的技能；项目或内置技能请用「禁用」",
+            "该技能记录为「非市场安装」，不能卸载；项目或内置技能请用「禁用」",
         ));
     }
 
     let target = paths.install_root.join(&name);
+    if record.is_none() && !target.exists() {
+        return Err(MarketError::not_found(format!("技能 {name} 不存在")));
+    }
     fs::create_dir_all(paths.trash_dir())
         .map_err(|error| MarketError::new(500, format!("卸载失败：{error}")))?;
     let trash_path = paths.trash_dir().join(Uuid::new_v4().to_string());
@@ -1607,13 +1838,18 @@ pub fn uninstall(
         false
     };
 
+    let had_record = record.is_some();
     let write_result = {
         let _guard = registry_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut latest = read_installed(paths);
-        latest.skills.remove(&name);
-        remove_disabled(paths, &name).and_then(|()| write_installed(paths, &latest))
+        if had_record {
+            let mut latest = read_installed(paths);
+            latest.skills.remove(&name);
+            remove_disabled(paths, &name).and_then(|()| write_installed(paths, &latest))
+        } else {
+            remove_disabled(paths, &name)
+        }
     };
     if let Err(error) = write_result {
         if moved {
@@ -2046,19 +2282,67 @@ mod tests {
         assert_eq!(missing.status, 404);
     }
 
+    /// 命令行安装不写 `installed.json`，但落在安装根内，WebUI 必须能卸载。
     #[test]
-    fn uninstall_rejects_unmanaged_skill() {
+    fn uninstall_removes_unregistered_root_skill() {
         let fixture = fixture();
-        fs::create_dir_all(fixture.paths.install_root.join("manual")).expect("manual skill");
+        let source = fixture.source_root.join("skills").join("demo");
+        install_local(
+            &fixture.paths,
+            source.to_str().expect("source utf8"),
+            &fixture.workspace,
+            false,
+            &Mutex::new(()),
+            Fault::None,
+        )
+        .expect("local install");
+        assert!(read_installed(&fixture.paths).skills.is_empty());
+        let target = fixture.paths.install_root.join("demo");
+        assert!(target.is_dir());
+
+        uninstall(&fixture.paths, "demo", &Mutex::new(())).expect("uninstall unregistered");
+        assert!(!target.exists(), "目录必须被删除");
+        assert!(staging_is_empty(&fixture.paths));
+        assert!(trash_is_empty(&fixture.paths));
+    }
+
+    /// 注册表明确标了 `managed: false` 的记录仍然不可卸载。
+    #[test]
+    fn uninstall_rejects_non_managed_record() {
+        let fixture = fixture();
+        let target = fixture.paths.install_root.join("manual");
+        fs::create_dir_all(&target).expect("manual skill");
         fs::write(
-            fixture.paths.install_root.join("manual").join("SKILL.md"),
+            target.join("SKILL.md"),
             "---\nname: manual\ndescription: x\n---\n",
         )
         .expect("write manual");
+        let mut registry = InstalledRegistry::default();
+        registry.skills.insert(
+            "manual".to_string(),
+            InstalledRecord {
+                name: "manual".to_string(),
+                display_name: None,
+                version: "0.0.0+unknown".to_string(),
+                marketplace: String::new(),
+                source: InstalledSource {
+                    kind: "local".to_string(),
+                    value: String::new(),
+                    subdir: None,
+                    resolved_ref: None,
+                },
+                checksum: None,
+                installed_at_unix_ms: 0,
+                updated_at_unix_ms: 0,
+                managed: false,
+            },
+        );
+        write_installed(&fixture.paths, &registry).expect("write registry");
+
         let error = uninstall(&fixture.paths, "manual", &Mutex::new(()))
-            .expect_err("unmanaged uninstall must fail");
+            .expect_err("non-managed record must be rejected");
         assert_eq!(error.status, 409);
-        assert!(fixture.paths.install_root.join("manual").is_dir());
+        assert!(target.is_dir());
     }
 
     /// 目录快照：相对路径 + 大小 + 修改时间。启停前后必须完全一致。

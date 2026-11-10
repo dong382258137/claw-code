@@ -3154,6 +3154,7 @@ fn skill_summary_json(
     skill: &commands::SkillSummary,
     installed: Option<&crate::skill_market::InstalledRecord>,
     enabled: bool,
+    uninstallable: bool,
 ) -> Value {
     json!({
         "name": skill.name(),
@@ -3165,9 +3166,18 @@ fn skill_summary_json(
         "active": skill.is_active(),
         "shadowed_by": skill.shadowed_by().map(commands::DefinitionSource::scope_key),
         "managed": installed.is_some(),
+        // 是否可卸载只看「副本是否在安装根」：命令行安装没有注册表记录，
+        // 但同样落在安装根内，必须能从 WebUI 删掉。
+        "uninstallable": uninstallable,
         "version": installed.map_or("", |record| record.version.as_str()),
         "marketplace": installed.map_or("", |record| record.marketplace.as_str()),
     })
+}
+
+/// 安装根内的副本（市场安装或 `/skills install`）可卸载；项目/内置只能禁用。
+fn is_uninstallable(state: &AppState, skill: &commands::SkillSummary) -> bool {
+    let install_root = state.skill_market.install_root.as_path();
+    !install_root.as_os_str().is_empty() && skill.path().starts_with(install_root)
 }
 
 /// 已装记录只在技能确实来自市场安装根时才算数：项目里同名技能遮蔽时，
@@ -3237,6 +3247,10 @@ async fn api_skills(State(state): State<AppState>, Query(auth): Query<AuthQuery>
         .iter()
         .filter(|skill| managed_record(&state, skill, &installed).is_some())
         .count();
+    let uninstallable = skills
+        .iter()
+        .filter(|skill| is_uninstallable(&state, skill))
+        .count();
     let install_root = commands::skill_install_root()
         .map(|path| path.display().to_string())
         .unwrap_or_default();
@@ -3247,13 +3261,19 @@ async fn api_skills(State(state): State<AppState>, Query(auth): Query<AuthQuery>
             "shadowed": total - active,
             "disabled": disabled_count,
             "managed": managed,
+            "uninstallable": uninstallable,
             "install_root": install_root,
         },
         "skills": skills
             .iter()
             .map(|skill| {
                 let enabled = !disabled.contains(skill.name());
-                skill_summary_json(skill, managed_record(&state, skill, &installed), enabled)
+                skill_summary_json(
+                    skill,
+                    managed_record(&state, skill, &installed),
+                    enabled,
+                    is_uninstallable(&state, skill),
+                )
             })
             .collect::<Vec<_>>(),
     }))
@@ -3305,7 +3325,7 @@ async fn api_skill(
     let enabled = !crate::skill_market::read_state(&state.skill_market)
         .disabled
         .contains(skill.name());
-    let mut body = skill_summary_json(skill, record, enabled);
+    let mut body = skill_summary_json(skill, record, enabled, is_uninstallable(&state, skill));
     body["files"] = Value::Array(files);
     body["invoke_as"] = json!(format!("${}", skill.name()));
     body["installed"] = match record {
@@ -3411,6 +3431,14 @@ fn market_error_response(error: crate::skill_market::MarketError) -> Response {
     (status, error.message).into_response()
 }
 
+fn blocking_failed(join: tokio::task::JoinError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("任务执行失败：{join}"),
+    )
+        .into_response()
+}
+
 async fn api_skill_sources(
     State(state): State<AppState>,
     Query(auth): Query<AuthQuery>,
@@ -3432,15 +3460,22 @@ async fn api_skill_source_add(
     if !authorize(&state, &auth) {
         return unauthorized();
     }
-    match crate::skill_market::add_source(
-        &state.skill_market,
-        &body.kind,
-        &body.value,
-        body.name.as_deref(),
-        body.subdir.as_deref(),
-    ) {
-        Ok(source) => (StatusCode::CREATED, Json(source)).into_response(),
-        Err(error) => market_error_response(error),
+    // git 来源会 clone（最长 30 秒），不能占住 async worker。
+    let paths = state.skill_market.clone();
+    let SkillSourceBody {
+        kind,
+        value,
+        name,
+        subdir,
+    } = body;
+    match tokio::task::spawn_blocking(move || {
+        crate::skill_market::add_source(&paths, &kind, &value, name.as_deref(), subdir.as_deref())
+    })
+    .await
+    {
+        Ok(Ok(source)) => (StatusCode::CREATED, Json(source)).into_response(),
+        Ok(Err(error)) => market_error_response(error),
+        Err(join) => blocking_failed(join),
     }
 }
 
@@ -3466,9 +3501,13 @@ async fn api_skill_source_refresh(
     if !authorize(&state, &auth) {
         return unauthorized();
     }
-    match crate::skill_market::refresh_source(&state.skill_market, &id) {
-        Ok(source) => Json(source).into_response(),
-        Err(error) => market_error_response(error),
+    let paths = state.skill_market.clone();
+    match tokio::task::spawn_blocking(move || crate::skill_market::refresh_source(&paths, &id))
+        .await
+    {
+        Ok(Ok(source)) => Json(source).into_response(),
+        Ok(Err(error)) => market_error_response(error),
+        Err(join) => blocking_failed(join),
     }
 }
 
@@ -3528,16 +3567,29 @@ async fn api_skill_install(
         Ok(lock) => lock,
         Err(error) => return market_error_response(error),
     };
-    match crate::skill_market::install(
-        &state.skill_market,
-        &body.source_id,
-        &name,
-        body.version.as_deref(),
-        body.upgrade,
-        &state.skill_registry_lock,
-        crate::skill_market::Fault::None,
-    ) {
-        Ok(record) => {
+    // 安装可能触发 git clone（最长 30 秒），放到阻塞线程池里执行。
+    let paths = state.skill_market.clone();
+    let registry_lock = state.skill_registry_lock.clone();
+    let source_id = body.source_id;
+    let version = body.version;
+    let upgrade = body.upgrade;
+    let install_name = name.clone();
+    let installed = tokio::task::spawn_blocking(move || {
+        crate::skill_market::install(
+            &paths,
+            &source_id,
+            &install_name,
+            version.as_deref(),
+            upgrade,
+            &registry_lock,
+            crate::skill_market::Fault::None,
+        )
+    })
+    .await;
+    match installed {
+        Err(join) => blocking_failed(join),
+        Ok(Err(error)) => market_error_response(error),
+        Ok(Ok(record)) => {
             let shadowed_by = load_all_skill_summaries(&state.workspace)
                 .ok()
                 .and_then(|skills| {
@@ -3561,7 +3613,6 @@ async fn api_skill_install(
             )
                 .into_response()
         }
-        Err(error) => market_error_response(error),
     }
 }
 

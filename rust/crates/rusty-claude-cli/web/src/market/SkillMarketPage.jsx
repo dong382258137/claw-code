@@ -68,7 +68,7 @@ export function SkillMarketPage() {
   const visible = useMemo(() => {
     const text = keyword.trim().toLowerCase()
     return skills.filter((skill) => {
-      if (view === 'installed' && !skill.managed) return false
+      if (view === 'installed' && !skill.uninstallable) return false
       if (view === 'list') {
         if (filter === 'active' && !skill.active) return false
         if (filter === 'shadowed' && skill.active) return false
@@ -130,11 +130,11 @@ export function SkillMarketPage() {
       <div className="market-head">
         <div>
           <h1>技能市场</h1>
-          <p>浏览本机技能，从本地索引来源安装或卸载；卸载只会删除市场安装的副本。</p>
+          <p>浏览本机技能，从本地索引来源安装或卸载；卸载只删除安装目录下的副本，项目与内置技能只能禁用。</p>
         </div>
         <span className="chip">
           {summary.active ?? 0} / {summary.total ?? 0} 生效 · {summary.disabled ?? 0} 已禁用 ·{' '}
-          {summary.managed ?? 0} 已安装
+          {summary.uninstallable ?? 0} 可卸载
         </span>
       </div>
 
@@ -226,6 +226,8 @@ export function SkillMarketPage() {
                       <div className="skill-managed">
                         市场安装 · {skill.marketplace || '未知来源'} · v{skill.version || '未知'}
                       </div>
+                    ) : skill.uninstallable ? (
+                      <div className="skill-managed">命令行安装 · 无市场元数据</div>
                     ) : null}
                     {!skill.enabled ? <div className="skill-disabled">已禁用</div> : null}
                     {!skill.active && skill.shadowed_by ? (
