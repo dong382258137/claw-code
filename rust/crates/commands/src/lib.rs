@@ -2359,6 +2359,17 @@ impl DefinitionSource {
     fn label(self) -> &'static str {
         self.report_scope().label()
     }
+
+    /// Web API 用的稳定标识；`project` / `user_config` / `user` / `builtin`。
+    #[must_use]
+    pub fn scope_key(self) -> &'static str {
+        match self.report_scope() {
+            DefinitionScope::Project => "project",
+            DefinitionScope::UserConfigHome => "user_config",
+            DefinitionScope::UserHome => "user",
+            DefinitionScope::Builtin => "builtin",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2378,12 +2389,19 @@ pub struct SkillSummary {
     source: DefinitionSource,
     shadowed_by: Option<DefinitionSource>,
     origin: SkillOrigin,
+    /// 技能提示词文件（`<dir>/SKILL.md` 或 legacy 的单 `.md`），供 Web 端预览与定位。
+    path: PathBuf,
 }
 
 impl SkillSummary {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     #[must_use]
@@ -2426,6 +2444,15 @@ impl SkillOrigin {
         match self {
             Self::SkillsDir => None,
             Self::LegacyCommandsDir => Some("legacy /commands"),
+        }
+    }
+
+    /// Web API 用的稳定标识；与中文展示文案解耦。
+    #[must_use]
+    pub fn api_key(self) -> &'static str {
+        match self {
+            Self::SkillsDir => "skills_dir",
+            Self::LegacyCommandsDir => "legacy_commands",
         }
     }
 }
@@ -3485,6 +3512,25 @@ pub fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
+    // Windows 兜底：`HOME` 常为空，但 `USERPROFILE` 存在。安装根走
+    // `default_config_home()`，若发现层不登记同一个目录，会出现「装完却找不到」。
+    // 已有根按路径去重，因此 HOME / CLAW_CONFIG_HOME 场景下不会重复。
+    let config_home = runtime::default_config_home();
+    if config_home != Path::new(".claw") {
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClaw,
+            config_home.join("skills"),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClaw,
+            config_home.join("commands"),
+            SkillOrigin::LegacyCommandsDir,
+        );
+    }
+
     // Built-in skills shipped with the claw binary.
     // Resolution order (first match wins via `push_unique_skill_root`):
     //   1. `<cwd-ancestor>/rust/skills`  — dev mode: running claw from the repo
@@ -3540,7 +3586,7 @@ pub fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
 }
 
 fn install_skill(source: &str, cwd: &Path) -> std::io::Result<InstalledSkill> {
-    let registry_root = default_skill_install_root()?;
+    let registry_root = skill_install_root()?;
     install_skill_into(source, cwd, &registry_root)
 }
 
@@ -3589,20 +3635,35 @@ fn install_skill_into(
     })
 }
 
-fn default_skill_install_root() -> std::io::Result<PathBuf> {
+/// 技能安装根：`CLAW_CONFIG_HOME` → `CODEX_HOME` → 统一配置家目录。
+///
+/// Windows 上 `HOME` 常为空，旧实现只读 `HOME` 会直接失败；这里改走
+/// [`runtime::config::default_config_home`]，它会退到 `%USERPROFILE%\.claw`。
+/// 若三个环境变量都不存在，返回错误而不是相对 `.claw`，避免把技能装到
+/// 随 cwd 漂移的位置。
+pub fn skill_install_root() -> std::io::Result<PathBuf> {
     if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
         return Ok(PathBuf::from(claw_config_home).join("skills"));
     }
     if let Ok(codex_home) = env::var("CODEX_HOME") {
         return Ok(PathBuf::from(codex_home).join("skills"));
     }
-    if let Some(home) = env::var_os("HOME") {
-        return Ok(PathBuf::from(home).join(".claw").join("skills"));
+    let config_home = runtime::default_config_home();
+    skill_install_root_from(config_home)
+}
+
+/// 纯函数部分：把「配置家目录」映射为技能安装根。
+///
+/// `default_config_home()` 在没有任何环境变量时会退化成相对 `.claw`，
+/// 这里显式拒绝，避免技能被装到随 cwd 漂移的位置。
+fn skill_install_root_from(config_home: PathBuf) -> std::io::Result<PathBuf> {
+    if config_home == Path::new(".claw") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "unable to resolve a skills install root; set CLAW_CONFIG_HOME, HOME or USERPROFILE",
+        ));
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "unable to resolve a skills install root; set CLAW_CONFIG_HOME or HOME",
-    ))
+    Ok(config_home.join("skills"))
 }
 
 fn resolve_skill_install_source(source: &str, cwd: &Path) -> std::io::Result<SkillInstallSource> {
@@ -3980,7 +4041,7 @@ pub fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillS
                     if !skill_path.is_file() {
                         continue;
                     }
-                    let contents = fs::read_to_string(skill_path)?;
+                    let contents = fs::read_to_string(&skill_path)?;
                     let (name, description) = parse_skill_frontmatter(&contents);
                     root_skills.push(SkillSummary {
                         name: name
@@ -3989,6 +4050,7 @@ pub fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillS
                         source: root.source,
                         shadowed_by: None,
                         origin: root.origin,
+                        path: skill_path,
                     });
                 }
                 SkillOrigin::LegacyCommandsDir => {
@@ -4020,6 +4082,7 @@ pub fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillS
                         source: root.source,
                         shadowed_by: None,
                         origin: root.origin,
+                        path: markdown_path,
                     });
                 }
             }
@@ -6247,6 +6310,37 @@ mod tests {
     }
 
     #[test]
+    fn skill_summary_exposes_prompt_file_path() {
+        let workspace = temp_dir("skill-summary-path");
+        let project_skills = workspace.join(".codex").join("skills");
+        write_skill(&project_skills, "demo", "Demo skill");
+
+        let roots = vec![SkillRoot {
+            source: DefinitionSource::ProjectCodex,
+            path: project_skills.clone(),
+            origin: SkillOrigin::SkillsDir,
+        }];
+        let skills = load_skills_from_roots(&roots).expect("skill roots should load");
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(
+            skills[0].path(),
+            project_skills.join("demo").join("SKILL.md").as_path()
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn skill_install_root_never_falls_back_to_relative_path() {
+        assert!(crate::skill_install_root_from(PathBuf::from(".claw")).is_err());
+
+        let resolved = crate::skill_install_root_from(PathBuf::from("C:\\Users\\demo\\.claw"))
+            .expect("absolute config home should resolve");
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with(Path::new("skills")));
+    }
+
+    #[test]
     fn resolves_project_skills_and_legacy_commands_from_shared_registry() {
         let workspace = temp_dir("resolve-project-skills");
         let project_skills = workspace.join(".claw").join("skills");
@@ -6970,6 +7064,7 @@ other: value
                 source: super::DefinitionSource::BuiltinShipped,
                 shadowed_by: None,
                 origin: super::SkillOrigin::SkillsDir,
+                path: std::path::PathBuf::from("SKILL.md"),
             },
             super::SkillSummary {
                 name: "beta".to_string(),
@@ -6977,6 +7072,7 @@ other: value
                 source: super::DefinitionSource::BuiltinShipped,
                 shadowed_by: None,
                 origin: super::SkillOrigin::SkillsDir,
+                path: std::path::PathBuf::from("SKILL.md"),
             },
         ];
         let catalog = super::render_skill_catalog(&skills);
@@ -6998,6 +7094,7 @@ other: value
             source: super::DefinitionSource::BuiltinShipped,
             shadowed_by: None,
             origin: super::SkillOrigin::SkillsDir,
+            path: std::path::PathBuf::from("SKILL.md"),
         }];
         let catalog = super::render_skill_catalog(&skills);
         // The rendered line should be shorter than the original description.
@@ -7016,6 +7113,7 @@ other: value
                 source: super::DefinitionSource::BuiltinShipped,
                 shadowed_by: None,
                 origin: super::SkillOrigin::SkillsDir,
+                path: std::path::PathBuf::from("SKILL.md"),
             });
         }
         let catalog = super::render_skill_catalog(&skills);
@@ -7040,6 +7138,7 @@ other: value
                 source: super::DefinitionSource::BuiltinShipped,
                 shadowed_by: None,
                 origin: super::SkillOrigin::SkillsDir,
+                path: std::path::PathBuf::from("SKILL.md"),
             })
             .collect::<Vec<_>>();
         let catalog = super::render_skill_catalog(&skills);

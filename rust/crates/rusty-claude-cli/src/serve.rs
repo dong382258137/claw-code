@@ -618,6 +618,9 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .route("/api/client-error", post(api_client_error))
             .route("/api/upload", post(api_upload))
             .route("/api/meta", get(api_meta))
+            .route("/api/skills", get(api_skills))
+            .route("/api/skills/{name}", get(api_skill))
+            .route("/api/skills/{name}/raw", get(api_skill_raw))
             .route("/ws/terminal", get(ws_terminal))
             .route("/api/session/{id}/tasks", get(api_tasks))
             .route(
@@ -3112,6 +3115,205 @@ async fn api_meta(State(state): State<AppState>, Query(auth): Query<AuthQuery>) 
         "workspace": state.workspace.display().to_string(),
     }))
     .into_response()
+}
+
+const MAX_SKILL_PREVIEW_BYTES: u64 = 512 * 1024;
+const MAX_SKILL_FILES: usize = 200;
+
+fn load_all_skill_summaries(workspace: &Path) -> std::io::Result<Vec<commands::SkillSummary>> {
+    let roots = commands::discover_skill_roots(workspace);
+    commands::load_skills_from_roots(&roots)
+}
+
+fn skill_summary_json(skill: &commands::SkillSummary) -> Value {
+    json!({
+        "name": skill.name(),
+        "description": skill.description().unwrap_or_default(),
+        "source": skill.source().scope_key(),
+        "origin": skill.origin().api_key(),
+        "path": skill.path().display().to_string(),
+        // P0 还没有独立启停状态：全部视为启用，`active` 只反映是否被同名技能遮蔽。
+        "enabled": true,
+        "active": skill.is_active(),
+        "shadowed_by": skill.shadowed_by().map(commands::DefinitionSource::scope_key),
+    })
+}
+
+fn collect_skill_files(dir: &Path, base: &Path, out: &mut Vec<Value>) {
+    if out.len() >= MAX_SKILL_FILES {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= MAX_SKILL_FILES {
+            break;
+        }
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
+            collect_skill_files(&path, base, out);
+        } else if meta.is_file() {
+            let relative = path.strip_prefix(base).unwrap_or(&path);
+            out.push(json!({
+                "path": relative.display().to_string(),
+                "size": meta.len(),
+            }));
+        }
+    }
+}
+
+async fn api_skills(State(state): State<AppState>, Query(auth): Query<AuthQuery>) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let skills = match load_all_skill_summaries(&state.workspace) {
+        Ok(skills) => skills,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("读取技能目录失败：{error}"),
+            )
+                .into_response();
+        }
+    };
+    let total = skills.len();
+    let active = skills.iter().filter(|skill| skill.is_active()).count();
+    let install_root = commands::skill_install_root()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    Json(json!({
+        "summary": {
+            "total": total,
+            "active": active,
+            "shadowed": total - active,
+            "install_root": install_root,
+        },
+        "skills": skills.iter().map(skill_summary_json).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+async fn api_skill(
+    UrlPath(name): UrlPath<String>,
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let skills = match load_all_skill_summaries(&state.workspace) {
+        Ok(skills) => skills,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("读取技能目录失败：{error}"),
+            )
+                .into_response();
+        }
+    };
+    let Some(skill) = skills
+        .iter()
+        .find(|skill| skill.name().eq_ignore_ascii_case(&name))
+    else {
+        return (StatusCode::NOT_FOUND, format!("技能 {name} 不存在")).into_response();
+    };
+    let mut files = Vec::new();
+    if skill.path().file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+        if let Some(base) = skill.path().parent() {
+            collect_skill_files(base, base, &mut files);
+        }
+    } else {
+        let size = std::fs::metadata(skill.path())
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        let file_name = skill
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("SKILL.md");
+        files.push(json!({ "path": file_name, "size": size }));
+    }
+    let mut body = skill_summary_json(skill);
+    body["files"] = Value::Array(files);
+    body["invoke_as"] = json!(format!("${}", skill.name()));
+    Json(body).into_response()
+}
+
+#[derive(Deserialize)]
+struct SkillRawQuery {
+    path: Option<String>,
+}
+
+async fn api_skill_raw(
+    UrlPath(name): UrlPath<String>,
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    Query(query): Query<SkillRawQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let skills = match load_all_skill_summaries(&state.workspace) {
+        Ok(skills) => skills,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("读取技能目录失败：{error}"),
+            )
+                .into_response();
+        }
+    };
+    let Some(skill) = skills
+        .iter()
+        .find(|skill| skill.name().eq_ignore_ascii_case(&name))
+    else {
+        return (StatusCode::NOT_FOUND, format!("技能 {name} 不存在")).into_response();
+    };
+    let is_dir_skill = skill.path().file_name().and_then(|name| name.to_str()) == Some("SKILL.md");
+    let base = if is_dir_skill {
+        skill.path().parent().unwrap_or_else(|| Path::new("."))
+    } else {
+        skill.path()
+    };
+    let requested = query.path.unwrap_or_else(|| "SKILL.md".to_string());
+    if requested.contains("..") || Path::new(&requested).is_absolute() {
+        return (StatusCode::BAD_REQUEST, "非法文件路径").into_response();
+    }
+    let target = if is_dir_skill {
+        base.join(&requested)
+    } else {
+        base.to_path_buf()
+    };
+    let (Ok(target), Ok(base)) = (target.canonicalize(), base.canonicalize()) else {
+        return (StatusCode::NOT_FOUND, format!("文件 {requested} 不存在")).into_response();
+    };
+    if !target.starts_with(&base) {
+        return (StatusCode::BAD_REQUEST, "技能路径越出技能目录").into_response();
+    }
+    let Ok(meta) = std::fs::metadata(&target) else {
+        return (StatusCode::NOT_FOUND, format!("文件 {requested} 不存在")).into_response();
+    };
+    if !meta.is_file() {
+        return (StatusCode::BAD_REQUEST, "只能预览普通文件").into_response();
+    }
+    if meta.len() > MAX_SKILL_PREVIEW_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "文件过大，仅支持在线预览 {}KB 以内",
+                MAX_SKILL_PREVIEW_BYTES / 1024
+            ),
+        )
+            .into_response();
+    }
+    let Ok(text) = std::fs::read_to_string(&target) else {
+        return (StatusCode::BAD_REQUEST, "不是可读的文本文件").into_response();
+    };
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
 }
 
 fn web_settings_path() -> Option<PathBuf> {

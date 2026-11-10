@@ -1,7 +1,7 @@
 import React from 'react'
+import { SkillMarketPage } from './SkillMarketPage.jsx'
 
-// 市场骨架页：本轮只占位，不发起任何请求、不定义 API 契约。
-// 后续接入时，列表/安装/启停都落在这个组件里，不再回到 App.jsx。
+// 市场页入口：插件仍为占位；技能已接入只读目录（P0）。
 const COPY = {
   plugins: {
     title: '插件市场',
@@ -9,15 +9,10 @@ const COPY = {
     emptyTitle: '插件市场骨架已就位',
     emptyText: '列表、搜索、安装与启停将在后续版本接入；本轮不定义后端接口。',
   },
-  skills: {
-    title: '技能市场',
-    subtitle: '浏览与安装技能，让助手按需获得领域能力。',
-    emptyTitle: '技能市场骨架已就位',
-    emptyText: '技能列表、来源校验与安装流程将在后续版本接入；本轮不定义后端接口。',
-  },
 }
 
 export function MarketPage({ kind = 'plugins' }) {
+  if (kind === 'skills') return <SkillMarketPage />
   const copy = COPY[kind] || COPY.plugins
   return (
     <div className="market-page">

@@ -7,7 +7,21 @@ const ROUTE_EVENT = 'claw-route-change'
 
 export function parseRoute(hash = '') {
   const value = String(hash || '').replace(/^#\/?/, '').split('?')[0]
+  // 技能详情用 #/skills/<name>，来源管理用 #/skills/sources；
+  // 一级路由仍返回 skills，App.jsx / Sidebar 无需感知子路径。
+  if (value === 'skills' || value.startsWith('skills/')) return 'skills'
   return ROUTES.includes(value) ? value : 'chat'
+}
+
+// 解析技能市场子路径：{ view: 'list' | 'installed' | 'sources' | 'detail', name? }
+export function parseSkillSub(hash = '') {
+  const value = String(hash || '').replace(/^#\/?/, '').split('?')[0]
+  if (!value.startsWith('skills/')) return { view: 'list' }
+  const rest = value.slice('skills/'.length)
+  if (!rest) return { view: 'list' }
+  if (rest === 'installed') return { view: 'installed' }
+  if (rest === 'sources') return { view: 'sources' }
+  return { view: 'detail', name: decodeURIComponent(rest) }
 }
 
 export function navigate(route) {
