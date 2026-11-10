@@ -9,7 +9,7 @@
 //!
 //! 数据直接来自磁盘上的会话 JSONL；此阶段不写入、不驱动 turn。
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -23,7 +23,7 @@ use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{Html, IntoResponse, Json, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -60,6 +60,12 @@ struct AppState {
     events: Arc<EventHub>,
     /// 等待用户在 Web 端批准的越权工具调用（id → 会话 + 应答通道）。
     approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
+    /// 技能市场：注册表/暂存区根 + 技能安装根。
+    skill_market: crate::skill_market::MarketPaths,
+    /// 同名安装/卸载互斥（P1：并发同名返回 409）。
+    skill_install_locks: Arc<Mutex<BTreeSet<String>>>,
+    /// `installed.json` 读改写串行化，避免不同技能并发安装丢更新。
+    skill_registry_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -587,6 +593,9 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             scheduler,
             events: Arc::new(EventHub::default()),
             approvals: Arc::new(Mutex::new(HashMap::new())),
+            skill_market: crate::skill_market::MarketPaths::discover(),
+            skill_install_locks: Arc::new(Mutex::new(BTreeSet::new())),
+            skill_registry_lock: Arc::new(Mutex::new(())),
         };
         spawn_session_watchdog(state.clone());
         let app = Router::new()
@@ -619,8 +628,19 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .route("/api/upload", post(api_upload))
             .route("/api/meta", get(api_meta))
             .route("/api/skills", get(api_skills))
-            .route("/api/skills/{name}", get(api_skill))
+            .route("/api/skills/{name}", get(api_skill).delete(api_skill_uninstall))
             .route("/api/skills/{name}/raw", get(api_skill_raw))
+            .route("/api/skills/install", post(api_skill_install))
+            .route(
+                "/api/skill-sources",
+                get(api_skill_sources).post(api_skill_source_add),
+            )
+            .route("/api/skill-sources/{id}", delete(api_skill_source_delete))
+            .route(
+                "/api/skill-sources/{id}/refresh",
+                post(api_skill_source_refresh),
+            )
+            .route("/api/skill-market", get(api_skill_market))
             .route("/ws/terminal", get(ws_terminal))
             .route("/api/session/{id}/tasks", get(api_tasks))
             .route(
@@ -3125,18 +3145,38 @@ fn load_all_skill_summaries(workspace: &Path) -> std::io::Result<Vec<commands::S
     commands::load_skills_from_roots(&roots)
 }
 
-fn skill_summary_json(skill: &commands::SkillSummary) -> Value {
+fn skill_summary_json(
+    skill: &commands::SkillSummary,
+    installed: Option<&crate::skill_market::InstalledRecord>,
+) -> Value {
     json!({
         "name": skill.name(),
         "description": skill.description().unwrap_or_default(),
         "source": skill.source().scope_key(),
         "origin": skill.origin().api_key(),
         "path": skill.path().display().to_string(),
-        // P0 还没有独立启停状态：全部视为启用，`active` 只反映是否被同名技能遮蔽。
+        // P1 还没有独立启停状态：全部视为启用，`active` 只反映是否被同名技能遮蔽。
         "enabled": true,
         "active": skill.is_active(),
         "shadowed_by": skill.shadowed_by().map(commands::DefinitionSource::scope_key),
+        "managed": installed.is_some(),
+        "version": installed.map_or("", |record| record.version.as_str()),
+        "marketplace": installed.map_or("", |record| record.marketplace.as_str()),
     })
+}
+
+/// 已装记录只在技能确实来自市场安装根时才算数：项目里同名技能遮蔽时，
+/// 当前生效副本并不是市场装的那个，不能标成受管。
+fn managed_record<'a>(
+    state: &'a AppState,
+    skill: &commands::SkillSummary,
+    installed: &'a crate::skill_market::InstalledRegistry,
+) -> Option<&'a crate::skill_market::InstalledRecord> {
+    let install_root = state.skill_market.install_root.as_path();
+    if install_root.as_os_str().is_empty() || !skill.path().starts_with(install_root) {
+        return None;
+    }
+    installed.skills.get(skill.name())
 }
 
 fn collect_skill_files(dir: &Path, base: &Path, out: &mut Vec<Value>) {
@@ -3182,6 +3222,11 @@ async fn api_skills(State(state): State<AppState>, Query(auth): Query<AuthQuery>
     };
     let total = skills.len();
     let active = skills.iter().filter(|skill| skill.is_active()).count();
+    let installed = crate::skill_market::read_installed(&state.skill_market);
+    let managed = skills
+        .iter()
+        .filter(|skill| managed_record(&state, skill, &installed).is_some())
+        .count();
     let install_root = commands::skill_install_root()
         .map(|path| path.display().to_string())
         .unwrap_or_default();
@@ -3190,9 +3235,14 @@ async fn api_skills(State(state): State<AppState>, Query(auth): Query<AuthQuery>
             "total": total,
             "active": active,
             "shadowed": total - active,
+            "disabled": 0,
+            "managed": managed,
             "install_root": install_root,
         },
-        "skills": skills.iter().map(skill_summary_json).collect::<Vec<_>>(),
+        "skills": skills
+            .iter()
+            .map(|skill| skill_summary_json(skill, managed_record(&state, skill, &installed)))
+            .collect::<Vec<_>>(),
     }))
     .into_response()
 }
@@ -3237,9 +3287,22 @@ async fn api_skill(
             .unwrap_or("SKILL.md");
         files.push(json!({ "path": file_name, "size": size }));
     }
-    let mut body = skill_summary_json(skill);
+    let installed = crate::skill_market::read_installed(&state.skill_market);
+    let record = managed_record(&state, skill, &installed);
+    let mut body = skill_summary_json(skill, record);
     body["files"] = Value::Array(files);
     body["invoke_as"] = json!(format!("${}", skill.name()));
+    body["installed"] = match record {
+        Some(record) => json!({
+            "version": record.version,
+            "marketplace": record.marketplace,
+            "checksum": record.checksum,
+            "installed_at_unix_ms": record.installed_at_unix_ms,
+            "updated_at_unix_ms": record.updated_at_unix_ms,
+            "managed": record.managed,
+        }),
+        None => Value::Null,
+    };
     Json(body).into_response()
 }
 
@@ -3314,6 +3377,201 @@ async fn api_skill_raw(
         return (StatusCode::BAD_REQUEST, "不是可读的文本文件").into_response();
     };
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
+}
+
+#[derive(Deserialize)]
+struct SkillSourceBody {
+    #[serde(rename = "type")]
+    kind: String,
+    value: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    subdir: Option<String>,
+}
+
+fn market_error_response(error: crate::skill_market::MarketError) -> Response {
+    let status = StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (status, error.message).into_response()
+}
+
+async fn api_skill_sources(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    Json(json!({
+        "sources": crate::skill_market::list_sources(&state.skill_market),
+    }))
+    .into_response()
+}
+
+async fn api_skill_source_add(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<SkillSourceBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    match crate::skill_market::add_source(
+        &state.skill_market,
+        &body.kind,
+        &body.value,
+        body.name.as_deref(),
+        body.subdir.as_deref(),
+    ) {
+        Ok(source) => (StatusCode::CREATED, Json(source)).into_response(),
+        Err(error) => market_error_response(error),
+    }
+}
+
+async fn api_skill_source_delete(
+    UrlPath(id): UrlPath<String>,
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    match crate::skill_market::delete_source(&state.skill_market, &id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => market_error_response(error),
+    }
+}
+
+async fn api_skill_source_refresh(
+    UrlPath(id): UrlPath<String>,
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    match crate::skill_market::refresh_source(&state.skill_market, &id) {
+        Ok(source) => Json(source).into_response(),
+        Err(error) => market_error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct SkillMarketQuery {
+    source: Option<String>,
+}
+
+async fn api_skill_market(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    Query(query): Query<SkillMarketQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let Some(source) = query
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return (StatusCode::BAD_REQUEST, "缺少 source 参数").into_response();
+    };
+    match crate::skill_market::market_index(&state.skill_market, source) {
+        Ok(index) => Json(index).into_response(),
+        Err(error) => market_error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct SkillInstallBody {
+    source_id: String,
+    name: String,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    upgrade: bool,
+}
+
+async fn api_skill_install(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<SkillInstallBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let Some(name) = commands::sanitize_skill_invocation_name(&body.name) else {
+        return (StatusCode::BAD_REQUEST, "技能名不合法").into_response();
+    };
+    let _lock = match crate::skill_market::NameLock::acquire(
+        &state.skill_install_locks,
+        &name,
+        &format!("技能 {name} 正在安装，请稍候"),
+    ) {
+        Ok(lock) => lock,
+        Err(error) => return market_error_response(error),
+    };
+    match crate::skill_market::install(
+        &state.skill_market,
+        &body.source_id,
+        &name,
+        body.version.as_deref(),
+        body.upgrade,
+        &state.skill_registry_lock,
+        crate::skill_market::Fault::None,
+    ) {
+        Ok(record) => {
+            let shadowed_by = load_all_skill_summaries(&state.workspace)
+                .ok()
+                .and_then(|skills| {
+                    skills
+                        .iter()
+                        .find(|skill| skill.name().eq_ignore_ascii_case(&name))
+                        .and_then(commands::SkillSummary::shadowed_by)
+                        .map(commands::DefinitionSource::scope_key)
+                });
+            let path = state.skill_market.install_root.join(&record.name);
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "name": record.name,
+                    "version": record.version,
+                    "path": path.display().to_string(),
+                    "enabled": true,
+                    "checksum": record.checksum,
+                    "shadowed_by": shadowed_by,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => market_error_response(error),
+    }
+}
+
+async fn api_skill_uninstall(
+    UrlPath(name): UrlPath<String>,
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let Some(name) = commands::sanitize_skill_invocation_name(&name) else {
+        return (StatusCode::BAD_REQUEST, "技能名不合法").into_response();
+    };
+    let _lock = match crate::skill_market::NameLock::acquire(
+        &state.skill_install_locks,
+        &name,
+        &format!("技能 {name} 正在安装，暂时不能卸载"),
+    ) {
+        Ok(lock) => lock,
+        Err(error) => return market_error_response(error),
+    };
+    match crate::skill_market::uninstall(&state.skill_market, &name, &state.skill_registry_lock) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => market_error_response(error),
+    }
 }
 
 fn web_settings_path() -> Option<PathBuf> {

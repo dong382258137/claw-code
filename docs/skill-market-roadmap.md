@@ -516,6 +516,25 @@
   5. 卸载后目录消失、`installed.json.skills` 为 `{}`、`trash\` 为空。
   6. 两个终端同时 `POST install` 同名 → 一个 201、一个 409（文案含「正在安装」）。
 - 回滚：删 `~/.claw/skill-market/` 与已装技能目录；卸掉路由。已安装技能本身就是普通目录，回退后 CLI 仍可用。
+- **实现偏差（2026-11-10）**：`install_skill_into` 未被市场复用 —— 它直接写最终目录，不满足「staging → 校验 → rename → 注册表」的原子性要求。市场流水线改为复用 `commands::copy_directory_contents` 与 `commands::sanitize_skill_invocation_name`（两者已公开），`/skills install` 行为不变。git 来源在 P1 接受落盘但固定 `status=unreadable`、不参与安装（P3 实现）。
+- **P1 实测记录（2026-11-10，本机 Windows）**：
+
+  | 判据 | 实测 |
+  | --- | --- |
+  | 单测 | `cargo test -p rusty-claude-cli skill_market::tests`：9 passed（原子安装、两种故障注入回滚、并发一胜一负、卸载+prompt 重建、路径逃逸、校验和不匹配） |
+  | 判据 1：安装落盘 | `D:\tmp\p1-config\skills\demo\SKILL.md` 存在；`installed.json` 1 条记录，checksum `sha256:4f5ac45b…` |
+  | 判据 2：CLI 可见 | `claw --output-format json skills list` 含 `demo`（source=`user_claw_config_home`） |
+  | 判据 3：重复安装 | `upgrade:false` → 409「技能 demo 已安装（1.2.0）；如需覆盖请勾选「升级安装」」；目录 mtime `2026-11-10T09:22:33.0974406Z` 前后一致 |
+  | 判据 4：校验失败 | `SKILL.md` 改名后安装 → 422「skills/broken 下没有 SKILL.md，不是有效技能目录」；`skills\` 无新目录、`staging\` 0 项、注册表仍 1 条 |
+  | 判据 5：卸载 | 204；目录消失；`installed.json.skills == {}`；`trash\` 与 `staging\` 均为 0 项 |
+  | 判据 6：并发同名 | 两个并发 POST（.NET `HttpClient`）→ 201 + 409「技能 broken 正在安装，请稍候」；仅 1 个目录、1 条记录、staging 0 项 |
+  | 故障注入回滚 | `Fault::ValidateAfterCopy` / `Fault::RenameToTarget`：新装与升级两条路径均恢复安装前状态（旧目录内容逐字节一致，staging/trash 清空，注册表不变） |
+  | prompt 重建 | 单测调用真实 `app::load_skill_catalog`：安装后 catalog 含 `aaa-demo`，卸载后不再包含（`skill_catalog_fingerprint` 覆盖 SKILL.md mtime/长度，缓存自然失效） |
+  | 浏览器 | `#/skills/sources` 显示 p1-market「可用」并展开 demo/broken 与安装按钮；`#/skills` 三页签正常、列表 145 条；`#/skills/installed` 空状态文案正确 |
+  | 安全 | 路径逃逸 422、无 SKILL.md 422、索引名不一致 422、校验和不匹配 422 |
+  | 回归 | `cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo fmt --all -- --check` 通过；`cargo test --workspace` 除既有 flake `session_list_surfaces_saved_dirty_abandoned_lifecycle`（单跑通过）外全绿 |
+  | 环境相关既有失败 | `runtime::source_root` 与 `runtime::evolution_inbox` 两个测试在本机 `~/.claw/source-root` 指向本仓库时失败；`CLAW_CONFIG_HOME` 指向空目录后两者通过，与 P1 无关 |
+
 
 ### P2：启停
 

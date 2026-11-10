@@ -1166,6 +1166,35 @@ details.plan > summary { display: flex; justify-content: space-between; gap: 10p
 .skill-preview { margin-top: 18px; font-size: 13px; line-height: 1.7; color: var(--label-primary); }
 .skill-raw { margin: 0; padding: 14px; overflow-x: auto; font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; background: var(--layer-2); border-radius: var(--r-sm); }
 .skill-detail-empty { display: flex; align-items: center; justify-content: center; height: 100%; min-height: 220px; font-size: 13px; color: var(--label-tertiary); }
+.skill-tabs { display: flex; gap: 6px; padding: 14px 0 0; }
+.skill-tab { padding: 6px 12px; font-size: 12px; color: var(--label-secondary); background: transparent; border: 0.5px solid transparent; border-radius: var(--r-sm); cursor: pointer; }
+.skill-tab.active { color: var(--label-primary); border-color: var(--link); background: var(--layer-2); }
+.skill-notice { margin: 4px 0 10px; padding: 8px 12px; font-size: 12px; color: var(--label-secondary); border: 0.5px solid var(--border-l2); border-radius: var(--r-sm); background: var(--layer-1); }
+.skill-notice.warn { color: var(--danger); border-color: var(--danger); }
+.skill-managed { margin-top: 6px; font-size: 11px; color: var(--label-caption); }
+.skill-danger { padding: 6px 12px; font-size: 12px; color: var(--danger); background: transparent; border: 0.5px solid var(--danger); border-radius: var(--r-sm); cursor: pointer; }
+.skill-danger:disabled { opacity: .5; cursor: default; }
+.skill-sources { padding-bottom: 12px; }
+.skill-source-form { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 0; }
+.skill-source-form select, .skill-source-form input { padding: 7px 10px; font-size: 12px; color: var(--label-primary); background: var(--layer-2); border: 0.5px solid var(--border-l2); border-radius: var(--r-sm); outline: none; }
+.skill-source-form input { flex: 1; min-width: 160px; }
+.skill-source-list { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.skill-source-row { padding: 10px 12px; background: var(--layer-1); border: 0.5px solid var(--border-l1); border-radius: var(--r-sm); cursor: pointer; }
+.skill-source-row.active { border-color: var(--link); }
+.skill-source-status { flex: 0 0 auto; padding: 1px 6px; font-size: 11px; color: var(--label-tertiary); border: 0.5px solid var(--border-l2); border-radius: var(--r-sm); }
+.skill-source-status.ok { color: var(--success, #3fb950); }
+.skill-source-status.unreadable, .skill-source-status.clone_failed { color: var(--danger); border-color: var(--danger); }
+.skill-source-meta { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 6px; font-size: 11px; color: var(--label-caption); }
+.skill-source-error { font-size: 11px; color: var(--danger); }
+.skill-source-actions { display: flex; gap: 12px; margin-top: 8px; }
+.skill-link { font-size: 12px; color: var(--link); cursor: pointer; }
+.skill-link.danger { color: var(--danger); }
+.skill-install-list { margin-top: 18px; padding-top: 12px; border-top: 0.5px solid var(--border-l1); }
+.skill-install-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.skill-install-head h3 { margin: 0; font-size: 14px; color: var(--label-primary); }
+.skill-install-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 0.5px solid var(--border-l1); }
+.skill-install-main { flex: 1; min-width: 0; }
+.skill-version { flex: 0 0 auto; font-size: 11px; color: var(--label-caption); }
 @media (max-width: 900px) {
   .skill-layout { grid-template-columns: 1fr; }
 }

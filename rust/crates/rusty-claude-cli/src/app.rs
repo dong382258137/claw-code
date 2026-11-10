@@ -3885,7 +3885,7 @@ fn skill_catalog_enabled(cwd: &Path) -> bool {
         .is_some_and(|config| config.feature_config().skills_catalog_enabled_or_default())
 }
 
-fn load_skill_catalog(cwd: &Path) -> Option<String> {
+pub(crate) fn load_skill_catalog(cwd: &Path) -> Option<String> {
     // Respect the settings toggle. We need to load config first to check.
     // ConfigLoader::default_for is the same loader used by the main prompt
     // builder, so the toggle semantics match exactly.

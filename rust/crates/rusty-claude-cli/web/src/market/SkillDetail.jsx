@@ -20,12 +20,13 @@ function formatSize(bytes) {
   return `${(bytes / 1024).toFixed(1)} KB`
 }
 
-export function SkillDetail({ name }) {
+export function SkillDetail({ name, onRemoved }) {
   const [detail, setDetail] = useState(null)
   const [raw, setRaw] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [mode, setMode] = useState('rendered')
+  const [removing, setRemoving] = useState(false)
 
   useEffect(() => {
     if (!name) return undefined
@@ -55,6 +56,26 @@ export function SkillDetail({ name }) {
     }
   }, [name])
 
+  const remove = async () => {
+    if (
+      !window.confirm(
+        `卸载 ${detail.name}？\n\n将删除 ${detail.path}，且不可恢复。项目里的同名技能不受影响。`,
+      )
+    ) {
+      return
+    }
+    setRemoving(true)
+    setError('')
+    try {
+      await api(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' })
+      onRemoved?.()
+    } catch (err) {
+      setError(err.message || String(err))
+    } finally {
+      setRemoving(false)
+    }
+  }
+
   if (loading) return <div className="skill-detail-empty">加载中…</div>
   if (error) return <div className="skill-error"><span>{error}</span></div>
   if (!detail) return null
@@ -81,6 +102,16 @@ export function SkillDetail({ name }) {
           >
             原文
           </button>
+          {detail.installed?.managed ? (
+            <button
+              type="button"
+              className="skill-danger"
+              onClick={remove}
+              disabled={removing}
+            >
+              {removing ? '卸载中…' : '卸载'}
+            </button>
+          ) : null}
         </div>
       </div>
 
@@ -95,6 +126,16 @@ export function SkillDetail({ name }) {
         </dd>
         <dt>路径</dt>
         <dd className="skill-path">{detail.path}</dd>
+        {detail.installed?.managed ? (
+          <>
+            <dt>版本</dt>
+            <dd>v{detail.installed.version || '未知'}</dd>
+            <dt>市场</dt>
+            <dd>{detail.installed.marketplace || '未知'}</dd>
+            <dt>校验和</dt>
+            <dd className="skill-path">{detail.installed.checksum || '未提供'}</dd>
+          </>
+        ) : null}
       </dl>
 
       {detail.files?.length ? (

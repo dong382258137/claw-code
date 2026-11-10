@@ -20,6 +20,7 @@ pub mod render;
 pub mod serve;
 pub mod session_mgr;
 pub mod settings;
+pub mod skill_market;
 pub mod streaming;
 pub mod suggestion;
 pub mod tool_display;

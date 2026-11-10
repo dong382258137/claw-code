@@ -3727,7 +3727,12 @@ fn derive_skill_install_name(
     ))
 }
 
-fn sanitize_skill_invocation_name(candidate: &str) -> Option<String> {
+/// 把候选名字归一成可安装/可调用的技能名（小写 `[a-z0-9._-]`）。
+///
+/// 市场安装用它保证「索引名」与「安装目录名」一致；公开给技能市场复用，
+/// 避免两套归一规则漂移。
+#[must_use]
+pub fn sanitize_skill_invocation_name(candidate: &str) -> Option<String> {
     let trimmed = candidate
         .trim()
         .trim_start_matches('/')
@@ -3757,7 +3762,11 @@ fn sanitize_skill_invocation_name(candidate: &str) -> Option<String> {
     (!sanitized.is_empty()).then_some(sanitized)
 }
 
-fn copy_directory_contents(source: &Path, destination: &Path) -> std::io::Result<()> {
+/// 递归复制目录内容（不复制目录本身），失败向上传播由调用方回滚。
+///
+/// 公开给技能市场复用：市场安装只是把源目录复制到 staging，再 rename 到
+/// 安装根，复制语义与 `/skills install` 必须完全一致。
+pub fn copy_directory_contents(source: &Path, destination: &Path) -> std::io::Result<()> {
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let entry_type = entry.file_type()?;
