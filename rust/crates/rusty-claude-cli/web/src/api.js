@@ -15,7 +15,20 @@ export async function api(path, options = {}) {
   const response = await fetch(withToken(path), options)
   if (!response.ok) {
     const text = await response.text().catch(() => '')
-    throw new Error(`HTTP ${response.status}${text ? ' · ' + text.slice(0, 200) : ''}`)
+    // 后端错误体是 { code, message }；保留 code 供页面区分 untrusted_source、
+    // not_installable 等场景，message 仍保留 HTTP 前缀以兼容既有调用方。
+    let body = null
+    try {
+      body = text ? JSON.parse(text) : null
+    } catch (_) {}
+    const detail = body && typeof body.message === 'string' ? body.message : text
+    const error = new Error(
+      `HTTP ${response.status}${detail ? ' · ' + String(detail).slice(0, 200) : ''}`,
+    )
+    error.status = response.status
+    error.code = body && body.code ? body.code : ''
+    error.detail = detail || ''
+    throw error
   }
   const type = response.headers.get('content-type') || ''
   return type.includes('application/json') ? response.json() : response.text()

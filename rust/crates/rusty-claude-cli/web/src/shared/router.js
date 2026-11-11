@@ -7,9 +7,10 @@ const ROUTE_EVENT = 'claw-route-change'
 
 export function parseRoute(hash = '') {
   const value = String(hash || '').replace(/^#\/?/, '').split('?')[0]
-  // 技能详情用 #/skills/<name>，来源管理用 #/skills/sources；
-  // 一级路由仍返回 skills，App.jsx / Sidebar 无需感知子路径。
+  // 技能/插件详情与来源管理都走子路径；一级路由仍返回 skills / plugins，
+  // App.jsx / Sidebar 无需感知子路径。
   if (value === 'skills' || value.startsWith('skills/')) return 'skills'
+  if (value === 'plugins' || value.startsWith('plugins/')) return 'plugins'
   return ROUTES.includes(value) ? value : 'chat'
 }
 
@@ -18,6 +19,17 @@ export function parseSkillSub(hash = '') {
   const value = String(hash || '').replace(/^#\/?/, '').split('?')[0]
   if (!value.startsWith('skills/')) return { view: 'list' }
   const rest = value.slice('skills/'.length)
+  if (!rest) return { view: 'list' }
+  if (rest === 'installed') return { view: 'installed' }
+  if (rest === 'sources') return { view: 'sources' }
+  return { view: 'detail', name: decodeURIComponent(rest) }
+}
+
+// 解析插件市场子路径：{ view: 'list' | 'installed' | 'sources' | 'detail', name? }
+export function parsePluginSub(hash = '') {
+  const value = String(hash || '').replace(/^#\/?/, '').split('?')[0]
+  if (!value.startsWith('plugins/')) return { view: 'list' }
+  const rest = value.slice('plugins/'.length)
   if (!rest) return { view: 'list' }
   if (rest === 'installed') return { view: 'installed' }
   if (rest === 'sources') return { view: 'sources' }
