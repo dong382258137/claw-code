@@ -124,7 +124,7 @@ if ($MISSING.Count -gt 0) {
 # Step 3: build claw binaries
 # =========================================================
 Step "Building claw ($BUILD_PROFILE)"
-$CARGO_FLAGS = @('build', '-p', 'rusty-claude-cli', '--bin', 'claw')
+$CARGO_FLAGS = @('build', '-p', 'rusty-claude-cli')
 if ($BUILD_PROFILE -eq 'release') { $CARGO_FLAGS += '--release' }
 Info "Running: cargo $($CARGO_FLAGS -join ' ')"
 Info "First build may take a few minutes. Please wait..."
@@ -149,7 +149,9 @@ if (-not (Test-Path $DEPLOY_DIR)) {
     New-Item -ItemType Directory -Path $DEPLOY_DIR -Force | Out-Null
 }
 $BIN_SRC = Join-Path $RUST_DIR "target\$BUILD_PROFILE"
-$BINARIES = @('claw.exe')
+# claw.exe / claw-plus.exe 是 cargo 产物；claw-web.exe 是 claw.exe 的入口副本，
+# 桌面快捷方式「CLAW Web UI」直接启动它，必须同步更新，否则快捷方式仍是旧版。
+$BINARIES = @('claw.exe', 'claw-plus.exe')
 foreach ($bin in $BINARIES) {
     $src = Join-Path $BIN_SRC $bin
     if (-not (Test-Path $src)) {
@@ -158,6 +160,10 @@ foreach ($bin in $BINARIES) {
     }
     Copy-Item -Path $src -Destination (Join-Path $DEPLOY_DIR $bin) -Force
     Ok "Deployed $bin -> $DEPLOY_DIR"
+    if ($bin -eq 'claw.exe') {
+        Copy-Item -Path $src -Destination (Join-Path $DEPLOY_DIR 'claw-web.exe') -Force
+        Ok "Deployed claw-web.exe -> $DEPLOY_DIR"
+    }
 }
 Write-Host ""
 Info "If 'claw' is not on this terminal yet, open a new PowerShell window ($DEPLOY_DIR is on PATH)."
