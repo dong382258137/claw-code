@@ -1046,6 +1046,7 @@ pub(crate) fn render_config_report(
             ConfigSource::User => "user",
             ConfigSource::Project => "project",
             ConfigSource::Local => "local",
+            ConfigSource::Plugin => "plugin",
         };
         let status = if runtime_config
             .loaded_entries()
@@ -1123,6 +1124,7 @@ pub(crate) fn render_config_json(
                 ConfigSource::User => "user",
                 ConfigSource::Project => "project",
                 ConfigSource::Local => "local",
+                ConfigSource::Plugin => "plugin",
             };
             let is_loaded = runtime_config
                 .loaded_entries()

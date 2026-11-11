@@ -4989,7 +4989,7 @@ fn build_runtime_plugin_state_discovers_mcp_tools_and_surfaces_pending_servers()
 }
 
 #[test]
-fn build_runtime_plugin_state_surfaces_unsupported_mcp_servers_structurally() {
+fn build_runtime_plugin_state_attempts_remote_http_mcp_servers() {
     let config_home = temp_dir();
     let workspace = temp_dir();
     fs::create_dir_all(&config_home).expect("config home");
@@ -5029,11 +5029,13 @@ fn build_runtime_plugin_state_surfaces_unsupported_mcp_servers_structurally() {
     );
     assert_eq!(
         search_json["mcp_degraded"]["failed_servers"][0]["phase"],
-        "server_registration"
+        "tool_discovery"
     );
-    assert_eq!(
-        search_json["mcp_degraded"]["failed_servers"][0]["error"]["context"]["transport"],
-        "http"
+    assert!(
+        search_json["mcp_degraded"]["failed_servers"][0]["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("MCP remote request failed")),
+        "unexpected degraded error: {search_json}"
     );
 
     let _ = fs::remove_dir_all(config_home);

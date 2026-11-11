@@ -1474,7 +1474,18 @@ impl LiveCli {
     ) -> Result<bool, Box<dyn std::error::Error>> {
         Ok(match command {
             SlashCommand::Help => {
-                let help = render_repl_help();
+                let mut help = render_repl_help();
+                let plugin_commands = commands::discover_plugin_commands(&self.workspace);
+                if !plugin_commands.is_empty() {
+                    help.push_str("\n\nPlugin commands (from enabled plugins)\n");
+                    for plugin_command in &plugin_commands {
+                        help.push_str(&format!(
+                            "  /{}  {}\n",
+                            plugin_command.name,
+                            plugin_command.description.as_deref().unwrap_or("")
+                        ));
+                    }
+                }
                 if !self.tui_println(&help) {
                     println!("{help}");
                 }
@@ -1949,7 +1960,31 @@ impl LiveCli {
                 }
                 false
             }
-            SlashCommand::Unknown(name) => {
+            SlashCommand::Unknown { name, arguments } => {
+                // 插件命令：命中就渲染成普通回合执行；未命中仍是未知命令。
+                if let Some(plugin_command) = commands::find_plugin_command(&self.workspace, &name)
+                {
+                    let prompt = commands::render_plugin_command(
+                        &plugin_command,
+                        arguments.as_deref(),
+                        &self.workspace,
+                    );
+                    let previous_model = self.model.clone();
+                    let previous_tools = self.allowed_tools.clone();
+                    if let Some(model) = &plugin_command.model {
+                        self.model = resolve_model_alias(model).to_string();
+                    }
+                    if !plugin_command.allowed_tools.is_empty() {
+                        self.allowed_tools = Some(AllowedToolSet::from_iter(
+                            plugin_command.allowed_tools.iter().cloned(),
+                        ));
+                    }
+                    let result = self.run_turn(&prompt);
+                    self.model = previous_model;
+                    self.allowed_tools = previous_tools;
+                    result?;
+                    return Ok(false);
+                }
                 let msg = format_unknown_slash_command(&name);
                 if !self.tui_println(&msg) {
                     eprintln!("{msg}");

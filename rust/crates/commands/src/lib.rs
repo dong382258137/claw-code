@@ -4,13 +4,18 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// 插件 `commands/*.md`：发现、解析与渲染（与 skills/agents/MCP 共用启用判定）。
+pub mod plugin_commands;
 /// 技能市场：来源、原子安装/卸载与安装注册表。
 ///
 /// 放在 `commands` 而不是 CLI crate，是为了让 `/skills install` 与 WebUI
 /// 市场安装共用**同一条**原子安装流水线，避免两套安装语义并存。
 pub mod skill_market;
+pub use plugin_commands::{
+    discover_plugin_commands, find_plugin_command, render_plugin_command, PluginCommand,
+};
 
-use plugins::{PluginError, PluginLoadFailure, PluginManager, PluginSummary};
+use plugins::{PluginError, PluginLoadFailure, PluginManager, PluginManagerConfig, PluginSummary};
 use runtime::{
     compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
     ScopedMcpServerConfig, Session,
@@ -1299,7 +1304,11 @@ pub enum SlashCommand {
     Im {
         args: Option<String>,
     },
-    Unknown(String),
+    Unknown {
+        name: String,
+        /// 原始参数串，供插件命令模板的 `$ARGUMENTS` 使用。
+        arguments: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1667,7 +1676,10 @@ pub fn validate_slash_command_input(
         "history" => SlashCommand::History {
             count: optional_single_arg(command, &args, "[count]")?,
         },
-        other => SlashCommand::Unknown(other.to_string()),
+        other => SlashCommand::Unknown {
+            name: other.to_string(),
+            arguments: remainder,
+        },
     }))
 }
 fn validate_no_args(command: &str, args: &[&str]) -> Result<(), SlashCommandParseError> {
@@ -2326,6 +2338,8 @@ pub enum DefinitionSource {
     UserClaw,
     UserCodex,
     UserClaude,
+    /// 已启用插件贡献的组件目录（skills/agents 等）。
+    Plugin,
     /// Skills shipped with the claw binary itself (e.g. `rust/skills/` in the
     /// source tree, or `<exe-dir>/skills/` after install).
     BuiltinShipped,
@@ -2336,6 +2350,7 @@ pub enum DefinitionScope {
     Project,
     UserConfigHome,
     UserHome,
+    Plugin,
     Builtin,
 }
 
@@ -2345,6 +2360,7 @@ impl DefinitionScope {
             Self::Project => "Project roots",
             Self::UserConfigHome => "User config roots",
             Self::UserHome => "User home roots",
+            Self::Plugin => "Plugin roots",
             Self::Builtin => "Builtin roots",
         }
     }
@@ -2358,6 +2374,7 @@ impl DefinitionSource {
             }
             Self::UserClawConfigHome | Self::UserCodexHome => DefinitionScope::UserConfigHome,
             Self::UserClaw | Self::UserCodex | Self::UserClaude => DefinitionScope::UserHome,
+            Self::Plugin => DefinitionScope::Plugin,
             Self::BuiltinShipped => DefinitionScope::Builtin,
         }
     }
@@ -2366,13 +2383,14 @@ impl DefinitionSource {
         self.report_scope().label()
     }
 
-    /// Web API 用的稳定标识；`project` / `user_config` / `user` / `builtin`。
+    /// Web API 用的稳定标识；`project` / `user_config` / `user` / `plugin` / `builtin`。
     #[must_use]
     pub fn scope_key(self) -> &'static str {
         match self.report_scope() {
             DefinitionScope::Project => "project",
             DefinitionScope::UserConfigHome => "user_config",
             DefinitionScope::UserHome => "user",
+            DefinitionScope::Plugin => "plugin",
             DefinitionScope::Builtin => "builtin",
         }
     }
@@ -3361,7 +3379,99 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
         );
     }
 
+    if leaf == "agents" {
+        for path in enabled_plugin_component_roots(cwd).agents {
+            push_unique_root(&mut roots, DefinitionSource::Plugin, path);
+        }
+    }
+
     roots
+}
+
+/// 已启用插件贡献的组件目录；技能/子代理发现根与命令表共用同一份解析。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginComponentRoots {
+    pub skills: Vec<PathBuf>,
+    pub agents: Vec<PathBuf>,
+    pub commands: Vec<PathBuf>,
+}
+
+/// 按当前启用状态解析插件组件目录。
+///
+/// 这是「启用但没注入」「禁用后还挂着」的唯一判定点：只有
+/// `plugin_registry()` 认为启用的插件才会贡献目录。
+#[must_use]
+pub fn enabled_plugin_component_roots(cwd: &Path) -> PluginComponentRoots {
+    let loader = ConfigLoader::default_for(cwd);
+    let Ok(runtime_config) = loader.load() else {
+        return PluginComponentRoots::default();
+    };
+    let manager = plugin_manager_for(cwd, loader.config_home(), &runtime_config);
+    let Ok(registry) = manager.plugin_registry() else {
+        return PluginComponentRoots::default();
+    };
+
+    let mut roots = PluginComponentRoots::default();
+    for plugin in registry
+        .plugins()
+        .iter()
+        .filter(|plugin| plugin.is_enabled())
+    {
+        let components = plugin.components();
+        roots.skills.extend(components.skill_paths.iter().cloned());
+        roots.agents.extend(components.agent_paths.iter().cloned());
+        roots
+            .commands
+            .extend(components.command_paths.iter().cloned());
+    }
+    dedupe_paths(&mut roots.skills);
+    dedupe_paths(&mut roots.agents);
+    dedupe_paths(&mut roots.commands);
+    roots
+}
+
+fn dedupe_paths(paths: &mut Vec<PathBuf>) {
+    let mut seen = BTreeSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
+}
+
+/// 按配置构造插件管理器；CLI、WebUI 与技能/子代理发现共用同一套解析。
+#[must_use]
+pub fn plugin_manager_for(
+    cwd: &Path,
+    config_home: &Path,
+    runtime_config: &runtime::RuntimeConfig,
+) -> PluginManager {
+    let plugin_settings = runtime_config.plugins();
+    let mut plugin_config = PluginManagerConfig::new(config_home.to_path_buf());
+    plugin_config.enabled_plugins = plugin_settings.enabled_plugins().clone();
+    plugin_config.external_dirs = plugin_settings
+        .external_directories()
+        .iter()
+        .map(|path| resolve_plugin_path(cwd, config_home, path))
+        .collect();
+    plugin_config.install_root = plugin_settings
+        .install_root()
+        .map(|path| resolve_plugin_path(cwd, config_home, path));
+    plugin_config.registry_path = plugin_settings
+        .registry_path()
+        .map(|path| resolve_plugin_path(cwd, config_home, path));
+    plugin_config.bundled_root = plugin_settings
+        .bundled_root()
+        .map(|path| resolve_plugin_path(cwd, config_home, path));
+    PluginManager::new(plugin_config)
+}
+
+#[must_use]
+pub fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else if value.starts_with('.') {
+        cwd.join(path)
+    } else {
+        config_home.join(path)
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3592,6 +3702,16 @@ pub fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
             PathBuf::from(userprofile)
                 .join(".claw")
                 .join("builtin-skills"),
+            SkillOrigin::SkillsDir,
+        );
+    }
+
+    // 启用插件贡献的技能根：与 WebUI/CLI 的启用状态同源。
+    for path in enabled_plugin_component_roots(cwd).skills {
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::Plugin,
+            path,
             SkillOrigin::SkillsDir,
         );
     }
@@ -4267,6 +4387,7 @@ fn render_agents_report(agents: &[AgentSummary]) -> String {
         DefinitionScope::Project,
         DefinitionScope::UserConfigHome,
         DefinitionScope::UserHome,
+        DefinitionScope::Plugin,
         DefinitionScope::Builtin,
     ] {
         let group = agents
@@ -4351,6 +4472,7 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
         DefinitionScope::Project,
         DefinitionScope::UserConfigHome,
         DefinitionScope::UserHome,
+        DefinitionScope::Plugin,
         DefinitionScope::Builtin,
     ] {
         let group = skills
@@ -4697,6 +4819,7 @@ fn config_source_label(source: ConfigSource) -> &'static str {
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
+        ConfigSource::Plugin => "plugin",
     }
 }
 
@@ -4779,6 +4902,7 @@ fn definition_source_id(source: DefinitionSource) -> &'static str {
         DefinitionSource::UserClaw | DefinitionSource::UserCodex | DefinitionSource::UserClaude => {
             "user_claw"
         }
+        DefinitionSource::Plugin => "plugin",
         DefinitionSource::BuiltinShipped => "builtin_shipped",
     }
 }
@@ -4832,6 +4956,7 @@ fn config_source_id(source: ConfigSource) -> &'static str {
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
+        ConfigSource::Plugin => "plugin",
     }
 }
 
@@ -5016,7 +5141,7 @@ pub fn handle_slash_command(
         | SlashCommand::Im { .. }
         | SlashCommand::Search { .. }
         | SlashCommand::Undo
-        | SlashCommand::Unknown(_) => None,
+        | SlashCommand::Unknown { .. } => None,
     }
 }
 

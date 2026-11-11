@@ -602,13 +602,13 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
 ) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
     let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
     let plugin_registry = plugin_manager.plugin_registry()?;
-    let plugin_hook_config =
-        runtime_hook_config_from_plugin_hooks(plugin_registry.aggregated_hooks()?);
+    let plugin_hook_config = runtime_hook_config_from_plugin_registry(&plugin_registry)?;
     let feature_config = runtime_config
         .feature_config()
         .clone()
         .with_hooks(runtime_config.hooks().merged(&plugin_hook_config));
-    let (mcp_state, mut runtime_tools) = build_runtime_mcp_state(runtime_config)?;
+    let merged_runtime_config = runtime_config_with_plugin_mcp(runtime_config, &plugin_registry)?;
+    let (mcp_state, mut runtime_tools) = build_runtime_mcp_state(&merged_runtime_config)?;
     // Register the session_search tool. Its execution is intercepted by
     // ConversationRuntime::run_turn (routed to HistoryIndex), not handled by
     // CliToolExecutor — but the spec must be in the registry so the model
@@ -1270,35 +1270,11 @@ pub(crate) fn build_plugin_manager(
     loader: &ConfigLoader,
     runtime_config: &runtime::RuntimeConfig,
 ) -> PluginManager {
-    let plugin_settings = runtime_config.plugins();
-    let mut plugin_config = PluginManagerConfig::new(loader.config_home().to_path_buf());
-    plugin_config.enabled_plugins = plugin_settings.enabled_plugins().clone();
-    plugin_config.external_dirs = plugin_settings
-        .external_directories()
-        .iter()
-        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path))
-        .collect();
-    plugin_config.install_root = plugin_settings
-        .install_root()
-        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
-    plugin_config.registry_path = plugin_settings
-        .registry_path()
-        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
-    plugin_config.bundled_root = plugin_settings
-        .bundled_root()
-        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
-    PluginManager::new(plugin_config)
+    commands::plugin_manager_for(cwd, loader.config_home(), runtime_config)
 }
 
 pub(crate) fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        path
-    } else if value.starts_with('.') {
-        cwd.join(path)
-    } else {
-        config_home.join(path)
-    }
+    commands::resolve_plugin_path(cwd, config_home, value)
 }
 
 pub(crate) fn runtime_hook_config_from_plugin_hooks(
@@ -1309,4 +1285,293 @@ pub(crate) fn runtime_hook_config_from_plugin_hooks(
         hooks.post_tool_use,
         hooks.post_tool_use_failure,
     )
+}
+
+/// 把插件声明（原生字符串 hooks + Claude `hooks.json`/内联 hooks）合并成运行时 hook 配置。
+pub(crate) fn runtime_hook_config_from_plugin_registry(
+    registry: &PluginRegistry,
+) -> Result<runtime::RuntimeHookConfig, plugins::PluginError> {
+    let mut config = runtime_hook_config_from_plugin_hooks(registry.aggregated_hooks()?);
+    for plugin in registry
+        .plugins()
+        .iter()
+        .filter(|plugin| plugin.is_enabled())
+    {
+        for spec in &plugin.components().hooks {
+            let definition = claude_hook_definition(spec);
+            match spec.event.as_str() {
+                "PreToolUse" => config.push_pre_tool_use(definition),
+                "PostToolUse" => config.push_post_tool_use(definition),
+                "PostToolUseFailure" => config.push_post_tool_use_failure(definition),
+                event => config.push_lifecycle(event, definition),
+            }
+        }
+    }
+    Ok(config)
+}
+
+fn claude_hook_definition(spec: &plugins::ClaudeHookSpec) -> runtime::HookDefinition {
+    let mut definition = runtime::HookDefinition::command(spec.command.clone());
+    if let Some(matcher) = spec.matcher.as_ref().filter(|matcher| !matcher.is_empty()) {
+        definition = definition.with_matchers(vec![matcher.clone()]);
+    }
+    if let Some(timeout_ms) = spec.timeout_ms {
+        definition = definition.with_timeout_ms(timeout_ms);
+    }
+    definition
+}
+
+/// 把启用插件贡献的 MCP 服务器合并进运行时配置；与 `.mcp.json`/settings 走同一
+/// `McpServerManager` 路径，只是配置来源不同。
+fn runtime_config_with_plugin_mcp(
+    runtime_config: &runtime::RuntimeConfig,
+    registry: &PluginRegistry,
+) -> Result<runtime::RuntimeConfig, Box<dyn std::error::Error>> {
+    let mut merged = runtime_config.clone();
+    let mut servers = Vec::new();
+    for plugin in registry
+        .plugins()
+        .iter()
+        .filter(|plugin| plugin.is_enabled())
+    {
+        for spec in &plugin.components().mcp_servers {
+            let name = plugin_mcp_server_name(&plugin.metadata().id, &spec.name);
+            if let Some(config) = plugin_mcp_server_config(spec) {
+                servers.push((
+                    name,
+                    runtime::ScopedMcpServerConfig {
+                        required: false,
+                        scope: runtime::ConfigSource::Plugin,
+                        config,
+                    },
+                ));
+            }
+        }
+    }
+    merged.extend_mcp_servers(servers);
+    Ok(merged)
+}
+
+fn plugin_mcp_server_name(plugin_id: &str, server_name: &str) -> String {
+    let sanitize = |value: &str| {
+        value
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    };
+    format!("plugin_{}_{}", sanitize(plugin_id), sanitize(server_name))
+}
+
+fn plugin_mcp_server_config(
+    spec: &plugins::PluginMcpServerSpec,
+) -> Option<runtime::McpServerConfig> {
+    match spec.transport.as_str() {
+        "stdio" => Some(runtime::McpServerConfig::Stdio(
+            runtime::McpStdioServerConfig {
+                command: spec.command.clone()?,
+                args: spec.args.clone(),
+                env: spec.env.clone(),
+                tool_call_timeout_ms: spec.timeout_ms,
+            },
+        )),
+        "http" => Some(runtime::McpServerConfig::Http(
+            runtime::McpRemoteServerConfig {
+                url: spec.url.clone()?,
+                headers: spec.headers.clone(),
+                headers_helper: None,
+                oauth: None,
+                tool_call_timeout_ms: spec.timeout_ms,
+                proxy: spec.proxy.clone(),
+            },
+        )),
+        "sse" => Some(runtime::McpServerConfig::Sse(
+            runtime::McpRemoteServerConfig {
+                url: spec.url.clone()?,
+                headers: spec.headers.clone(),
+                headers_helper: None,
+                oauth: None,
+                tool_call_timeout_ms: spec.timeout_ms,
+                proxy: spec.proxy.clone(),
+            },
+        )),
+        "ws" | "websocket" => Some(runtime::McpServerConfig::Ws(
+            runtime::McpWebSocketServerConfig {
+                url: spec.url.clone()?,
+                headers: spec.headers.clone(),
+                headers_helper: None,
+                tool_call_timeout_ms: spec.timeout_ms,
+                proxy: spec.proxy.clone(),
+            },
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use plugins::{PluginManager, PluginManagerConfig};
+
+    use super::runtime_config_with_plugin_mcp;
+
+    struct TestHome {
+        root: PathBuf,
+    }
+
+    impl TestHome {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "claw-plugin-mcp-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("create temp root");
+            Self { root }
+        }
+
+        fn path(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn write_plugin(plugin_dir: &Path) {
+        fs::create_dir_all(plugin_dir.join(".claude-plugin")).expect("plugin dir");
+        fs::write(
+            plugin_dir.join(".claude-plugin/plugin.json"),
+            serde_json::json!({
+                "name": "demo",
+                "version": "1.0.0",
+                "description": "demo plugin",
+                "mcpServers": {
+                    "remote": {
+                        "type": "http",
+                        "url": "https://example.test/mcp",
+                        "headers": { "Authorization": "Bearer demo" },
+                        "timeout": 30,
+                    },
+                    "local": { "command": "node", "args": ["server.js"] },
+                },
+            })
+            .to_string(),
+        )
+        .expect("write plugin.json");
+    }
+
+    fn write_registry(home: &Path, plugin_dir: &Path) {
+        let plugins_dir = home.join("plugins");
+        fs::create_dir_all(&plugins_dir).expect("plugins dir");
+        let registry = serde_json::json!({
+            "plugins": {
+                "demo": {
+                    "kind": "external",
+                    "id": "demo",
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "description": "demo plugin",
+                    "install_path": plugin_dir,
+                    "source": { "type": "local_path", "path": plugin_dir },
+                    "installed_at_unix_ms": 1_u64,
+                    "updated_at_unix_ms": 1_u64,
+                },
+            },
+        });
+        fs::write(plugins_dir.join("installed.json"), registry.to_string())
+            .expect("write registry");
+    }
+
+    fn manager_for(home: &Path, enabled: bool) -> PluginManager {
+        let mut config = PluginManagerConfig::new(home);
+        config.bundled_root = Some(home.join("bundled"));
+        config.enabled_plugins = BTreeMap::from([("demo@external".to_string(), enabled)]);
+        PluginManager::new(config)
+    }
+
+    #[test]
+    fn plugin_mcp_servers_follow_enabled_state() {
+        let home = TestHome::new("enabled");
+        let plugin_dir = home.path().join("plugins").join("installed").join("demo");
+        write_plugin(&plugin_dir);
+        write_registry(home.path(), &plugin_dir);
+
+        let enabled_registry = manager_for(home.path(), true)
+            .plugin_registry()
+            .expect("enabled registry");
+        let discovered = enabled_registry
+            .plugins()
+            .iter()
+            .map(|plugin| {
+                (
+                    plugin.metadata().id.clone(),
+                    plugin
+                        .components()
+                        .mcp_servers
+                        .iter()
+                        .map(|server| format!("{}:{}", server.name, server.transport))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            discovered.iter().any(|(id, _)| id.starts_with("demo")),
+            "demo 插件未被发现: {discovered:?}"
+        );
+        let merged =
+            runtime_config_with_plugin_mcp(&runtime::RuntimeConfig::empty(), &enabled_registry)
+                .expect("merge plugin mcp");
+        let servers = merged.mcp().servers();
+        let remote = servers
+            .get("plugin_demo_external_remote")
+            .unwrap_or_else(|| panic!("remote server injected; discovered={discovered:?}"));
+        match &remote.config {
+            runtime::McpServerConfig::Http(config) => {
+                assert_eq!(config.url, "https://example.test/mcp");
+                assert_eq!(
+                    config.headers.get("Authorization").map(String::as_str),
+                    Some("Bearer demo")
+                );
+                assert_eq!(config.tool_call_timeout_ms, Some(30_000));
+            }
+            other => panic!("expected http server, got {other:?}"),
+        }
+        assert_eq!(remote.scope, runtime::ConfigSource::Plugin);
+        match &servers
+            .get("plugin_demo_external_local")
+            .expect("stdio server injected")
+            .config
+        {
+            runtime::McpServerConfig::Stdio(config) => {
+                assert_eq!(config.command, "node");
+                assert_eq!(config.args, vec!["server.js"]);
+            }
+            other => panic!("expected stdio server, got {other:?}"),
+        }
+
+        let disabled_registry = manager_for(home.path(), false)
+            .plugin_registry()
+            .expect("disabled registry");
+        let merged =
+            runtime_config_with_plugin_mcp(&runtime::RuntimeConfig::empty(), &disabled_registry)
+                .expect("merge disabled plugin mcp");
+        assert!(
+            merged.mcp().servers().is_empty(),
+            "禁用后不应残留插件 MCP 服务器: {:?}",
+            merged.mcp().servers().keys().collect::<Vec<_>>()
+        );
+    }
 }

@@ -54,6 +54,7 @@ pub mod lsp_client;
 mod mcp;
 mod mcp_client;
 pub mod mcp_lifecycle_hardened;
+mod mcp_remote;
 pub mod mcp_server;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
@@ -197,12 +198,12 @@ pub use compact::{
 pub use config::{
     bootstrapped_sentinel_path, default_config_home, is_bootstrapped, load_wizard_settings,
     mark_bootstrapped, save_wizard_settings, ConfigEntry, ConfigError, ConfigLoader, ConfigSource,
-    LspConfigCollection, LspServerConfig, McpConfigCollection, McpManagedProxyServerConfig,
-    McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig,
-    McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
-    ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
-    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
-    WizardSettings, CLAW_SETTINGS_SCHEMA_NAME,
+    FailurePolicy, HookDefinition, HookHandlerType, LspConfigCollection, LspServerConfig,
+    McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig,
+    McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
+    McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode,
+    RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
+    RuntimePluginConfig, ScopedMcpServerConfig, WizardSettings, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,

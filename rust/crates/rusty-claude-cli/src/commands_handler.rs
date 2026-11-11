@@ -20,8 +20,8 @@ pub(crate) fn take_max_turns() -> Option<u32> {
 use crate::render::OutputVerbosity;
 use api::model_family_identity_for;
 use commands::{
-    classify_skills_slash_command, resolve_skill_invocation, slash_command_specs,
-    SkillSlashDispatch, SlashCommand,
+    classify_skills_slash_command, find_plugin_command, render_plugin_command,
+    resolve_skill_invocation, slash_command_specs, SkillSlashDispatch, SlashCommand,
 };
 use runtime::{load_system_prompt, PermissionMode};
 use serde_json::json;
@@ -1160,7 +1160,38 @@ pub(crate) fn parse_direct_slash_cli_action(
                 }),
             }
         }
-        Ok(Some(SlashCommand::Unknown(name))) => Err(format_unknown_direct_slash_command(&name)),
+        Ok(Some(SlashCommand::Unknown { name, arguments })) => {
+            // 插件命令：解析成功就渲染成一次普通提示词回合，走与 `-p` 相同的
+            // 执行路径；未命中才报未知命令。
+            let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let Some(plugin_command) = find_plugin_command(&cwd, &name) else {
+                return Err(format_unknown_direct_slash_command(&name));
+            };
+            let prompt = render_plugin_command(&plugin_command, arguments.as_deref(), &cwd);
+            let plugin_allowed_tools = if plugin_command.allowed_tools.is_empty() {
+                allowed_tools
+            } else {
+                Some(AllowedToolSet::from_iter(
+                    plugin_command.allowed_tools.iter().cloned(),
+                ))
+            };
+            Ok(CliAction::Prompt {
+                prompt,
+                model: resolve_model_alias_with_config(
+                    plugin_command.model.as_deref().unwrap_or(&model),
+                ),
+                output_format,
+                allowed_tools: plugin_allowed_tools,
+                permission_mode,
+                compact,
+                base_commit,
+                reasoning_effort: reasoning_effort.clone(),
+                thinking_mode,
+                allow_broad_cwd,
+                additional_workspace_roots: additional_workspace_roots.clone(),
+                output_verbosity,
+            })
+        }
         Ok(Some(command)) => Err({
             let _ = command;
             format!(

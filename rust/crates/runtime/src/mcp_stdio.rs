@@ -19,10 +19,26 @@ use crate::mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase,
 };
 
-#[cfg(test)]
-const MCP_INITIALIZE_TIMEOUT_MS: u64 = 200;
-#[cfg(not(test))]
-const MCP_INITIALIZE_TIMEOUT_MS: u64 = 10_000;
+/// 初始化握手超时。
+///
+/// 单测默认压到 200ms 以保持快速；真实公网 MCP 测试可用
+/// `CLAW_MCP_TEST_INITIALIZE_TIMEOUT_MS` 覆盖。
+fn mcp_initialize_timeout_ms() -> u64 {
+    #[cfg(test)]
+    {
+        if let Some(ms) = std::env::var("CLAW_MCP_TEST_INITIALIZE_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            return ms;
+        }
+        200
+    }
+    #[cfg(not(test))]
+    {
+        10_000
+    }
+}
 
 /// Maximum accepted `Content-Length` for a single inbound JSON-RPC frame
 /// read by [`McpStdioProcess::read_frame`]. Bounds the allocation so a
@@ -502,7 +518,7 @@ struct ToolRoute {
 #[derive(Debug)]
 struct ManagedMcpServer {
     bootstrap: McpClientBootstrap,
-    process: Option<McpStdioProcess>,
+    process: Option<McpClientProcess>,
     initialized: bool,
     required: bool,
 }
@@ -538,7 +554,10 @@ impl McpServerManager {
         let mut unsupported_servers = Vec::new();
 
         for (server_name, server_config) in servers {
-            if server_config.transport() == McpTransport::Stdio {
+            if !matches!(
+                server_config.transport(),
+                McpTransport::Sdk | McpTransport::ManagedProxy
+            ) {
                 let bootstrap = McpClientBootstrap::from_scoped_config(server_name, server_config);
                 managed_servers.insert(
                     server_name.clone(),
@@ -818,10 +837,15 @@ impl McpServerManager {
                 })?;
         match &server.bootstrap.transport {
             McpClientTransport::Stdio(transport) => Ok(transport.resolved_tool_call_timeout_ms()),
+            McpClientTransport::Http(transport)
+            | McpClientTransport::Sse(transport)
+            | McpClientTransport::WebSocket(transport) => {
+                Ok(transport.tool_call_timeout_ms.unwrap_or(60_000))
+            }
             other => Err(McpServerManagerError::InvalidResponse {
                 server_name: server_name.to_string(),
                 method: "tools/call",
-                details: format!("unsupported MCP transport for stdio manager: {other:?}"),
+                details: format!("unsupported MCP transport for runtime client: {other:?}"),
             }),
         }
     }
@@ -1118,7 +1142,7 @@ impl McpServerManager {
 
             if needs_spawn {
                 let server = self.server_mut(server_name)?;
-                server.process = Some(spawn_mcp_stdio_process(&server.bootstrap)?);
+                server.process = Some(spawn_mcp_client_process(&server.bootstrap)?);
                 server.initialized = false;
             }
 
@@ -1147,7 +1171,7 @@ impl McpServerManager {
                 Self::run_process_request(
                     server_name,
                     "initialize",
-                    MCP_INITIALIZE_TIMEOUT_MS,
+                    mcp_initialize_timeout_ms(),
                     process.initialize(request_id, default_initialize_params()),
                 )
                 .await
@@ -1565,6 +1589,122 @@ pub fn spawn_mcp_stdio_process(bootstrap: &McpClientBootstrap) -> io::Result<Mcp
     }
 }
 
+/// 统一的 MCP 客户端：stdio 与远程传输共用管理器上层接口。
+#[derive(Debug)]
+enum McpClientProcess {
+    Stdio(Box<McpStdioProcess>),
+    Remote(Box<crate::mcp_remote::McpRemoteProcess>),
+}
+
+impl McpClientProcess {
+    fn has_exited(&mut self) -> io::Result<bool> {
+        match self {
+            Self::Stdio(process) => process.has_exited(),
+            Self::Remote(_) => Ok(false),
+        }
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        match self {
+            Self::Stdio(process) => process.shutdown().await,
+            Self::Remote(process) => process.shutdown().await,
+        }
+    }
+
+    async fn initialize(
+        &mut self,
+        id: JsonRpcId,
+        params: McpInitializeParams,
+    ) -> io::Result<JsonRpcResponse<McpInitializeResult>> {
+        match self {
+            Self::Stdio(process) => process.initialize(id, params).await,
+            Self::Remote(process) => {
+                let response = process.initialize(id, params).await?;
+                if response.error.is_none() {
+                    // streamable HTTP / SSE 要求初始化后显式发送 initialized 通知。
+                    let _ = process
+                        .notify("notifications/initialized", None::<serde_json::Value>)
+                        .await;
+                }
+                Ok(response)
+            }
+        }
+    }
+
+    async fn list_tools(
+        &mut self,
+        id: JsonRpcId,
+        params: Option<McpListToolsParams>,
+    ) -> io::Result<JsonRpcResponse<McpListToolsResult>> {
+        match self {
+            Self::Stdio(process) => process.list_tools(id, params).await,
+            Self::Remote(process) => process.request(id, "tools/list", params).await,
+        }
+    }
+
+    async fn call_tool(
+        &mut self,
+        id: JsonRpcId,
+        params: McpToolCallParams,
+    ) -> io::Result<JsonRpcResponse<McpToolCallResult>> {
+        match self {
+            Self::Stdio(process) => process.call_tool(id, params).await,
+            Self::Remote(process) => process.request(id, "tools/call", Some(params)).await,
+        }
+    }
+
+    async fn list_resources(
+        &mut self,
+        id: JsonRpcId,
+        params: Option<McpListResourcesParams>,
+    ) -> io::Result<JsonRpcResponse<McpListResourcesResult>> {
+        match self {
+            Self::Stdio(process) => process.list_resources(id, params).await,
+            Self::Remote(process) => process.request(id, "resources/list", params).await,
+        }
+    }
+
+    async fn read_resource(
+        &mut self,
+        id: JsonRpcId,
+        params: McpReadResourceParams,
+    ) -> io::Result<JsonRpcResponse<McpReadResourceResult>> {
+        match self {
+            Self::Stdio(process) => process.read_resource(id, params).await,
+            Self::Remote(process) => process.request(id, "resources/read", Some(params)).await,
+        }
+    }
+}
+
+fn spawn_mcp_client_process(bootstrap: &McpClientBootstrap) -> io::Result<McpClientProcess> {
+    match &bootstrap.transport {
+        McpClientTransport::Stdio(transport) => McpStdioProcess::spawn(transport)
+            .map(|process| McpClientProcess::Stdio(Box::new(process))),
+        McpClientTransport::Http(transport) => crate::mcp_remote::McpRemoteProcess::new(
+            crate::mcp_remote::RemoteKind::Http,
+            transport.clone(),
+        )
+        .map(|process| McpClientProcess::Remote(Box::new(process))),
+        McpClientTransport::Sse(transport) => crate::mcp_remote::McpRemoteProcess::new(
+            crate::mcp_remote::RemoteKind::Sse,
+            transport.clone(),
+        )
+        .map(|process| McpClientProcess::Remote(Box::new(process))),
+        McpClientTransport::WebSocket(transport) => crate::mcp_remote::McpRemoteProcess::new(
+            crate::mcp_remote::RemoteKind::WebSocket,
+            transport.clone(),
+        )
+        .map(|process| McpClientProcess::Remote(Box::new(process))),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "MCP bootstrap transport for {} is not supported by the runtime client: {other:?}",
+                bootstrap.server_name
+            ),
+        )),
+    }
+}
+
 fn apply_env(command: &mut Command, env: &BTreeMap<String, String>) {
     for (key, value) in env {
         command.env(key, value);
@@ -1597,6 +1737,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
@@ -2971,7 +3112,7 @@ mod tests {
     }
 
     #[test]
-    fn manager_records_unsupported_non_stdio_servers_without_panicking() {
+    fn manager_manages_remote_servers_and_only_records_sdk_as_unsupported() {
         let servers = BTreeMap::from([
             (
                 "http".to_string(),
@@ -2983,13 +3124,15 @@ mod tests {
                         headers: BTreeMap::new(),
                         headers_helper: None,
                         oauth: None,
+                        tool_call_timeout_ms: None,
+                        proxy: None,
                     }),
                 },
             ),
             (
                 "sdk".to_string(),
                 ScopedMcpServerConfig {
-                    required: false,
+                    required: true,
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Sdk(McpSdkServerConfig {
                         name: "sdk-server".to_string(),
@@ -3005,6 +3148,8 @@ mod tests {
                         url: "wss://example.test/mcp".to_string(),
                         headers: BTreeMap::new(),
                         headers_helper: None,
+                        tool_call_timeout_ms: None,
+                        proxy: None,
                     }),
                 },
             ),
@@ -3013,11 +3158,12 @@ mod tests {
         let manager = McpServerManager::from_servers(&servers);
         let unsupported = manager.unsupported_servers();
 
-        assert_eq!(unsupported.len(), 3);
-        assert_eq!(unsupported[0].server_name, "http");
+        assert_eq!(unsupported.len(), 1);
+        assert_eq!(unsupported[0].server_name, "sdk");
         assert!(unsupported[0].required);
-        assert_eq!(unsupported[1].server_name, "sdk");
-        assert_eq!(unsupported[2].server_name, "ws");
+        let mut managed = manager.server_names();
+        managed.sort();
+        assert_eq!(managed, vec!["http".to_string(), "ws".to_string()]);
         let failed = unsupported_server_failed_server(&unsupported[0]);
         assert_eq!(failed.phase, McpLifecyclePhase::ServerRegistration);
         assert_eq!(

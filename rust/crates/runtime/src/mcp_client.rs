@@ -29,6 +29,9 @@ pub struct McpRemoteTransport {
     pub headers: BTreeMap<String, String>,
     pub headers_helper: Option<String>,
     pub auth: McpClientAuth,
+    pub tool_call_timeout_ms: Option<u64>,
+    /// 显式代理；`None` 时由传输层读取 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`。
+    pub proxy: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,18 +88,24 @@ impl McpClientTransport {
                 headers: config.headers.clone(),
                 headers_helper: config.headers_helper.clone(),
                 auth: McpClientAuth::from_oauth(config.oauth.clone()),
+                tool_call_timeout_ms: config.tool_call_timeout_ms,
+                proxy: config.proxy.clone(),
             }),
             McpServerConfig::Http(config) => Self::Http(McpRemoteTransport {
                 url: config.url.clone(),
                 headers: config.headers.clone(),
                 headers_helper: config.headers_helper.clone(),
                 auth: McpClientAuth::from_oauth(config.oauth.clone()),
+                tool_call_timeout_ms: config.tool_call_timeout_ms,
+                proxy: config.proxy.clone(),
             }),
             McpServerConfig::Ws(config) => Self::WebSocket(McpRemoteTransport {
                 url: config.url.clone(),
                 headers: config.headers.clone(),
                 headers_helper: config.headers_helper.clone(),
                 auth: McpClientAuth::None,
+                tool_call_timeout_ms: config.tool_call_timeout_ms,
+                proxy: config.proxy.clone(),
             }),
             McpServerConfig::Sdk(config) => Self::Sdk(McpSdkTransport {
                 name: config.name.clone(),
@@ -191,6 +200,8 @@ mod tests {
                     ),
                     xaa: Some(true),
                 }),
+                tool_call_timeout_ms: None,
+                proxy: None,
             }),
         };
 
@@ -221,6 +232,8 @@ mod tests {
                 url: "wss://vendor.example/mcp".to_string(),
                 headers: BTreeMap::new(),
                 headers_helper: None,
+                tool_call_timeout_ms: None,
+                proxy: None,
             }),
         };
         let sdk = ScopedMcpServerConfig {

@@ -15,6 +15,8 @@ pub enum ConfigSource {
     User,
     Project,
     Local,
+    /// 由已启用插件贡献的配置（目前用于 `mcpServers`）。
+    Plugin,
 }
 
 /// Effective permission mode after decoding config values.
@@ -343,6 +345,10 @@ pub struct McpRemoteServerConfig {
     pub headers: BTreeMap<String, String>,
     pub headers_helper: Option<String>,
     pub oauth: Option<McpOAuthConfig>,
+    /// 单次工具调用超时（毫秒）；`None` 使用默认值。
+    pub tool_call_timeout_ms: Option<u64>,
+    /// 显式代理（`http://user:pass@host:port`）；`None` 时按环境变量。
+    pub proxy: Option<String>,
 }
 
 /// Configuration for an MCP server reached over WebSocket.
@@ -351,6 +357,10 @@ pub struct McpWebSocketServerConfig {
     pub url: String,
     pub headers: BTreeMap<String, String>,
     pub headers_helper: Option<String>,
+    /// 单次工具调用超时（毫秒）；`None` 使用默认值。
+    pub tool_call_timeout_ms: Option<u64>,
+    /// 显式代理（`http://user:pass@host:port`）；`None` 时按环境变量。
+    pub proxy: Option<String>,
 }
 
 /// Configuration for an MCP server addressed through an SDK name.
@@ -652,6 +662,17 @@ impl RuntimeConfig {
     #[must_use]
     pub fn mcp(&self) -> &McpConfigCollection {
         &self.feature_config.mcp
+    }
+
+    /// 合并插件贡献的 MCP 服务器。同名时插件配置覆盖文件配置，
+    /// 因为插件是按启用状态显式注入的，用户刚刚启用它。
+    pub fn extend_mcp_servers(
+        &mut self,
+        servers: impl IntoIterator<Item = (String, ScopedMcpServerConfig)>,
+    ) {
+        for (name, server) in servers {
+            self.feature_config.mcp.insert(name, server);
+        }
     }
 
     /// SP4.2-B3: Access configured LSP servers.
@@ -992,6 +1013,29 @@ impl RuntimeHookConfig {
         }
     }
 
+    /// 追加一个 `PreToolUse` hook（保留 matcher / timeout 等定义）。
+    pub fn push_pre_tool_use(&mut self, definition: HookDefinition) {
+        self.pre_tool_use.push(definition);
+    }
+
+    /// 追加一个 `PostToolUse` hook。
+    pub fn push_post_tool_use(&mut self, definition: HookDefinition) {
+        self.post_tool_use.push(definition);
+    }
+
+    /// 追加一个 `PostToolUseFailure` hook。
+    pub fn push_post_tool_use_failure(&mut self, definition: HookDefinition) {
+        self.post_tool_use_failure.push(definition);
+    }
+
+    /// 追加任意生命周期事件（如 `SessionStart` / `Stop`）的 hook。
+    pub fn push_lifecycle(&mut self, event: impl Into<String>, definition: HookDefinition) {
+        self.lifecycle
+            .entry(event.into())
+            .or_default()
+            .push(definition);
+    }
+
     #[must_use]
     pub fn pre_tool_use(&self) -> &[HookDefinition] {
         &self.pre_tool_use
@@ -1065,6 +1109,11 @@ impl McpConfigCollection {
     #[must_use]
     pub fn servers(&self) -> &BTreeMap<String, ScopedMcpServerConfig> {
         &self.servers
+    }
+
+    /// 注入一个服务器（插件贡献的 MCP 配置走这里，与配置文件同一集合）。
+    pub fn insert(&mut self, name: String, server: ScopedMcpServerConfig) {
+        self.servers.insert(name, server);
     }
 
     #[must_use]
@@ -1560,6 +1609,8 @@ fn parse_mcp_server_config(
             url: expect_string(object, "url", context)?.to_string(),
             headers: optional_string_map(object, "headers", context)?.unwrap_or_default(),
             headers_helper: optional_string(object, "headersHelper", context)?.map(str::to_string),
+            tool_call_timeout_ms: optional_u64(object, "toolCallTimeoutMs", context)?,
+            proxy: optional_string(object, "proxy", context)?.map(str::to_string),
         })),
         "sdk" => Ok(McpServerConfig::Sdk(McpSdkServerConfig {
             name: expect_string(object, "name", context)?.to_string(),
@@ -1591,6 +1642,8 @@ fn parse_mcp_remote_server_config(
         headers: optional_string_map(object, "headers", context)?.unwrap_or_default(),
         headers_helper: optional_string(object, "headersHelper", context)?.map(str::to_string),
         oauth: parse_optional_mcp_oauth_config(object, context)?,
+        tool_call_timeout_ms: optional_u64(object, "toolCallTimeoutMs", context)?,
+        proxy: optional_string(object, "proxy", context)?.map(str::to_string),
     })
 }
 

@@ -790,7 +790,7 @@ pub(crate) fn run_resume_command(
                 json: Some(serde_json::json!({ "kind": "bus", "text": json_text })),
             })
         }
-        SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
+        SlashCommand::Unknown { name, .. } => Err(format_unknown_slash_command(name).into()),
         // /session list/exists/delete can be served from the managed sessions directory
         // in resume mode without starting an interactive REPL. Mutating delete remains
         // opt-in through /session delete <id> --force so JSON callers never hang on a prompt.

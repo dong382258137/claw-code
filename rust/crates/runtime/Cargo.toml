@@ -17,7 +17,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 telemetry = { path = "../telemetry" }
-tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "time", "sync"] }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "time", "sync", "net"] }
 walkdir = "2"
 # DAG 多 agent 编排基础设施 (v0.2):见 workspace Cargo.toml 注释。
 petgraph.workspace = true
@@ -25,6 +25,12 @@ tokio-util.workspace = true
 serde_yaml.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
+# 远程 MCP 传输：streamable HTTP / 旧版 SSE / WebSocket。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+futures-util = "0.3"
+bytes = "1"
+base64 = "0.22"
 # Step 4.2: LSP 官方类型定义,用于类型安全的 documentSymbol/Diagnostic 解析。
 # 替代部分手搓 serde_json,提高协议层可靠性。
 lsp-types = "0.95"

@@ -259,6 +259,8 @@ mod tests {
             url: "https://api.anthropic.com/v2/ccr-sessions/1?mcp_url=wss%3A%2F%2Fvendor.example%2Fmcp".to_string(),
             headers: BTreeMap::new(),
             headers_helper: None,
+            tool_call_timeout_ms: None,
+            proxy: None,
         });
         assert_eq!(
             mcp_server_signature(&remote),
@@ -273,6 +275,8 @@ mod tests {
             headers: BTreeMap::from([("Authorization".to_string(), "Bearer token".to_string())]),
             headers_helper: Some("helper.sh".to_string()),
             oauth: None,
+            tool_call_timeout_ms: None,
+            proxy: None,
         });
         let user = ScopedMcpServerConfig {
             required: false,
@@ -297,6 +301,8 @@ mod tests {
                 headers: BTreeMap::new(),
                 headers_helper: None,
                 oauth: None,
+                tool_call_timeout_ms: None,
+                proxy: None,
             }),
         };
         assert_ne!(

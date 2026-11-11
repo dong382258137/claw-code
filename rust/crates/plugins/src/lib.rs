@@ -125,6 +125,9 @@ pub struct PluginManifest {
     pub tools: Vec<PluginToolManifest>,
     #[serde(default)]
     pub commands: Vec<PluginCommandManifest>,
+    /// Claude Code 插件契约组件（skills/agents/commands/hooks/mcpServers/userConfig）。
+    #[serde(default)]
+    pub components: ClaudeComponents,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -217,23 +220,112 @@ pub struct PluginCommandManifest {
     pub command: String,
 }
 
+/// Claude Code 插件里的一类 hook 事件（已从 hooks.json / 内联对象归一化）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeHookSpec {
+    /// Claude 事件名，如 `PreToolUse` / `SessionStart`。
+    pub event: String,
+    /// 工具名过滤表达式（Claude 的 `matcher`），为空表示不限制。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// Claude Code 插件声明的 MCP 服务器（内联或 `.mcp.json` 读取后归一化）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginMcpServerSpec {
+    pub name: String,
+    /// `stdio` / `http` / `sse` / `ws`。
+    pub transport: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// 远程服务器的显式代理（`http://user:pass@host:port`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+}
+
+/// Claude 插件 `userConfig` 的一项；安装确认页据此向用户收集值。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginUserConfigField {
+    pub name: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default, rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub sensitive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+}
+
+/// Claude Code 插件契约里 claw 能执行/需要展示的组件集合。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeComponents {
+    /// 已解析为绝对路径的技能目录根（可直接加入技能发现根）。
+    #[serde(default)]
+    pub skill_paths: Vec<PathBuf>,
+    /// 已解析为绝对路径的子代理目录根（可直接加入子代理发现根）。
+    #[serde(default)]
+    pub agent_paths: Vec<PathBuf>,
+    /// 命令 markdown 文件或目录（动态命令表读取）。
+    #[serde(default)]
+    pub command_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub hooks: Vec<ClaudeHookSpec>,
+    #[serde(default)]
+    pub mcp_servers: Vec<PluginMcpServerSpec>,
+    #[serde(default)]
+    pub user_config: Vec<PluginUserConfigField>,
+    /// 无法映射的 Claude 字段/事件，展示给用户，不静默丢弃。
+    #[serde(default)]
+    pub unsupported: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct RawPluginManifest {
     pub name: String,
+    #[serde(default)]
     pub version: String,
+    #[serde(default)]
     pub description: String,
     #[serde(default)]
     pub permissions: Vec<String>,
     #[serde(rename = "defaultEnabled", default)]
     pub default_enabled: bool,
+    /// claw 原生 hooks（字符串数组）或 Claude hooks（文件路径/对象），两种都接受。
     #[serde(default)]
-    pub hooks: PluginHooks,
+    pub hooks: Value,
     #[serde(default)]
     pub lifecycle: PluginLifecycle,
     #[serde(default)]
     pub tools: Vec<RawPluginToolManifest>,
+    /// claw 原生命令对象数组，或 Claude 的命令目录/文件列表。
     #[serde(default)]
-    pub commands: Vec<PluginCommandManifest>,
+    pub commands: Option<Value>,
+    #[serde(default)]
+    pub skills: Option<Value>,
+    #[serde(default)]
+    pub agents: Option<Value>,
+    #[serde(rename = "mcpServers", default)]
+    pub mcp_servers: Option<Value>,
+    #[serde(rename = "userConfig", default)]
+    pub user_config: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,6 +459,28 @@ pub struct InstalledPluginRecord {
     pub source: PluginInstallSource,
     pub installed_at_unix_ms: u128,
     pub updated_at_unix_ms: u128,
+    /// 安装时校验过的插件目录树 sha256；用于更新时复核。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
+    /// 固定的 git commit（完整性锚点之一）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    /// 仓库内子目录（Claude marketplace 的 `git-subdir`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subdir: Option<PathBuf>,
+}
+
+/// 市场安装请求：来源 + 完整性锚点。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInstallRequest {
+    pub source: PluginInstallSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subdir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    /// 插件目录树 sha256；与固定 git commit 至少要提供一个。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -385,6 +499,7 @@ pub struct BuiltinPlugin {
     hooks: PluginHooks,
     lifecycle: PluginLifecycle,
     tools: Vec<PluginTool>,
+    components: ClaudeComponents,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -393,6 +508,7 @@ pub struct BundledPlugin {
     hooks: PluginHooks,
     lifecycle: PluginLifecycle,
     tools: Vec<PluginTool>,
+    components: ClaudeComponents,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -401,6 +517,7 @@ pub struct ExternalPlugin {
     hooks: PluginHooks,
     lifecycle: PluginLifecycle,
     tools: Vec<PluginTool>,
+    components: ClaudeComponents,
 }
 
 pub trait Plugin {
@@ -408,6 +525,7 @@ pub trait Plugin {
     fn hooks(&self) -> &PluginHooks;
     fn lifecycle(&self) -> &PluginLifecycle;
     fn tools(&self) -> &[PluginTool];
+    fn components(&self) -> &ClaudeComponents;
     fn validate(&self) -> Result<(), PluginError>;
     fn initialize(&self) -> Result<(), PluginError>;
     fn shutdown(&self) -> Result<(), PluginError>;
@@ -435,6 +553,10 @@ impl Plugin for BuiltinPlugin {
 
     fn tools(&self) -> &[PluginTool] {
         &self.tools
+    }
+
+    fn components(&self) -> &ClaudeComponents {
+        &self.components
     }
 
     fn validate(&self) -> Result<(), PluginError> {
@@ -465,6 +587,10 @@ impl Plugin for BundledPlugin {
 
     fn tools(&self) -> &[PluginTool] {
         &self.tools
+    }
+
+    fn components(&self) -> &ClaudeComponents {
+        &self.components
     }
 
     fn validate(&self) -> Result<(), PluginError> {
@@ -507,6 +633,10 @@ impl Plugin for ExternalPlugin {
 
     fn tools(&self) -> &[PluginTool] {
         &self.tools
+    }
+
+    fn components(&self) -> &ClaudeComponents {
+        &self.components
     }
 
     fn validate(&self) -> Result<(), PluginError> {
@@ -567,6 +697,14 @@ impl Plugin for PluginDefinition {
         }
     }
 
+    fn components(&self) -> &ClaudeComponents {
+        match self {
+            Self::Builtin(plugin) => plugin.components(),
+            Self::Bundled(plugin) => plugin.components(),
+            Self::External(plugin) => plugin.components(),
+        }
+    }
+
     fn validate(&self) -> Result<(), PluginError> {
         match self {
             Self::Builtin(plugin) => plugin.validate(),
@@ -620,6 +758,12 @@ impl RegisteredPlugin {
     #[must_use]
     pub fn tools(&self) -> &[PluginTool] {
         self.definition.tools()
+    }
+
+    /// Claude 组件（skills/agents/commands/hooks/mcpServers），用于运行时注入。
+    #[must_use]
+    pub fn components(&self) -> &ClaudeComponents {
+        self.definition.components()
     }
 
     #[must_use]
@@ -1127,7 +1271,7 @@ impl PluginManager {
     pub fn install(&mut self, source: &str) -> Result<InstallOutcome, PluginError> {
         let install_source = parse_install_source(source)?;
         let temp_root = self.install_root().join(".tmp");
-        let staged_source = materialize_source(&install_source, &temp_root)?;
+        let staged_source = materialize_source(&install_source, None, &temp_root)?;
         let cleanup_source = matches!(install_source, PluginInstallSource::GitUrl { .. });
         let manifest = load_plugin_from_directory(&staged_source)?;
 
@@ -1152,12 +1296,111 @@ impl PluginManager {
             source: install_source,
             installed_at_unix_ms: now,
             updated_at_unix_ms: now,
+            checksum: None,
+            git_ref: None,
+            subdir: None,
         };
 
         let mut registry = self.load_registry()?;
         registry.plugins.insert(plugin_id.clone(), record);
         self.store_registry(&registry)?;
         self.write_enabled_state(&plugin_id, Some(true))?;
+        self.config.enabled_plugins.insert(plugin_id.clone(), true);
+
+        Ok(InstallOutcome {
+            plugin_id,
+            version: manifest.version,
+            install_path,
+        })
+    }
+
+    /// 市场安装：带完整性锚点、原子切换与失败回滚。
+    ///
+    /// 与 `install` 的区别：
+    /// - 支持 `git-subdir` 与固定 git commit；
+    /// - 必须提供 `expected_sha256` 或固定 commit，二者皆无则拒绝安装；
+    /// - 新版本先落到同盘临时目录，校验通过后再原子替换旧目录，任何一步失败都恢复旧版本。
+    pub fn install_request(
+        &mut self,
+        request: PluginInstallRequest,
+    ) -> Result<InstallOutcome, PluginError> {
+        self.reject_install_without_integrity_anchor(&request)?;
+
+        let temp_root = self.install_root().join(".tmp");
+        let staged_source = materialize_request(&request, &temp_root)?;
+        let cleanup_source = matches!(request.source, PluginInstallSource::GitUrl { .. });
+        let result = self.install_staged(&request, &staged_source);
+        if cleanup_source {
+            let _ = fs::remove_dir_all(&staged_source);
+        }
+        result
+    }
+
+    fn reject_install_without_integrity_anchor(
+        &self,
+        request: &PluginInstallRequest,
+    ) -> Result<(), PluginError> {
+        if request.expected_sha256.is_some() {
+            return Ok(());
+        }
+        let pinned_commit = matches!(request.source, PluginInstallSource::GitUrl { .. })
+            && request.git_ref.as_deref().is_some_and(is_pinned_git_commit);
+        if pinned_commit {
+            return Ok(());
+        }
+        Err(PluginError::CommandFailed(
+            "拒绝安装：缺少完整性校验。请提供插件目录 sha256，或固定到具体 git commit（40 位 sha）。"
+                .to_string(),
+        ))
+    }
+
+    fn install_staged(
+        &mut self,
+        request: &PluginInstallRequest,
+        staged_source: &Path,
+    ) -> Result<InstallOutcome, PluginError> {
+        let manifest = load_plugin_from_directory(staged_source)?;
+        let checksum = compute_plugin_tree_sha256(staged_source)?;
+        if let Some(expected) = &request.expected_sha256 {
+            if !expected.eq_ignore_ascii_case(&checksum) {
+                return Err(PluginError::CommandFailed(format!(
+                    "插件校验失败：期望 sha256 `{expected}`，实际 `{checksum}`"
+                )));
+            }
+        }
+
+        let plugin_id = plugin_id(&manifest.name, EXTERNAL_MARKETPLACE);
+        let install_path = self.install_root().join(sanitize_plugin_id(&plugin_id));
+        atomic_replace_dir(staged_source, &install_path)?;
+
+        let now = unix_time_ms();
+        let record = InstalledPluginRecord {
+            kind: PluginKind::External,
+            id: plugin_id.clone(),
+            name: manifest.name,
+            version: manifest.version.clone(),
+            description: manifest.description,
+            install_path: install_path.clone(),
+            source: request.source.clone(),
+            installed_at_unix_ms: now,
+            updated_at_unix_ms: now,
+            checksum: Some(checksum),
+            git_ref: request.git_ref.clone(),
+            subdir: request.subdir.clone(),
+        };
+
+        let previous_registry = self.load_registry()?;
+        let mut registry = previous_registry.clone();
+        registry.plugins.insert(plugin_id.clone(), record);
+        if let Err(error) = self.store_registry(&registry) {
+            let _ = fs::remove_dir_all(&install_path);
+            return Err(error);
+        }
+        if let Err(error) = self.write_enabled_state(&plugin_id, Some(true)) {
+            let _ = self.store_registry(&previous_registry);
+            let _ = fs::remove_dir_all(&install_path);
+            return Err(error);
+        }
         self.config.enabled_plugins.insert(plugin_id.clone(), true);
 
         Ok(InstallOutcome {
@@ -1212,14 +1455,24 @@ impl PluginManager {
         })?;
 
         let temp_root = self.install_root().join(".tmp");
-        let staged_source = materialize_source(&record.source, &temp_root)?;
+        let staged_source =
+            materialize_source(&record.source, record.git_ref.as_deref(), &temp_root)?;
+        let staged_source = resolve_staged_subdir(&staged_source, record.subdir.as_deref())?;
         let cleanup_source = matches!(record.source, PluginInstallSource::GitUrl { .. });
         let manifest = load_plugin_from_directory(&staged_source)?;
-
-        if record.install_path.exists() {
-            fs::remove_dir_all(&record.install_path)?;
+        let checksum = compute_plugin_tree_sha256(&staged_source)?;
+        if let Some(expected) = &record.checksum {
+            if !expected.eq_ignore_ascii_case(&checksum) {
+                if cleanup_source {
+                    let _ = fs::remove_dir_all(&staged_source);
+                }
+                return Err(PluginError::CommandFailed(format!(
+                    "插件更新校验失败：期望 sha256 `{expected}`，实际 `{checksum}`"
+                )));
+            }
         }
-        copy_dir_all(&staged_source, &record.install_path)?;
+
+        atomic_replace_dir(&staged_source, &record.install_path)?;
         if cleanup_source {
             let _ = fs::remove_dir_all(&staged_source);
         }
@@ -1228,6 +1481,7 @@ impl PluginManager {
             version: manifest.version.clone(),
             description: manifest.description,
             updated_at_unix_ms: unix_time_ms(),
+            checksum: Some(checksum),
             ..record.clone()
         };
         registry
@@ -1419,6 +1673,9 @@ impl PluginManager {
                     source: PluginInstallSource::LocalPath { path: source_root },
                     installed_at_unix_ms,
                     updated_at_unix_ms: now,
+                    checksum: None,
+                    git_ref: None,
+                    subdir: None,
                 },
             );
             changed = true;
@@ -1546,6 +1803,7 @@ pub fn builtin_plugins() -> Vec<PluginDefinition> {
         hooks: PluginHooks::default(),
         lifecycle: PluginLifecycle::default(),
         tools: Vec::new(),
+        components: ClaudeComponents::default(),
     })]
 }
 
@@ -1566,6 +1824,7 @@ fn load_plugin_definition(
         default_enabled: manifest.default_enabled,
         root: Some(root.to_path_buf()),
     };
+    let components = manifest.components.clone();
     let hooks = resolve_hooks(root, &manifest.hooks);
     let lifecycle = resolve_lifecycle(root, &manifest.lifecycle);
     let tools = resolve_tools(root, &metadata.id, &metadata.name, &manifest.tools);
@@ -1575,18 +1834,21 @@ fn load_plugin_definition(
             hooks,
             lifecycle,
             tools,
+            components,
         }),
         PluginKind::Bundled => PluginDefinition::Bundled(BundledPlugin {
             metadata,
             hooks,
             lifecycle,
             tools,
+            components,
         }),
         PluginKind::External => PluginDefinition::External(ExternalPlugin {
             metadata,
             hooks,
             lifecycle,
             tools,
+            components,
         }),
     })
 }
@@ -1611,70 +1873,8 @@ fn load_manifest_from_path(
         ))
     })?;
     let raw_json: Value = serde_json::from_str(&contents)?;
-    let compatibility_errors = detect_claude_code_manifest_contract_gaps(&raw_json);
-    if !compatibility_errors.is_empty() {
-        return Err(PluginError::ManifestValidation(compatibility_errors));
-    }
     let raw_manifest: RawPluginManifest = serde_json::from_value(raw_json)?;
     build_plugin_manifest(root, raw_manifest)
-}
-
-fn detect_claude_code_manifest_contract_gaps(
-    raw_manifest: &Value,
-) -> Vec<PluginManifestValidationError> {
-    let Some(root) = raw_manifest.as_object() else {
-        return Vec::new();
-    };
-
-    let mut errors = Vec::new();
-
-    for (field, detail) in [
-        (
-            "skills",
-            "plugin manifest field `skills` uses the Claude Code plugin contract; `claw` does not load plugin-managed skills and instead discovers skills from local roots such as `.claw/skills`, `.omc/skills`, `.agents/skills`, `~/.omc/skills`, and `~/.claude/skills/omc-learned`.",
-        ),
-        (
-            "mcpServers",
-            "plugin manifest field `mcpServers` uses the Claude Code plugin contract; `claw` does not import MCP servers from plugin manifests.",
-        ),
-        (
-            "agents",
-            "plugin manifest field `agents` uses the Claude Code plugin contract; `claw` does not load plugin-managed agent markdown catalogs from plugin manifests.",
-        ),
-    ] {
-        if root.contains_key(field) {
-            errors.push(PluginManifestValidationError::UnsupportedManifestContract {
-                detail: detail.to_string(),
-            });
-        }
-    }
-
-    if root
-        .get("commands")
-        .and_then(Value::as_array)
-        .is_some_and(|commands| commands.iter().any(Value::is_string))
-    {
-        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
-            detail: "plugin manifest field `commands` uses Claude Code-style directory globs; `claw` slash dispatch is still built-in and does not load plugin slash command markdown files.".to_string(),
-        });
-    }
-
-    if let Some(hooks) = root.get("hooks").and_then(Value::as_object) {
-        for hook_name in hooks.keys() {
-            if !matches!(
-                hook_name.as_str(),
-                "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
-            ) {
-                errors.push(PluginManifestValidationError::UnsupportedManifestContract {
-                    detail: format!(
-                        "plugin hook `{hook_name}` uses the Claude Code lifecycle contract; `claw` plugins currently support only PreToolUse, PostToolUse, and PostToolUseFailure."
-                    ),
-                });
-            }
-        }
-    }
-
-    errors
 }
 
 fn plugin_manifest_path(root: &Path) -> Result<PathBuf, PluginError> {
@@ -1702,32 +1902,81 @@ fn build_plugin_manifest(
     let mut errors = Vec::new();
 
     validate_required_manifest_field("name", &raw.name, &mut errors);
-    validate_required_manifest_field("version", &raw.version, &mut errors);
-    validate_required_manifest_field("description", &raw.description, &mut errors);
+    let version = if raw.version.trim().is_empty() {
+        "0.0.0".to_string()
+    } else {
+        raw.version
+    };
+    let description = raw.description;
 
     let permissions = build_manifest_permissions(&raw.permissions, &mut errors);
-    validate_command_entries(root, raw.hooks.pre_tool_use.iter(), "hook", &mut errors);
-    validate_command_entries(root, raw.hooks.post_tool_use.iter(), "hook", &mut errors);
+    let (hooks, mut claude_hooks, mut lifecycle, hook_unsupported) =
+        parse_hooks_value(root, &raw.hooks);
+    if !raw.lifecycle.init.is_empty() {
+        lifecycle.init.extend(raw.lifecycle.init.iter().cloned());
+    }
+    if !raw.lifecycle.shutdown.is_empty() {
+        lifecycle
+            .shutdown
+            .extend(raw.lifecycle.shutdown.iter().cloned());
+    }
+    validate_command_entries(root, hooks.pre_tool_use.iter(), "hook", &mut errors);
+    validate_command_entries(root, hooks.post_tool_use.iter(), "hook", &mut errors);
     validate_command_entries(
         root,
-        raw.hooks.post_tool_use_failure.iter(),
+        hooks.post_tool_use_failure.iter(),
         "hook",
         &mut errors,
     );
     validate_command_entries(
         root,
-        raw.lifecycle.init.iter(),
+        lifecycle.init.iter(),
         "lifecycle command",
         &mut errors,
     );
     validate_command_entries(
         root,
-        raw.lifecycle.shutdown.iter(),
+        lifecycle.shutdown.iter(),
         "lifecycle command",
         &mut errors,
     );
+
     let tools = build_manifest_tools(root, raw.tools, &mut errors);
-    let commands = build_manifest_commands(root, raw.commands, &mut errors);
+    let has_raw_commands = raw.commands.is_some();
+    let (commands, mut command_paths) = parse_commands_value(root, raw.commands, &mut errors);
+    let mut skill_paths = parse_component_roots(root, raw.skills.as_ref(), true);
+    let mut agent_paths = parse_component_roots(root, raw.agents.as_ref(), false);
+    if raw.skills.is_none() && root.join("skills").is_dir() {
+        skill_paths.push(root.join("skills"));
+    }
+    if raw.agents.is_none() && root.join("agents").is_dir() {
+        agent_paths.push(root.join("agents"));
+    }
+    if !has_raw_commands && root.join("commands").is_dir() {
+        command_paths.push(root.join("commands"));
+    }
+    if raw.hooks.is_null() {
+        let file = root.join("hooks").join("hooks.json");
+        if file.is_file() {
+            let parsed = parse_hooks_file(root, &file);
+            claude_hooks.extend(parsed.claude);
+            lifecycle.init.extend(parsed.lifecycle.init);
+            lifecycle.shutdown.extend(parsed.lifecycle.shutdown);
+        }
+    }
+    let mcp_servers = parse_mcp_servers(root, raw.mcp_servers.as_ref());
+    let user_config = parse_user_config(raw.user_config.as_ref());
+    let mut unsupported: Vec<String> = hook_unsupported
+        .into_iter()
+        .map(|event| format!("hook 事件 `{event}` 在 claw 中没有对应机制，已跳过"))
+        .collect();
+    if raw.mcp_servers.is_some()
+        && mcp_servers
+            .iter()
+            .any(|server| !matches!(server.transport.as_str(), "stdio" | "sse" | "http" | "ws"))
+    {
+        unsupported.push("mcpServers 里存在未识别的传输类型".to_string());
+    }
 
     if !errors.is_empty() {
         return Err(PluginError::ManifestValidation(errors));
@@ -1735,14 +1984,574 @@ fn build_plugin_manifest(
 
     Ok(PluginManifest {
         name: raw.name,
-        version: raw.version,
-        description: raw.description,
+        version,
+        description,
         permissions,
         default_enabled: raw.default_enabled,
-        hooks: raw.hooks,
-        lifecycle: raw.lifecycle,
+        hooks,
+        lifecycle,
         tools,
         commands,
+        components: ClaudeComponents {
+            skill_paths,
+            agent_paths,
+            command_paths,
+            hooks: claude_hooks,
+            mcp_servers,
+            user_config,
+            unsupported,
+        },
+    })
+}
+
+#[derive(Debug, Default)]
+struct ParsedHooks {
+    native: PluginHooks,
+    claude: Vec<ClaudeHookSpec>,
+    lifecycle: PluginLifecycle,
+    unsupported: Vec<String>,
+}
+
+fn parse_hooks_file(root: &Path, path: &Path) -> ParsedHooks {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let mut parsed = ParsedHooks::default();
+    if let Ok(json) = serde_json::from_str::<Value>(&text) {
+        // 兼容 `{ "hooks": { ... } }` 包装和直接事件对象两种写法。
+        let object = json.get("hooks").cloned().unwrap_or(json);
+        collect_hook_object(root, &object, &mut parsed);
+    }
+    parsed
+}
+
+/// 同时接受 claw 原生字符串数组和 Claude hooks（文件路径 / 内联对象）。
+fn parse_hooks_value(
+    root: &Path,
+    value: &Value,
+) -> (
+    PluginHooks,
+    Vec<ClaudeHookSpec>,
+    PluginLifecycle,
+    Vec<String>,
+) {
+    let parsed = parse_hooks_value_inner(root, value);
+    (
+        parsed.native,
+        parsed.claude,
+        parsed.lifecycle,
+        parsed.unsupported,
+    )
+}
+
+fn parse_hooks_value_inner(root: &Path, value: &Value) -> ParsedHooks {
+    let mut parsed = ParsedHooks::default();
+    match value {
+        Value::Null => {}
+        Value::String(path) => {
+            let file = resolve_path(root, path);
+            if file.is_file() {
+                let content = fs::read_to_string(&file).unwrap_or_default();
+                if let Ok(json) = serde_json::from_str::<Value>(&content) {
+                    let object = json.get("hooks").cloned().unwrap_or(json);
+                    collect_hook_object(root, &object, &mut parsed);
+                }
+            }
+        }
+        Value::Object(_) => {
+            let object = value.get("hooks").cloned().unwrap_or_else(|| value.clone());
+            collect_hook_object(root, &object, &mut parsed);
+        }
+        _ => {}
+    }
+    parsed
+}
+
+fn collect_hook_object(root: &Path, value: &Value, parsed: &mut ParsedHooks) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    for (event, entries) in object {
+        match event.as_str() {
+            "PreToolUse" => collect_native_or_claude_hooks(
+                root,
+                event,
+                entries,
+                &mut parsed.native.pre_tool_use,
+                &mut parsed.claude,
+            ),
+            "PostToolUse" => collect_native_or_claude_hooks(
+                root,
+                event,
+                entries,
+                &mut parsed.native.post_tool_use,
+                &mut parsed.claude,
+            ),
+            "PostToolUseFailure" => collect_native_or_claude_hooks(
+                root,
+                event,
+                entries,
+                &mut parsed.native.post_tool_use_failure,
+                &mut parsed.claude,
+            ),
+            "SessionStart" => collect_lifecycle_commands(root, entries, &mut parsed.lifecycle.init),
+            "Stop" | "SessionEnd" => {
+                collect_lifecycle_commands(root, entries, &mut parsed.lifecycle.shutdown)
+            }
+            other => collect_claude_hooks(root, other, entries, &mut parsed.claude),
+        }
+    }
+}
+
+/// Claude 事件对象 → 归一化 hook 规格；字符串形式只对 claw 原生事件有意义。
+fn collect_claude_hooks(
+    root: &Path,
+    event: &str,
+    entries: &Value,
+    claude: &mut Vec<ClaudeHookSpec>,
+) {
+    let Some(items) = entries.as_array() else {
+        return;
+    };
+    for item in items {
+        let matcher = item
+            .get("matcher")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(commands) = item.get("hooks").and_then(Value::as_array) {
+            for hook in commands {
+                if let Some(command) = hook.get("command").and_then(Value::as_str) {
+                    let type_name = hook
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("command");
+                    if type_name != "command" {
+                        continue;
+                    }
+                    claude.push(ClaudeHookSpec {
+                        event: event.to_string(),
+                        matcher: matcher.clone(),
+                        command: expand_placeholders(root, command),
+                        timeout_ms: hook
+                            .get("timeout")
+                            .and_then(Value::as_u64)
+                            .map(|seconds| seconds.saturating_mul(1000)),
+                    });
+                }
+            }
+        } else if let Some(command) = item.get("command").and_then(Value::as_str) {
+            claude.push(ClaudeHookSpec {
+                event: event.to_string(),
+                matcher,
+                command: expand_placeholders(root, command),
+                timeout_ms: item
+                    .get("timeout")
+                    .and_then(Value::as_u64)
+                    .map(|seconds| seconds.saturating_mul(1000)),
+            });
+        }
+    }
+}
+
+fn collect_native_or_claude_hooks(
+    root: &Path,
+    event: &str,
+    entries: &Value,
+    native: &mut Vec<String>,
+    claude: &mut Vec<ClaudeHookSpec>,
+) {
+    if let Some(items) = entries.as_array() {
+        for item in items {
+            if let Some(command) = item.as_str() {
+                native.push(expand_placeholders(root, command));
+            }
+        }
+    }
+    collect_claude_hooks(root, event, entries, claude);
+}
+
+fn collect_lifecycle_commands(root: &Path, entries: &Value, target: &mut Vec<String>) {
+    let Some(items) = entries.as_array() else {
+        return;
+    };
+    for item in items {
+        if let Some(command) = item.as_str() {
+            target.push(expand_placeholders(root, command));
+        } else if let Some(commands) = item.get("hooks").and_then(Value::as_array) {
+            for hook in commands {
+                if let Some(command) = hook.get("command").and_then(Value::as_str) {
+                    target.push(expand_placeholders(root, command));
+                }
+            }
+        } else if let Some(command) = item.get("command").and_then(Value::as_str) {
+            target.push(expand_placeholders(root, command));
+        }
+    }
+}
+
+/// 命令字段既可能是 claw 原生对象数组，也可能是 Claude 的目录/文件列表。
+fn parse_commands_value(
+    root: &Path,
+    value: Option<Value>,
+    errors: &mut Vec<PluginManifestValidationError>,
+) -> (Vec<PluginCommandManifest>, Vec<PathBuf>) {
+    let Some(value) = value else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut native_values = Vec::new();
+    let mut path_values = Vec::new();
+    match value {
+        Value::String(path) => path_values.push(path),
+        Value::Array(items) => {
+            for item in items {
+                if item.is_string() {
+                    path_values.push(item.as_str().unwrap_or_default().to_string());
+                } else if item.get("command").is_some() {
+                    native_values.push(item);
+                } else if let Some(path) = item.get("path").and_then(Value::as_str) {
+                    path_values.push(path.to_string());
+                }
+            }
+        }
+        Value::Object(map) if map.contains_key("command") => native_values.push(Value::Object(map)),
+        _ => {}
+    }
+    let native = if native_values.is_empty() {
+        Vec::new()
+    } else {
+        match serde_json::from_value::<Vec<PluginCommandManifest>>(Value::Array(native_values)) {
+            Ok(commands) => build_manifest_commands(root, commands, errors),
+            Err(_) => Vec::new(),
+        }
+    };
+    let mut paths = Vec::new();
+    for path in path_values {
+        paths.extend(expand_component_path(&resolve_path(root, &path)));
+    }
+    (native, paths)
+}
+
+/// 把 skills/agents 的声明归一化成“发现根”。技能根约定为包含 `<skill>/SKILL.md` 的目录。
+fn parse_component_roots(root: &Path, value: Option<&Value>, skill: bool) -> Vec<PathBuf> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let mut raw_paths = Vec::new();
+    match value {
+        Value::String(path) => raw_paths.push(path.clone()),
+        Value::Array(items) => {
+            for item in items {
+                if let Some(path) = item.as_str() {
+                    raw_paths.push(path.to_string());
+                } else if let Some(path) = item.get("path").and_then(Value::as_str) {
+                    raw_paths.push(path.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut roots = Vec::new();
+    for raw in raw_paths {
+        for path in expand_component_path(&resolve_path(root, &raw)) {
+            if skill {
+                let is_skill_md =
+                    path.is_file() && path.file_name().is_some_and(|name| name == "SKILL.md");
+                let is_skill_dir = path.is_dir() && path.join("SKILL.md").is_file();
+                if is_skill_md || is_skill_dir {
+                    if let Some(parent) = path.parent() {
+                        roots.push(parent.to_path_buf());
+                    }
+                } else {
+                    roots.push(path);
+                }
+            } else if path.is_file() {
+                if let Some(parent) = path.parent() {
+                    roots.push(parent.to_path_buf());
+                }
+            } else {
+                roots.push(path);
+            }
+        }
+    }
+    dedupe_paths(roots)
+}
+
+fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = BTreeSet::new();
+    paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
+}
+
+fn resolve_path(root: &Path, raw: &str) -> PathBuf {
+    let root_text = root.to_string_lossy();
+    let expanded = raw
+        .replace("${CLAUDE_PLUGIN_ROOT}", &root_text)
+        .replace("$CLAUDE_PLUGIN_ROOT", &root_text)
+        .replace("${CLAUDE_PROJECT_DIR}", ".")
+        .replace("$CLAUDE_PROJECT_DIR", ".");
+    let path = Path::new(expanded.trim());
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+fn expand_component_path(path: &Path) -> Vec<PathBuf> {
+    let text = path.to_string_lossy();
+    if !text.contains('*') {
+        return vec![path.to_path_buf()];
+    }
+    let components: Vec<_> = path.components().collect();
+    let first_wildcard = components
+        .iter()
+        .position(|component| component.as_os_str().to_string_lossy().contains('*'));
+    let Some(index) = first_wildcard else {
+        return vec![path.to_path_buf()];
+    };
+    let mut base = PathBuf::new();
+    for component in &components[..index] {
+        base.push(component.as_os_str());
+    }
+    let parts: Vec<String> = components[index..]
+        .iter()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect();
+    expand_glob_parts(&base, &parts)
+}
+
+fn expand_glob_parts(base: &Path, parts: &[String]) -> Vec<PathBuf> {
+    let Some(part) = parts.first() else {
+        return vec![base.to_path_buf()];
+    };
+    if parts.len() == 1 && !part.contains('*') {
+        return vec![base.join(part)];
+    }
+    if part == "**" {
+        let mut out = expand_glob_parts(base, &parts[1..]);
+        if let Ok(entries) = fs::read_dir(base) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    out.extend(expand_glob_parts(&entry.path(), parts));
+                }
+            }
+        }
+        return out;
+    }
+    if part.contains('*') {
+        let mut out = Vec::new();
+        if let Ok(entries) = fs::read_dir(base) {
+            for entry in entries.flatten() {
+                if wildcard_match(&entry.file_name().to_string_lossy(), part) {
+                    out.extend(expand_glob_parts(&entry.path(), &parts[1..]));
+                }
+            }
+        }
+        out
+    } else {
+        expand_glob_parts(&base.join(part), &parts[1..])
+    }
+}
+
+fn wildcard_match(text: &str, pattern: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let mut memo = BTreeMap::new();
+    fn go(
+        text: &[char],
+        pattern: &[char],
+        ti: usize,
+        pi: usize,
+        memo: &mut BTreeMap<(usize, usize), bool>,
+    ) -> bool {
+        if let Some(value) = memo.get(&(ti, pi)) {
+            return *value;
+        }
+        let result = if pi == pattern.len() {
+            ti == text.len()
+        } else if pattern[pi] == '*' {
+            go(text, pattern, ti, pi + 1, memo)
+                || (ti < text.len() && go(text, pattern, ti + 1, pi, memo))
+        } else {
+            ti < text.len()
+                && (pattern[pi] == '?' || pattern[pi] == text[ti])
+                && go(text, pattern, ti + 1, pi + 1, memo)
+        };
+        memo.insert((ti, pi), result);
+        result
+    }
+    go(&text, &pattern, 0, 0, &mut memo)
+}
+
+fn parse_mcp_servers(root: &Path, value: Option<&Value>) -> Vec<PluginMcpServerSpec> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let source = match value {
+        Value::String(path) => {
+            let file = resolve_path(root, path);
+            fs::read_to_string(file)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .unwrap_or(Value::Null)
+        }
+        other => other.clone(),
+    };
+    let object = source.get("mcpServers").cloned().unwrap_or(source);
+    let Some(map) = object.as_object() else {
+        return Vec::new();
+    };
+    let mut servers = Vec::new();
+    for (name, config) in map {
+        let Some(config) = config.as_object() else {
+            continue;
+        };
+        let transport = config
+            .get("type")
+            .or_else(|| config.get("transport"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if config.get("url").is_some() {
+                    // 未声明 type 的远程服务器按当前标准走 streamable HTTP；
+                    // 仅支持旧版 SSE 的服务需要显式写 `"type": "sse"`。
+                    "http".to_string()
+                } else {
+                    "stdio".to_string()
+                }
+            });
+        let command = config
+            .get("command")
+            .and_then(Value::as_str)
+            .map(|command| expand_placeholders(root, command));
+        let args = config
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|args| {
+                args.iter()
+                    .filter_map(Value::as_str)
+                    .map(|arg| expand_placeholders(root, arg))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let env = string_map(config.get("env"), root);
+        let headers = string_map(config.get("headers"), root);
+        let url = config
+            .get("url")
+            .and_then(Value::as_str)
+            .map(|url| expand_placeholders(root, url));
+        let timeout_ms = config
+            .get("timeout")
+            .and_then(Value::as_u64)
+            .map(|seconds| seconds.saturating_mul(1000));
+        let proxy = config
+            .get("proxy")
+            .and_then(Value::as_str)
+            .map(|proxy| expand_placeholders(root, proxy));
+        servers.push(PluginMcpServerSpec {
+            name: name.clone(),
+            transport,
+            command,
+            args,
+            env,
+            url,
+            headers,
+            timeout_ms,
+            proxy,
+        });
+    }
+    servers
+}
+
+fn string_map(value: Option<&Value>, root: &Path) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    if let Some(object) = value.and_then(Value::as_object) {
+        for (key, value) in object {
+            let text = match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                Value::Bool(boolean) => boolean.to_string(),
+                _ => continue,
+            };
+            map.insert(key.clone(), expand_placeholders(root, &text));
+        }
+    }
+    map
+}
+
+fn expand_placeholders(root: &Path, text: &str) -> String {
+    let mut result = text
+        .replace("${CLAUDE_PLUGIN_ROOT}", &root.to_string_lossy())
+        .replace("$CLAUDE_PLUGIN_ROOT", &root.to_string_lossy())
+        .replace("${CLAUDE_PROJECT_DIR}", ".")
+        .replace("$CLAUDE_PROJECT_DIR", ".");
+    // 剩余 `${VAR}` 从环境变量展开；缺失时原样保留，便于安装确认页提示。
+    for (key, value) in std::env::vars() {
+        result = result.replace(&format!("${{{key}}}"), &value);
+    }
+    result
+}
+
+fn parse_user_config(value: Option<&Value>) -> Vec<PluginUserConfigField> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let mut fields = Vec::new();
+    match value {
+        Value::Object(object) => {
+            // Claude 的 userConfig 是 name -> schema 的对象。
+            for (name, schema) in object {
+                if let Some(field) = parse_user_config_field(name, schema) {
+                    fields.push(field);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                let Some(name) = item.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                if let Some(field) = parse_user_config_field(name, item) {
+                    fields.push(field);
+                }
+            }
+        }
+        _ => {}
+    }
+    fields
+}
+
+fn parse_user_config_field(name: &str, schema: &Value) -> Option<PluginUserConfigField> {
+    let object = schema.as_object()?;
+    Some(PluginUserConfigField {
+        name: name.to_string(),
+        title: object
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or(name)
+            .to_string(),
+        description: object
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        kind: object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("string")
+            .to_string(),
+        required: object
+            .get("required")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        sensitive: object
+            .get("sensitive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        default: object
+            .get("default")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -2166,35 +2975,160 @@ fn parse_install_source(source: &str) -> Result<PluginInstallSource, PluginError
 
 fn materialize_source(
     source: &PluginInstallSource,
+    git_ref: Option<&str>,
     temp_root: &Path,
 ) -> Result<PathBuf, PluginError> {
     fs::create_dir_all(temp_root)?;
     match source {
         PluginInstallSource::LocalPath { path } => Ok(path.clone()),
-        PluginInstallSource::GitUrl { url } => {
-            static MATERIALIZE_COUNTER: AtomicU64 = AtomicU64::new(0);
-            let unique = MATERIALIZE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let destination = temp_root.join(format!("plugin-{nanos}-{unique}"));
-            let output = Command::new("git")
-                .arg("clone")
-                .arg("--depth")
-                .arg("1")
-                .arg(url)
-                .arg(&destination)
-                .output()?;
-            if !output.status.success() {
-                return Err(PluginError::CommandFailed(format!(
-                    "git clone failed for `{url}`: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )));
-            }
-            Ok(destination)
+        PluginInstallSource::GitUrl { url } => clone_git_repo(url, git_ref, temp_root),
+    }
+}
+
+fn clone_git_repo(
+    url: &str,
+    git_ref: Option<&str>,
+    temp_root: &Path,
+) -> Result<PathBuf, PluginError> {
+    static MATERIALIZE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = MATERIALIZE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let destination = temp_root.join(format!("plugin-{nanos}-{unique}"));
+    // 固定 commit 时必须拿到完整历史才能 checkout 任意 sha；未固定时用浅克隆。
+    let mut clone = Command::new("git");
+    clone.arg("clone");
+    if git_ref.is_none() {
+        clone.arg("--depth").arg("1");
+    }
+    let output = clone.arg(url).arg(&destination).output()?;
+    if !output.status.success() {
+        return Err(PluginError::CommandFailed(format!(
+            "git clone failed for `{url}`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    if let Some(reference) = git_ref {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&destination)
+            .arg("checkout")
+            .arg("--detach")
+            .arg(reference)
+            .output()?;
+        if !output.status.success() {
+            let _ = fs::remove_dir_all(&destination);
+            return Err(PluginError::CommandFailed(format!(
+                "git checkout `{reference}` failed for `{url}`: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
         }
     }
+    Ok(destination)
+}
+
+fn materialize_request(
+    request: &PluginInstallRequest,
+    temp_root: &Path,
+) -> Result<PathBuf, PluginError> {
+    let root = materialize_source(&request.source, request.git_ref.as_deref(), temp_root)?;
+    resolve_staged_subdir(&root, request.subdir.as_deref())
+}
+
+fn resolve_staged_subdir(root: &Path, subdir: Option<&Path>) -> Result<PathBuf, PluginError> {
+    let Some(subdir) = subdir.filter(|subdir| !subdir.as_os_str().is_empty()) else {
+        return Ok(root.to_path_buf());
+    };
+    let candidate = root.join(subdir);
+    if candidate.is_dir() {
+        Ok(candidate)
+    } else {
+        Err(PluginError::NotFound(format!(
+            "插件子目录不存在：{}",
+            candidate.display()
+        )))
+    }
+}
+
+/// 只要出现任意一步失败，就恢复旧目录；成功时清理备份。
+fn atomic_replace_dir(source: &Path, destination: &Path) -> Result<(), PluginError> {
+    static REPLACE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let parent = destination.parent().ok_or_else(|| {
+        PluginError::CommandFailed(format!("插件安装目录没有父目录：{}", destination.display()))
+    })?;
+    fs::create_dir_all(parent)?;
+    let staging_root = parent.join(".tmp");
+    fs::create_dir_all(&staging_root)?;
+    let unique = REPLACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let staging = staging_root.join(format!(".staging-{nanos}-{unique}"));
+    let backup = staging_root.join(format!(".backup-{nanos}-{unique}"));
+
+    copy_dir_all(source, &staging)?;
+    let had_previous = destination.exists();
+    if had_previous {
+        fs::rename(destination, &backup)?;
+    }
+    if let Err(error) = fs::rename(&staging, destination) {
+        if had_previous {
+            let _ = fs::rename(&backup, destination);
+        }
+        let _ = fs::remove_dir_all(&staging);
+        return Err(PluginError::Io(error));
+    }
+    if had_previous {
+        let _ = fs::remove_dir_all(&backup);
+    }
+    Ok(())
+}
+
+fn is_pinned_git_commit(reference: &str) -> bool {
+    reference.len() == 40 && reference.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+/// 对插件目录做确定性 sha256：按相对路径排序，逐个写入路径、长度与内容。
+fn compute_plugin_tree_sha256(root: &Path) -> Result<String, PluginError> {
+    use sha2::{Digest, Sha256};
+
+    let mut files = Vec::new();
+    collect_tree_files(root, root, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    for (relative, path) in files {
+        hasher.update(relative.to_string_lossy().as_bytes());
+        hasher.update([0u8]);
+        let bytes = fs::read(&path)?;
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn collect_tree_files(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<(), PluginError> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == ".git" || name == ".tmp" {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_tree_files(root, &path, files)?;
+        } else {
+            let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+            files.push((relative, path));
+        }
+    }
+    Ok(())
 }
 
 fn discover_plugin_dirs(root: &Path) -> Result<Vec<PathBuf>, PluginError> {
@@ -2728,7 +3662,7 @@ mod tests {
     }
 
     #[test]
-    fn load_plugin_from_directory_rejects_claude_code_manifest_contracts_with_guidance() {
+    fn load_plugin_from_directory_normalizes_claude_code_components() {
         let root = temp_dir("manifest-claude-code-contract");
         write_file(
             root.join(MANIFEST_FILE_NAME).as_path(),
@@ -2737,23 +3671,125 @@ mod tests {
   "version": "4.10.2",
   "description": "Claude Code plugin manifest",
   "hooks": {
-    "SessionStart": ["scripts/session-start.mjs"]
+    "SessionStart": ["hooks/session-start.sh"],
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "hooks/pre.sh", "timeout": 30}]}
+    ]
   },
   "agents": ["agents/*.md"],
   "commands": ["commands/**/*.md"],
   "skills": "./skills/",
-  "mcpServers": "./.mcp.json"
+  "mcpServers": "./.mcp.json",
+  "userConfig": {
+    "apiKey": {"title": "API Key", "type": "string", "required": true, "sensitive": true}
+  }
 }"#,
         );
+        write_file(
+            &root.join("skills").join("demo").join("SKILL.md"),
+            "# demo\n",
+        );
+        write_file(
+            &root.join("agents").join("reviewer.md"),
+            "---\nname: reviewer\n---\n",
+        );
+        write_file(&root.join("commands").join("hello.md"), "# hello\n");
+        write_file(
+            &root.join(".mcp.json"),
+            r#"{
+  "mcpServers": {
+    "local": {"command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/server.js"]},
+    "remote": {"type": "http", "url": "https://example.com/mcp", "headers": {"Authorization": "Bearer token"}, "timeout": 12},
+    "legacy": {"type": "sse", "url": "https://example.com/sse"},
+    "socket": {"transport": "ws", "url": "wss://example.com/ws", "headers": {"X-Token": "${CLAW_TEST_MCP_TOKEN}"}}
+  }
+}"#,
+        );
+        std::env::set_var("CLAW_TEST_MCP_TOKEN", "from-env");
 
-        let error = load_plugin_from_directory(&root)
-            .expect_err("Claude Code plugin manifest should fail with guidance");
-        let rendered = error.to_string();
-        assert!(rendered.contains("field `skills` uses the Claude Code plugin contract"));
-        assert!(rendered.contains("field `mcpServers` uses the Claude Code plugin contract"));
-        assert!(rendered.contains("field `agents` uses the Claude Code plugin contract"));
-        assert!(rendered.contains("field `commands` uses Claude Code-style directory globs"));
-        assert!(rendered.contains("hook `SessionStart` uses the Claude Code lifecycle contract"));
+        let manifest =
+            load_plugin_from_directory(&root).expect("Claude Code manifest should normalize");
+
+        assert_eq!(
+            manifest.components.skill_paths,
+            vec![root.join("skills")],
+            "技能根应直接指向包含 <skill>/SKILL.md 的目录"
+        );
+        assert_eq!(manifest.components.agent_paths, vec![root.join("agents")]);
+        assert_eq!(
+            manifest.components.command_paths,
+            vec![root.join("commands").join("hello.md")]
+        );
+
+        let pretool = manifest
+            .components
+            .hooks
+            .iter()
+            .find(|hook| hook.event == "PreToolUse")
+            .expect("PreToolUse 应被归一化");
+        assert_eq!(pretool.matcher.as_deref(), Some("Bash"));
+        assert_eq!(pretool.command, "hooks/pre.sh");
+        assert_eq!(pretool.timeout_ms, Some(30_000));
+        assert_eq!(
+            manifest.lifecycle.init,
+            vec!["hooks/session-start.sh".to_string()]
+        );
+
+        assert_eq!(manifest.components.mcp_servers.len(), 4);
+        let local = manifest
+            .components
+            .mcp_servers
+            .iter()
+            .find(|server| server.name == "local")
+            .expect("stdio server");
+        assert_eq!(local.transport, "stdio");
+        assert_eq!(local.command.as_deref(), Some("node"));
+        let remote = manifest
+            .components
+            .mcp_servers
+            .iter()
+            .find(|server| server.name == "remote")
+            .expect("http server");
+        assert_eq!(remote.transport, "http");
+        assert_eq!(remote.url.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(
+            remote.headers.get("Authorization").map(String::as_str),
+            Some("Bearer token")
+        );
+        assert_eq!(remote.timeout_ms, Some(12_000));
+
+        let legacy = manifest
+            .components
+            .mcp_servers
+            .iter()
+            .find(|server| server.name == "legacy")
+            .expect("sse server");
+        assert_eq!(legacy.transport, "sse");
+        assert_eq!(legacy.url.as_deref(), Some("https://example.com/sse"));
+
+        let socket = manifest
+            .components
+            .mcp_servers
+            .iter()
+            .find(|server| server.name == "socket")
+            .expect("ws server");
+        assert_eq!(socket.transport, "ws");
+        assert_eq!(socket.url.as_deref(), Some("wss://example.com/ws"));
+        assert_eq!(
+            socket.headers.get("X-Token").map(String::as_str),
+            Some("from-env"),
+            "headers 中的 ${{VAR}} 应从环境变量展开"
+        );
+        std::env::remove_var("CLAW_TEST_MCP_TOKEN");
+
+        let config = manifest
+            .components
+            .user_config
+            .iter()
+            .find(|field| field.name == "apiKey")
+            .expect("userConfig 应被归一化");
+        assert!(config.required);
+        assert!(config.sensitive);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2959,15 +3995,10 @@ mod tests {
             load_plugin_from_directory(&root).expect_err("multiple manifest errors should fail");
         match error {
             PluginError::ManifestValidation(errors) => {
-                assert!(errors.len() >= 4);
+                assert!(errors.len() >= 3);
                 assert!(errors.iter().any(|error| matches!(
                     error,
                     PluginManifestValidationError::EmptyField { field } if *field == "name"
-                )));
-                assert!(errors.iter().any(|error| matches!(
-                    error,
-                    PluginManifestValidationError::EmptyField { field }
-                    if *field == "description"
                 )));
                 assert!(errors.iter().any(|error| matches!(
                     error,
@@ -3134,6 +4165,9 @@ mod tests {
                 },
                 installed_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
+                checksum: None,
+                git_ref: None,
+                subdir: None,
             },
         );
         manager.store_registry(&registry).expect("store registry");
@@ -3195,6 +4229,9 @@ mod tests {
                 },
                 installed_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
+                checksum: None,
+                git_ref: None,
+                subdir: None,
             },
         );
         manager.store_registry(&registry).expect("store registry");
@@ -3242,6 +4279,9 @@ mod tests {
                 },
                 installed_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
+                checksum: None,
+                git_ref: None,
+                subdir: None,
             },
         );
         manager.store_registry(&registry).expect("store registry");
