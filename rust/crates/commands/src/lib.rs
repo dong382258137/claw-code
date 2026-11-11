@@ -6,6 +6,11 @@ use std::path::{Path, PathBuf};
 
 /// 插件 `commands/*.md`：发现、解析与渲染（与 skills/agents/MCP 共用启用判定）。
 pub mod plugin_commands;
+/// 插件市场：Claude `marketplace.json` 归一化、来源管理与安装。
+///
+/// 安装仍复用 `plugins` crate 的 `install_request`；本模块只负责把公开索引
+/// 变成带完整性锚点的安装请求，并复用 `PluginManager` 的启停/卸载语义。
+pub mod plugin_market;
 /// 技能市场：来源、原子安装/卸载与安装注册表。
 ///
 /// 放在 `commands` 而不是 CLI crate，是为了让 `/skills install` 与 WebUI

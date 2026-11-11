@@ -16,6 +16,8 @@ serde_json.workspace = true
 # 技能市场：索引条目可选 sha256 树摘要校验 + 暂存目录唯一命名。
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
+# 插件市场：拉取公开 marketplace.json（阻塞调用，带环境代理）。
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
 
 [dev-dependencies]
 tempfile = "3"

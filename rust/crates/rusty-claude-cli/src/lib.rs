@@ -27,6 +27,7 @@ pub mod ultraplan;
 pub mod upgrade_helper;
 pub mod voice;
 
+pub use commands::plugin_market;
 /// 技能市场已下沉到 `commands`（CLI `/skills install` 与 WebUI 共用同一条
 /// 原子安装流水线），此处重导出以保持 `crate::skill_market` 路径稳定。
 pub use commands::skill_market;

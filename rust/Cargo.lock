@@ -722,6 +722,7 @@ name = "commands"
 version = "2026.11.10"
 dependencies = [
  "plugins",
+ "reqwest 0.12.28",
  "runtime",
  "serde",
  "serde_json",

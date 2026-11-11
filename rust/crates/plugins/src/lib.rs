@@ -1964,13 +1964,20 @@ fn build_plugin_manifest(
             lifecycle.shutdown.extend(parsed.lifecycle.shutdown);
         }
     }
-    let mcp_servers = parse_mcp_servers(root, raw.mcp_servers.as_ref());
+    // Claude 插件既可以在 plugin.json 里显式引用 `.mcp.json`，也可以把
+    // `.mcp.json` 直接放在插件根目录；两种写法都要能读到。
+    let mcp_value = raw.mcp_servers.clone().or_else(|| {
+        root.join(".mcp.json")
+            .is_file()
+            .then(|| Value::String(".mcp.json".to_string()))
+    });
+    let mcp_servers = parse_mcp_servers(root, mcp_value.as_ref());
     let user_config = parse_user_config(raw.user_config.as_ref());
     let mut unsupported: Vec<String> = hook_unsupported
         .into_iter()
         .map(|event| format!("hook 事件 `{event}` 在 claw 中没有对应机制，已跳过"))
         .collect();
-    if raw.mcp_servers.is_some()
+    if mcp_value.is_some()
         && mcp_servers
             .iter()
             .any(|server| !matches!(server.transport.as_str(), "stdio" | "sse" | "http" | "ws"))
@@ -2420,6 +2427,11 @@ fn parse_mcp_servers(root: &Path, value: Option<&Value>) -> Vec<PluginMcpServerS
                     "stdio".to_string()
                 }
             });
+        // Claude 把 streamable HTTP 也叫 `url`；统一映射到 claw 的 `http`。
+        let transport = match transport.as_str() {
+            "url" | "streamable-http" => "http".to_string(),
+            _ => transport,
+        };
         let command = config
             .get("command")
             .and_then(Value::as_str)
@@ -3092,7 +3104,9 @@ fn is_pinned_git_commit(reference: &str) -> bool {
 }
 
 /// 对插件目录做确定性 sha256：按相对路径排序，逐个写入路径、长度与内容。
-fn compute_plugin_tree_sha256(root: &Path) -> Result<String, PluginError> {
+///
+/// 市场层用它为「仓库内相对路径」条目补齐内容摘要，作为安装的完整性锚点。
+pub fn compute_plugin_tree_sha256(root: &Path) -> Result<String, PluginError> {
     use sha2::{Digest, Sha256};
 
     let mut files = Vec::new();
@@ -3790,6 +3804,28 @@ mod tests {
             .expect("userConfig 应被归一化");
         assert!(config.required);
         assert!(config.sensitive);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_plugin_from_directory_auto_discovers_root_mcp_json() {
+        let root = temp_dir("manifest-root-mcp-json");
+        write_file(
+            root.join(MANIFEST_FILE_NAME).as_path(),
+            r#"{"name": "auto-mcp", "version": "1.0.0"}"#,
+        );
+        write_file(
+            &root.join(".mcp.json"),
+            r#"{"mcpServers": {"remote": {"type": "url", "url": "https://example.com/mcp"}}}"#,
+        );
+
+        let manifest = load_plugin_from_directory(&root).expect("根目录 .mcp.json 应被自动读取");
+        assert_eq!(manifest.components.mcp_servers.len(), 1);
+        assert_eq!(
+            manifest.components.mcp_servers[0].transport, "http",
+            "Claude 的 type=url 应映射为 streamable HTTP"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

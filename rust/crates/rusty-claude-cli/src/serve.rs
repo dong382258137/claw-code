@@ -66,6 +66,10 @@ struct AppState {
     skill_install_locks: Arc<Mutex<BTreeSet<String>>>,
     /// `installed.json` 读改写串行化，避免不同技能并发安装丢更新。
     skill_registry_lock: Arc<Mutex<()>>,
+    /// 插件市场：来源、索引缓存与 git 镜像根。
+    plugin_market: crate::plugin_market::PluginMarketPaths,
+    /// 同名插件安装/卸载互斥（并发同名返回 409）。
+    plugin_install_locks: Arc<Mutex<BTreeSet<String>>>,
 }
 
 #[derive(Clone)]
@@ -585,6 +589,11 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // LISTEN 句柄，新进程就永远 bind 不上。这里显式清掉继承标志。
         make_listener_non_inheritable(&listener);
         let scheduler = Arc::new(Scheduler::new(ConcurrencyConfig::from_env()));
+        let plugin_market = crate::plugin_market::PluginMarketPaths::discover();
+        // 首次启动写入内置公开源；失败只记录，不影响服务启动。
+        if let Err(error) = crate::plugin_market::ensure_default_sources(&plugin_market) {
+            eprintln!("写入插件市场默认来源失败：{error}");
+        }
         let state = AppState {
             token: token.clone(),
             sessions,
@@ -596,6 +605,8 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             skill_market: crate::skill_market::MarketPaths::discover(),
             skill_install_locks: Arc::new(Mutex::new(BTreeSet::new())),
             skill_registry_lock: Arc::new(Mutex::new(())),
+            plugin_market,
+            plugin_install_locks: Arc::new(Mutex::new(BTreeSet::new())),
         };
         spawn_session_watchdog(state.clone());
         let app = Router::new()
@@ -646,6 +657,28 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 post(api_skill_source_refresh),
             )
             .route("/api/skill-market", get(api_skill_market))
+            .route("/api/plugins", get(api_plugins))
+            .route("/api/plugins/install", post(api_plugin_install))
+            .route(
+                "/api/plugins/{id}",
+                get(api_plugin)
+                    .patch(api_plugin_toggle)
+                    .delete(api_plugin_uninstall),
+            )
+            .route(
+                "/api/plugin-sources",
+                get(api_plugin_sources).post(api_plugin_source_add),
+            )
+            .route(
+                "/api/plugin-sources/{id}",
+                delete(api_plugin_source_delete),
+            )
+            .route(
+                "/api/plugin-sources/{id}/refresh",
+                post(api_plugin_source_refresh),
+            )
+            .route("/api/plugin-market", get(api_plugin_market))
+            .route("/api/plugin-market/detail", get(api_plugin_market_detail))
             .route("/ws/terminal", get(ws_terminal))
             .route("/api/session/{id}/tasks", get(api_tasks))
             .route(
@@ -3429,6 +3462,325 @@ struct SkillSourceBody {
 fn market_error_response(error: crate::skill_market::MarketError) -> Response {
     let status = StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (status, error.message).into_response()
+}
+
+fn plugin_market_error_response(error: crate::plugin_market::MarketError) -> Response {
+    let status = StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let code = match status.as_u16() {
+        400 => "invalid_argument",
+        403 => "untrusted_source",
+        404 => "not_found",
+        409 => "conflict",
+        422 => "not_installable",
+        502 => "source_unavailable",
+        504 => "source_timeout",
+        _ => "internal_error",
+    };
+    let mut response = Json(json!({ "code": code, "message": error.message })).into_response();
+    *response.status_mut() = status;
+    response
+}
+
+fn build_plugin_manager(
+    workspace: &Path,
+) -> Result<plugins::PluginManager, crate::plugin_market::MarketError> {
+    let loader = runtime::ConfigLoader::default_for(workspace);
+    let config = loader.load().map_err(|error| {
+        crate::plugin_market::MarketError::new(500, format!("加载配置失败：{error}"))
+    })?;
+    Ok(commands::plugin_manager_for(
+        workspace,
+        loader.config_home(),
+        &config,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginSourceBody {
+    #[serde(rename = "type")]
+    kind: String,
+    value: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    subdir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginInstallBody {
+    source_id: String,
+    name: String,
+    #[serde(default)]
+    confirm_untrusted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginToggleBody {
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginMarketQuery {
+    source: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginDetailQuery {
+    source: String,
+    name: String,
+}
+
+async fn api_plugins(State(state): State<AppState>, Query(auth): Query<AuthQuery>) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let workspace = state.workspace.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let manager = build_plugin_manager(&workspace)?;
+        crate::plugin_market::installed_plugins(&manager)
+    })
+    .await;
+    match result {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(error)) => plugin_market_error_response(error),
+        Err(join) => blocking_failed(join),
+    }
+}
+
+async fn api_plugin(
+    UrlPath(id): UrlPath<String>,
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let workspace = state.workspace.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let manager = build_plugin_manager(&workspace)?;
+        crate::plugin_market::installed_plugin(&manager, &id)
+    })
+    .await;
+    match result {
+        Ok(Ok(plugin)) => Json(plugin).into_response(),
+        Ok(Err(error)) => plugin_market_error_response(error),
+        Err(join) => blocking_failed(join),
+    }
+}
+
+async fn api_plugin_install(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<PluginInstallBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "插件名不能为空").into_response();
+    }
+    let lock_key = format!("plugin:{name}");
+    let _lock = match crate::skill_market::NameLock::acquire(
+        &state.plugin_install_locks,
+        &lock_key,
+        &format!("插件 {name} 正在安装，请稍候"),
+    ) {
+        Ok(lock) => lock,
+        Err(error) => return plugin_market_error_response(error),
+    };
+    let paths = state.plugin_market.clone();
+    let workspace = state.workspace.clone();
+    let source_id = body.source_id;
+    let confirm_untrusted = body.confirm_untrusted;
+    let install_name = name;
+    let result = tokio::task::spawn_blocking(move || {
+        let mut manager = build_plugin_manager(&workspace)?;
+        crate::plugin_market::install_plugin(
+            &paths,
+            &mut manager,
+            &source_id,
+            &install_name,
+            confirm_untrusted,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(report)) => (StatusCode::CREATED, Json(report)).into_response(),
+        Ok(Err(error)) => plugin_market_error_response(error),
+        Err(join) => blocking_failed(join),
+    }
+}
+
+async fn api_plugin_toggle(
+    UrlPath(id): UrlPath<String>,
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<PluginToggleBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let workspace = state.workspace.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut manager = build_plugin_manager(&workspace)?;
+        let enabled = crate::plugin_market::set_enabled(&mut manager, &id, body.enabled)?;
+        Ok::<_, crate::plugin_market::MarketError>(json!({ "id": id, "enabled": enabled }))
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => plugin_market_error_response(error),
+        Err(join) => blocking_failed(join),
+    }
+}
+
+async fn api_plugin_uninstall(
+    UrlPath(id): UrlPath<String>,
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let lock_key = format!("plugin:{id}");
+    let _lock = match crate::skill_market::NameLock::acquire(
+        &state.plugin_install_locks,
+        &lock_key,
+        &format!("插件 {id} 正在卸载，请稍候"),
+    ) {
+        Ok(lock) => lock,
+        Err(error) => return plugin_market_error_response(error),
+    };
+    let workspace = state.workspace.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut manager = build_plugin_manager(&workspace)?;
+        crate::plugin_market::uninstall_plugin(&mut manager, &id)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(error)) => plugin_market_error_response(error),
+        Err(join) => blocking_failed(join),
+    }
+}
+
+async fn api_plugin_sources(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    Json(json!({
+        "sources": crate::plugin_market::list_sources(&state.plugin_market),
+    }))
+    .into_response()
+}
+
+async fn api_plugin_source_add(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<PluginSourceBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let paths = state.plugin_market.clone();
+    let PluginSourceBody {
+        kind,
+        value,
+        name,
+        subdir,
+    } = body;
+    let result = tokio::task::spawn_blocking(move || {
+        crate::plugin_market::add_source(&paths, &kind, &value, name.as_deref(), subdir.as_deref())
+    })
+    .await;
+    match result {
+        Ok(Ok(source)) => (StatusCode::CREATED, Json(source)).into_response(),
+        Ok(Err(error)) => plugin_market_error_response(error),
+        Err(join) => blocking_failed(join),
+    }
+}
+
+async fn api_plugin_source_delete(
+    UrlPath(id): UrlPath<String>,
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    match crate::plugin_market::delete_source(&state.plugin_market, &id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => plugin_market_error_response(error),
+    }
+}
+
+async fn api_plugin_source_refresh(
+    UrlPath(id): UrlPath<String>,
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let paths = state.plugin_market.clone();
+    let result =
+        tokio::task::spawn_blocking(move || crate::plugin_market::refresh_source(&paths, &id))
+            .await;
+    match result {
+        Ok(Ok(source)) => Json(source).into_response(),
+        Ok(Err(error)) => plugin_market_error_response(error),
+        Err(join) => blocking_failed(join),
+    }
+}
+
+async fn api_plugin_market(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    Query(query): Query<PluginMarketQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let paths = state.plugin_market.clone();
+    let workspace = state.workspace.clone();
+    let source_id = query.source;
+    let result = tokio::task::spawn_blocking(move || {
+        let manager = build_plugin_manager(&workspace)?;
+        crate::plugin_market::market_index(&paths, Some(&manager), &source_id)
+    })
+    .await;
+    match result {
+        Ok(Ok(index)) => Json(index).into_response(),
+        Ok(Err(error)) => plugin_market_error_response(error),
+        Err(join) => blocking_failed(join),
+    }
+}
+
+async fn api_plugin_market_detail(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    Query(query): Query<PluginDetailQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let paths = state.plugin_market.clone();
+    let workspace = state.workspace.clone();
+    let PluginDetailQuery { source, name } = query;
+    let result = tokio::task::spawn_blocking(move || {
+        let manager = build_plugin_manager(&workspace)?;
+        crate::plugin_market::plugin_detail(&paths, Some(&manager), &source, &name)
+    })
+    .await;
+    match result {
+        Ok(Ok(detail)) => Json(detail).into_response(),
+        Ok(Err(error)) => plugin_market_error_response(error),
+        Err(join) => blocking_failed(join),
+    }
 }
 
 fn blocking_failed(join: tokio::task::JoinError) -> Response {
