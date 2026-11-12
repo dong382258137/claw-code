@@ -9,6 +9,20 @@ const STATUS_LABELS = {
   git_not_found: '未找到 git',
   clone_failed: '拉取失败',
   timeout: '超时',
+  http_error: '索引下载失败',
+}
+
+const KIND_LABELS = {
+  local: '本地',
+  git: 'git',
+  http: 'HTTP 索引',
+}
+
+const FORMAT_LABELS = {
+  native: '自家索引',
+  claude: 'Claude marketplace',
+  scan: '扫描仓库',
+  http: '远程索引',
 }
 
 // 后端时间戳是 unix 毫秒；缺失时返回空串，由调用方决定文案。
@@ -22,12 +36,13 @@ function formatTime(value) {
 // 来源市场：本地/远程索引来源的增删查，以及选中来源的安装列表。
 export function SkillSources() {
   const [sources, setSources] = useState([])
+  const [recommended, setRecommended] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [selected, setSelected] = useState('')
   const [form, setForm] = useState({ type: 'local', value: '', name: '', subdir: '' })
-  const [adding, setAdding] = useState(false)
+  const [adding, setAdding] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -35,6 +50,7 @@ export function SkillSources() {
     try {
       const payload = await api('/api/skill-sources')
       setSources(payload.sources || [])
+      setRecommended(payload.recommended || [])
     } catch (err) {
       setError(err.message || String(err))
     } finally {
@@ -46,32 +62,53 @@ export function SkillSources() {
     load()
   }, [load])
 
-  const addSource = async (event) => {
-    event.preventDefault()
-    setAdding(true)
+  // 推荐源与手填表单共用一条添加路径：后端返回的 status 决定提示文案。
+  const createSource = async (payload) => {
     setError('')
     setNotice('')
     try {
-      const created = await postJson('/api/skill-sources', {
-        type: form.type,
-        value: form.value,
-        name: form.name.trim() || null,
-        subdir: form.type === 'git' ? form.subdir.trim() || null : null,
-      })
+      const created = await postJson('/api/skill-sources', payload)
       setNotice(
         created.status === 'ok'
           ? `已添加来源 ${created.name || created.id}`
           : `来源已添加，但拉取失败：${created.last_error || created.status}`,
       )
       setSelected(created.id)
-      setForm({ type: 'local', value: '', name: '', subdir: '' })
       await load()
+      return true
     } catch (err) {
       setError(err.message || String(err))
-    } finally {
-      setAdding(false)
+      return false
     }
   }
+
+  const addSource = async (event) => {
+    event.preventDefault()
+    setAdding('form')
+    const ok = await createSource({
+      type: form.type,
+      value: form.value,
+      name: form.name.trim() || null,
+      subdir: form.type === 'git' ? form.subdir.trim() || null : null,
+    })
+    if (ok) setForm({ type: 'local', value: '', name: '', subdir: '' })
+    setAdding('')
+  }
+
+  const addRecommended = async (item) => {
+    setAdding(item.id)
+    await createSource({ type: item.kind, value: item.value, name: item.name || null })
+    setAdding('')
+  }
+
+  // git 源常带/不带 .git 后缀，比较时统一去掉尾部和大小写差异。
+  const normalizeValue = (value) => String(value || '').trim().replace(/\.git$/i, '').replace(/\/+$/, '')
+  // 接口里来源类型字段名是 type（与插件来源保持一致），推荐源用的是 kind。
+  const isAdded = (item) =>
+    sources.some(
+      (source) =>
+        source.type === item.kind && normalizeValue(source.value) === normalizeValue(item.value),
+    )
 
   const refresh = async (id) => {
     setError('')
@@ -103,6 +140,42 @@ export function SkillSources() {
 
   return (
     <div className="skill-sources">
+      {recommended.length ? (
+        <div className="skill-recommend">
+          <div className="skill-recommend-head">
+            <h3>推荐来源</h3>
+            <span className="chip">{recommended.length} 个</span>
+          </div>
+          <div className="skill-recommend-list">
+            {recommended.map((item) => {
+              const added = isAdded(item)
+              return (
+                <div key={item.id} className="skill-recommend-card">
+                  <div className="skill-item-top">
+                    <span className="skill-name">{item.name || item.id}</span>
+                    <span className="skill-source-status">{KIND_LABELS[item.kind] || item.kind}</span>
+                  </div>
+                  <div className="skill-desc">{item.description || item.value}</div>
+                  <div className="skill-source-meta">
+                    <span className="skill-recommend-value">{item.value}</span>
+                  </div>
+                  <div className="skill-source-actions">
+                    <button
+                      type="button"
+                      className="skill-refresh"
+                      disabled={added || adding === item.id}
+                      onClick={() => addRecommended(item)}
+                    >
+                      {added ? '已添加' : adding === item.id ? '添加中…' : '一键添加'}
+                    </button>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      ) : null}
+
       <form className="skill-source-form" onSubmit={addSource}>
         <select
           value={form.type}
@@ -110,14 +183,17 @@ export function SkillSources() {
         >
           <option value="local">本地目录 / marketplace.json</option>
           <option value="git">git 仓库（clone 到本地镜像）</option>
+          <option value="http">HTTP JSON 索引（自动缓存，断网回退）</option>
         </select>
         <input
           value={form.value}
           onChange={(event) => setForm((prev) => ({ ...prev, value: event.target.value }))}
           placeholder={
-            form.type === 'git'
-              ? 'https://example.com/skills.git'
-              : 'D:\\tmp\\market 或 ...\\marketplace.json'
+            form.type === 'http'
+              ? 'https://raw.githubusercontent.com/<owner>/<repo>/main/.claude-plugin/marketplace.json'
+              : form.type === 'git'
+                ? 'https://example.com/skills.git'
+                : 'D:\\tmp\\market 或 ...\\marketplace.json'
           }
           required
         />
@@ -133,8 +209,8 @@ export function SkillSources() {
           onChange={(event) => setForm((prev) => ({ ...prev, name: event.target.value }))}
           placeholder="来源名称（可选）"
         />
-        <button type="submit" className="skill-refresh" disabled={adding}>
-          {adding ? '添加中…' : '添加来源'}
+        <button type="submit" className="skill-refresh" disabled={Boolean(adding)}>
+          {adding === 'form' ? '添加中…' : '添加来源'}
         </button>
       </form>
 
@@ -148,7 +224,10 @@ export function SkillSources() {
 
       {loading ? <div className="skill-list-empty">加载中…</div> : null}
       {!loading && sources.length === 0 ? (
-        <div className="skill-list-empty">还没有来源。添加一个包含 marketplace.json 的本地目录。</div>
+        <div className="skill-list-empty">
+          还没有来源。可以一键添加上方推荐来源，或手动填写包含 marketplace.json 的本地目录、git
+          仓库、HTTP 索引地址。
+        </div>
       ) : null}
 
       <div className="skill-source-list">
@@ -160,15 +239,28 @@ export function SkillSources() {
           >
             <div className="skill-item-top">
               <span className="skill-name">{source.name || source.id}</span>
+              {source.builtin ? <span className="skill-source-status">内置</span> : null}
+              {source.index_format ? (
+                <span className="skill-source-status">
+                  {FORMAT_LABELS[source.index_format] || source.index_format}
+                </span>
+              ) : null}
               <span className={`skill-source-status ${source.status}`}>
                 {STATUS_LABELS[source.status] || source.status}
               </span>
             </div>
             <div className="skill-desc">{source.value}</div>
             <div className="skill-source-meta">
-              <span>{source.kind === 'git' ? 'git' : '本地'}</span>
+              <span>{KIND_LABELS[source.type] || source.type}</span>
               <span>{source.skill_count} 个技能</span>
               {source.git_ref ? <span>commit {source.git_ref}</span> : null}
+              {source.type === 'http' ? (
+                <span>
+                  {source.cached_at_unix_ms
+                    ? `索引快照：${formatTime(source.cached_at_unix_ms)}`
+                    : '尚无索引快照'}
+                </span>
+              ) : null}
               <span>
                 {source.last_success_at_unix_ms
                   ? `上次成功：${formatTime(source.last_success_at_unix_ms)}`
@@ -196,17 +288,19 @@ export function SkillSources() {
               >
                 刷新
               </span>
-              <span
-                role="button"
-                tabIndex={0}
-                className="skill-link danger"
-                onClick={(event) => {
-                  event.stopPropagation()
-                  remove(source)
-                }}
-              >
-                删除
-              </span>
+              {source.builtin ? null : (
+                <span
+                  role="button"
+                  tabIndex={0}
+                  className="skill-link danger"
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    remove(source)
+                  }}
+                >
+                  删除
+                </span>
+              )}
             </div>
           </div>
         ))}

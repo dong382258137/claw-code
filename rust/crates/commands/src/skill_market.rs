@@ -80,6 +80,8 @@ pub struct MarketPaths {
     pub root: PathBuf,
     /// `<config_home>/skills`：技能发现/安装根。
     pub install_root: PathBuf,
+    /// 首次启动是否写入内置公开源。单测用 `with_roots` 时关闭，避免污染断言。
+    pub seed_defaults: bool,
 }
 
 impl MarketPaths {
@@ -92,12 +94,17 @@ impl MarketPaths {
         Self {
             root: runtime::default_config_home().join("skill-market"),
             install_root: crate::skill_install_root().unwrap_or_default(),
+            seed_defaults: true,
         }
     }
 
     #[must_use]
     pub fn with_roots(root: PathBuf, install_root: PathBuf) -> Self {
-        Self { root, install_root }
+        Self {
+            root,
+            install_root,
+            seed_defaults: false,
+        }
     }
 
     fn installed_path(&self) -> PathBuf {
@@ -126,6 +133,11 @@ impl MarketPaths {
 
     fn trash_dir(&self) -> PathBuf {
         self.root.join("trash")
+    }
+
+    /// HTTP 索引快照：`<skill-market>/index-cache/<source_id>.http.json`。
+    fn http_cache_path(&self, id: &str) -> Option<PathBuf> {
+        index_cache_path(self, id).map(|path| path.with_extension("http.json"))
     }
 }
 
@@ -198,6 +210,9 @@ pub struct SourceRecord {
     /// 最近一次解析成功的时间；失败刷新不会覆盖它，用于「上次成功」提示。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_success_at_unix_ms: Option<u64>,
+    /// 内置来源：首次启动自动写入，允许刷新但不允许删除。
+    #[serde(default)]
+    pub builtin: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +284,22 @@ pub struct SourceView {
     pub git_ref: Option<String>,
     /// 最近一次成功解析的时间；从未成功为 `null`。
     pub last_success_at_unix_ms: Option<u64>,
+    /// 内置公开源：前端展示「内置」并隐藏删除入口。
+    pub builtin: bool,
+    /// HTTP 索引快照时间；非 http 来源为 `null`。
+    pub cached_at_unix_ms: Option<u64>,
+    /// 索引解析形态：`native` / `claude` / `scan` / `http`；解析失败为 `null`。
+    pub index_format: Option<String>,
+}
+
+/// 推荐来源：前端「一键添加」用的静态清单，不读磁盘。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RecommendedSource {
+    pub id: String,
+    pub kind: String,
+    pub value: String,
+    pub name: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,6 +319,9 @@ pub struct MarketSkillView {
     pub reason_detail: Option<String>,
     pub installed: Option<InstalledBrief>,
     pub checksum: Option<String>,
+    /// 来源绑定的完整 commit（git / http-GitHub）；纯远程索引或本地来源为 `null`。
+    #[serde(default)]
+    pub anchor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -300,6 +334,7 @@ pub struct MarketSourceBrief {
     pub last_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_ref: Option<String>,
+    pub index_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -330,6 +365,26 @@ struct ResolvedSource {
     last_error: Option<String>,
     root: Option<PathBuf>,
     index: Option<MarketplaceIndex>,
+    /// 完整性锚：git / http-GitHub 的完整 commit。
+    anchor: Option<String>,
+    /// 索引形态：`native` / `claude` / `scan` / `http`。
+    format: Option<&'static str>,
+    /// HTTP 索引快照时间（仅 http 来源）。
+    fetched_at_unix_ms: Option<u64>,
+}
+
+impl ResolvedSource {
+    fn failed(status: &'static str, error: impl Into<String>) -> Self {
+        Self {
+            status,
+            last_error: Some(error.into()),
+            root: None,
+            index: None,
+            anchor: None,
+            format: None,
+            fetched_at_unix_ms: None,
+        }
+    }
 }
 
 struct AnalyzedEntry {
@@ -403,6 +458,18 @@ pub fn read_installed(paths: &MarketPaths) -> InstalledRegistry {
 
 fn read_sources(paths: &MarketPaths) -> SourcesRegistry {
     let path = paths.sources_path();
+    if !path.exists() {
+        // 首次启动写入内置公开源；写失败（只读目录）不影响只读列表。
+        if paths.seed_defaults {
+            let registry = SourcesRegistry {
+                schema: sources_schema(),
+                sources: default_sources(),
+            };
+            let _ = write_sources(paths, &registry);
+            return registry;
+        }
+        return SourcesRegistry::default();
+    }
     let Ok(text) = fs::read_to_string(&path) else {
         return SourcesRegistry::default();
     };
@@ -419,6 +486,36 @@ fn read_sources(paths: &MarketPaths) -> SourcesRegistry {
             SourcesRegistry::default()
         }
     }
+}
+
+/// 内置公开源：`anthropics/skills` 的 Claude marketplace。
+fn default_sources() -> Vec<SourceRecord> {
+    vec![SourceRecord {
+        id: "anthropics-skills".to_string(),
+        kind: "git".to_string(),
+        value: "https://github.com/anthropics/skills".to_string(),
+        name: Some("Anthropic Agent Skills".to_string()),
+        subdir: None,
+        status: None,
+        last_error: None,
+        checked_at_unix_ms: None,
+        git_ref: None,
+        last_success_at_unix_ms: None,
+        builtin: true,
+    }]
+}
+
+/// 前端「推荐来源」清单（与磁盘上的来源无关，重复添加由前端按 value 去重）。
+#[must_use]
+pub fn recommended_sources() -> Vec<RecommendedSource> {
+    vec![RecommendedSource {
+        id: "anthropics-skills".to_string(),
+        kind: "git".to_string(),
+        value: "https://github.com/anthropics/skills".to_string(),
+        name: "Anthropic Agent Skills".to_string(),
+        description: "Anthropic 官方 Agent Skills（xlsx / docx / pptx / pdf 等），通过 Claude marketplace 索引提供。"
+            .to_string(),
+    }]
 }
 
 fn write_installed(paths: &MarketPaths, registry: &InstalledRegistry) -> io::Result<()> {
@@ -560,22 +657,21 @@ fn non_empty(value: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-/// 从一个已确定的索引目录读 `marketplace.json`。
-fn read_index(root: &Path) -> Result<MarketplaceIndex, (String, String)> {
-    let file = root.join("marketplace.json");
-    let text = fs::read_to_string(&file).map_err(|error| {
-        (
-            "unreadable".to_string(),
-            format!("读取 {} 失败：{error}", file.display()),
-        )
-    })?;
-    let index: MarketplaceIndex = serde_json::from_str(&text).map_err(|error| {
+/// 已探测出形态的索引：条目路径必须相对 `path_root` 解析。
+struct LoadedIndex {
+    index: MarketplaceIndex,
+    format: &'static str,
+    path_root: PathBuf,
+}
+
+/// 自家索引：schema 缺失按 v1 处理（§3.4 降级矩阵），存在但不匹配则 unsupported。
+fn parse_native_index(text: &str) -> Result<MarketplaceIndex, (String, String)> {
+    let index: MarketplaceIndex = serde_json::from_str(text).map_err(|error| {
         (
             "unreadable".to_string(),
             format!("marketplace.json 解析失败：{error}"),
         )
     })?;
-    // schema 缺失按 v1 处理（§3.4 降级矩阵）；存在但不匹配则标记 unsupported。
     if let Some(schema) = index.schema.as_deref() {
         if schema != MARKET_SCHEMA {
             return Err((
@@ -587,8 +683,204 @@ fn read_index(root: &Path) -> Result<MarketplaceIndex, (String, String)> {
     Ok(index)
 }
 
-/// 解析本地来源：返回 marketplace.json 所在目录（canonical）与索引。
-fn load_local_index(value: &str) -> Result<(PathBuf, MarketplaceIndex), (String, String)> {
+/// Claude marketplace 与自家索引同在一个文件名下，用 `plugins` 数组区分。
+fn is_claude_marketplace(value: &Value) -> bool {
+    value.get("plugins").is_some_and(Value::is_array)
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ClaudeMarketplace {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    metadata: Option<ClaudeMetadata>,
+    #[serde(default)]
+    plugins: Vec<ClaudePlugin>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ClaudeMetadata {
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ClaudePlugin {
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    skills: Vec<String>,
+}
+
+/// `./skills/xlsx` → `skills/xlsx`；空路径或 `.` 返回 `None`。
+fn normalize_claude_skill_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().replace('\\', "/");
+    let trimmed = trimmed.strip_prefix("./").unwrap_or(&trimmed);
+    let trimmed = trimmed.trim_matches('/');
+    (!trimmed.is_empty() && trimmed != ".").then(|| trimmed.to_string())
+}
+
+/// 把 Claude marketplace 展开成条目：`plugins[].skills[]` 一律相对仓库根。
+fn claude_index(value: &Value) -> Result<MarketplaceIndex, (String, String)> {
+    let raw: ClaudeMarketplace = serde_json::from_value(value.clone()).map_err(|error| {
+        (
+            "unreadable".to_string(),
+            format!("Claude marketplace 解析失败：{error}"),
+        )
+    })?;
+    let version = raw
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.version.clone());
+    let mut skills = Vec::new();
+    for plugin in &raw.plugins {
+        for declared in &plugin.skills {
+            let Some(path) = normalize_claude_skill_path(declared) else {
+                continue;
+            };
+            let name = path.rsplit('/').next().unwrap_or_default().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            skills.push(MarketplaceEntry {
+                name: Some(name),
+                version: version.clone(),
+                description: plugin.description.clone(),
+                path: Some(path),
+                sha256: None,
+                tags: Vec::new(),
+                min_claw_version: None,
+            });
+        }
+    }
+    Ok(MarketplaceIndex {
+        schema: Some(MARKET_SCHEMA.to_string()),
+        name: raw.name,
+        description: raw.description.or_else(|| {
+            raw.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.description.clone())
+        }),
+        updated_at: None,
+        skills,
+    })
+}
+
+fn parse_claude_index(value: &Value, repo_root: &Path) -> Result<LoadedIndex, (String, String)> {
+    let root = fs::canonicalize(repo_root)
+        .map_err(|error| ("unreadable".to_string(), format!("仓库根不可读：{error}")))?;
+    Ok(LoadedIndex {
+        index: claude_index(value)?,
+        format: "claude",
+        path_root: root,
+    })
+}
+
+/// 没有索引文件时扫描 `<repo>/skills/<name>/SKILL.md`（只扫这一层）。
+fn scan_repo_skills(repo_root: &Path) -> Result<LoadedIndex, (String, String)> {
+    let mut entries = Vec::new();
+    if let Ok(read) = fs::read_dir(repo_root.join("skills")) {
+        for entry in read.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let prompt = path.join("SKILL.md");
+            if !prompt.is_file() {
+                continue;
+            }
+            let Some(name) = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+            else {
+                continue;
+            };
+            let description = fs::read_to_string(&prompt)
+                .ok()
+                .and_then(|text| crate::parse_skill_frontmatter(&text).1);
+            entries.push(MarketplaceEntry {
+                name: Some(name.clone()),
+                version: None,
+                description,
+                path: Some(format!("skills/{name}")),
+                sha256: None,
+                tags: Vec::new(),
+                min_claw_version: None,
+            });
+        }
+    }
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    if entries.is_empty() {
+        return Err((
+            "unreadable".to_string(),
+            "未找到 marketplace.json，也没有 skills/<name>/SKILL.md".to_string(),
+        ));
+    }
+    let root = fs::canonicalize(repo_root)
+        .map_err(|error| ("unreadable".to_string(), format!("仓库根不可读：{error}")))?;
+    Ok(LoadedIndex {
+        index: MarketplaceIndex {
+            schema: Some(MARKET_SCHEMA.to_string()),
+            name: None,
+            description: None,
+            updated_at: None,
+            skills: entries,
+        },
+        format: "scan",
+        path_root: root,
+    })
+}
+
+fn read_json_value(file: &Path) -> Result<Value, (String, String)> {
+    let text = fs::read_to_string(file).map_err(|error| {
+        (
+            "unreadable".to_string(),
+            format!("读取 {} 失败：{error}", file.display()),
+        )
+    })?;
+    serde_json::from_str(&text).map_err(|error| {
+        (
+            "unreadable".to_string(),
+            format!("{} 解析失败：{error}", file.display()),
+        )
+    })
+}
+
+/// 按 native → Claude → 扫描的顺序探测索引。
+///
+/// `native_dir` 是 `marketplace.json` 的查找目录（git 的 `subdir`），
+/// `repo_root` 是 Claude/扫描适配器的路径根；两者在无 subdir 时相同。
+fn load_index_at(native_dir: &Path, repo_root: &Path) -> Result<LoadedIndex, (String, String)> {
+    let native_file = native_dir.join("marketplace.json");
+    if native_file.is_file() {
+        let value = read_json_value(&native_file)?;
+        if is_claude_marketplace(&value) {
+            return parse_claude_index(&value, repo_root);
+        }
+        let text = serde_json::to_string(&value)
+            .map_err(|error| ("unreadable".to_string(), format!("索引序列化失败：{error}")))?;
+        let root = fs::canonicalize(native_dir)
+            .map_err(|error| ("unreadable".to_string(), format!("索引目录不可读：{error}")))?;
+        return Ok(LoadedIndex {
+            index: parse_native_index(&text)?,
+            format: "native",
+            path_root: root,
+        });
+    }
+    let claude_file = repo_root.join(".claude-plugin").join("marketplace.json");
+    if claude_file.is_file() {
+        let value = read_json_value(&claude_file)?;
+        return parse_claude_index(&value, repo_root);
+    }
+    scan_repo_skills(repo_root)
+}
+
+/// 解析本地来源：`marketplace.json` 所在目录即 native 根，也是 Claude/扫描的仓库根。
+fn load_local_index(value: &str) -> Result<LoadedIndex, (String, String)> {
     let raw = PathBuf::from(value);
     let canonical = fs::canonicalize(&raw).map_err(|error| {
         (
@@ -604,8 +896,7 @@ fn load_local_index(value: &str) -> Result<(PathBuf, MarketplaceIndex), (String,
             .map(Path::to_path_buf)
             .unwrap_or_else(|| canonical.clone())
     };
-    let index = read_index(&root)?;
-    Ok((root, index))
+    load_index_at(&root, &root)
 }
 
 /// git 来源的索引目录：镜像根 + 可选 `subdir`，canonical 后必须仍在镜像内。
@@ -624,78 +915,136 @@ fn git_index_root(mirror: &Path, subdir: Option<&str>) -> Result<PathBuf, String
     Ok(candidate)
 }
 
-/// 解析来源状态。git 只读本地镜像，不在这里发起网络请求。
+fn load_mirror_index(mirror: &Path, subdir: Option<&str>) -> Result<LoadedIndex, (String, String)> {
+    let root = git_index_root(mirror, subdir).map_err(|error| ("unreadable".to_string(), error))?;
+    load_index_at(&root, mirror)
+}
+
+fn index_error_status(status: &str) -> &'static str {
+    if status == "unsupported" {
+        "unsupported"
+    } else {
+        "unreadable"
+    }
+}
+
+/// 解析来源状态。git / http 只读本地镜像与快照，不在这里发起网络请求。
 fn resolve_source(paths: &MarketPaths, record: &SourceRecord) -> ResolvedSource {
     match record.kind.as_str() {
         "local" => match load_local_index(&record.value) {
-            Ok((root, index)) => ResolvedSource {
+            Ok(loaded) => ResolvedSource {
                 status: "ok",
                 last_error: None,
-                root: Some(root),
-                index: Some(index),
+                root: Some(loaded.path_root),
+                index: Some(loaded.index),
+                anchor: None,
+                format: Some(loaded.format),
+                fetched_at_unix_ms: None,
             },
-            Err((status, error)) => ResolvedSource {
-                status: if status == "unsupported" {
-                    "unsupported"
-                } else {
-                    "unreadable"
-                },
-                last_error: Some(error),
-                root: None,
-                index: None,
-            },
+            Err((status, error)) => ResolvedSource::failed(index_error_status(&status), error),
         },
         "git" => {
             let mirror = paths.mirror_dir().join(&record.id);
             if !mirror.is_dir() {
-                return ResolvedSource {
-                    status: "clone_failed",
-                    last_error: Some("尚未拉取仓库，请刷新来源".to_string()),
-                    root: None,
-                    index: None,
-                };
+                return ResolvedSource::failed("clone_failed", "尚未拉取仓库，请刷新来源");
             }
-            let root = match git_index_root(&mirror, record.subdir.as_deref()) {
-                Ok(root) => root,
-                Err(error) => {
-                    return ResolvedSource {
-                        status: "unreadable",
-                        last_error: Some(error),
-                        root: None,
-                        index: None,
-                    }
+            let loaded = match load_mirror_index(&mirror, record.subdir.as_deref()) {
+                Ok(loaded) => loaded,
+                Err((status, error)) => {
+                    return ResolvedSource::failed(index_error_status(&status), error)
                 }
             };
-            match read_index(&root) {
-                Ok(index) => ResolvedSource {
-                    status: "ok",
-                    last_error: None,
-                    root: Some(root),
-                    index: Some(index),
-                },
-                Err((status, error)) => ResolvedSource {
-                    status: if status == "unsupported" {
-                        "unsupported"
-                    } else {
-                        "unreadable"
-                    },
-                    last_error: Some(error),
-                    root: None,
-                    index: None,
-                },
+            ResolvedSource {
+                status: "ok",
+                last_error: None,
+                root: Some(loaded.path_root),
+                index: Some(loaded.index),
+                anchor: git_full_ref(&mirror),
+                format: Some(loaded.format),
+                fetched_at_unix_ms: None,
             }
         }
-        other => ResolvedSource {
-            status: "unreadable",
-            last_error: Some(format!("未知来源类型：{other}")),
+        "http" => resolve_http_source(paths, record),
+        other => ResolvedSource::failed("unreadable", format!("未知来源类型：{other}")),
+    }
+}
+
+/// http 来源：GitHub 形态读镜像（与 commit 绑定），其余读原始响应快照。
+fn resolve_http_source(paths: &MarketPaths, record: &SourceRecord) -> ResolvedSource {
+    let cache = paths
+        .http_cache_path(&record.id)
+        .as_deref()
+        .and_then(read_http_cache);
+    let fetched_at = cache.as_ref().map(|cache| cache.fetched_at_unix_ms);
+    if let Some(github) = parse_github_index_url(&record.value) {
+        let mirror = paths.mirror_dir().join(&record.id);
+        if !mirror.is_dir() {
+            return ResolvedSource {
+                fetched_at_unix_ms: fetched_at,
+                ..ResolvedSource::failed("clone_failed", "尚未拉取仓库，请刷新来源")
+            };
+        }
+        let loaded = match load_mirror_index(&mirror, Some(&github.subdir)) {
+            Ok(loaded) => loaded,
+            Err((status, error)) => {
+                return ResolvedSource {
+                    fetched_at_unix_ms: fetched_at,
+                    ..ResolvedSource::failed(index_error_status(&status), error)
+                }
+            }
+        };
+        return ResolvedSource {
+            status: "ok",
+            last_error: None,
+            root: Some(loaded.path_root),
+            index: Some(loaded.index),
+            anchor: git_full_ref(&mirror),
+            format: Some(loaded.format),
+            fetched_at_unix_ms: fetched_at,
+        };
+    }
+    let Some(cache) = cache else {
+        return ResolvedSource::failed("unreadable", "尚未拉取远程索引，请刷新来源");
+    };
+    match parse_remote_index(&cache.body) {
+        Ok(index) => ResolvedSource {
+            status: "ok",
+            last_error: None,
             root: None,
-            index: None,
+            index: Some(index),
+            anchor: None,
+            format: Some("http"),
+            fetched_at_unix_ms: Some(cache.fetched_at_unix_ms),
+        },
+        Err((_, error)) => ResolvedSource {
+            fetched_at_unix_ms: Some(cache.fetched_at_unix_ms),
+            ..ResolvedSource::failed("unreadable", error)
         },
     }
 }
 
-/// 拉取仓库超时上限（路线 §4.3）。
-const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// 纯远程索引：按 JSON 形态在 native / Claude 之间选择，没有本地根可供扫描。
+fn parse_remote_index(body: &str) -> Result<MarketplaceIndex, (String, String)> {
+    let value: Value = serde_json::from_str(body).map_err(|error| {
+        (
+            "unreadable".to_string(),
+            format!("索引 JSON 解析失败：{error}"),
+        )
+    })?;
+    if is_claude_marketplace(&value) {
+        return claude_index(&value);
+    }
+    parse_native_index(body)
+}
+
+/// 拉取仓库超时上限。`anthropics/skills` 首次浅克隆实测 150 秒（本机网络），
+/// 旧的 30 秒会让内置公开源永远拉不下来。
+const GIT_TIMEOUT: Duration = Duration::from_secs(300);
+/// HTTP 索引拉取超时（与插件市场一致）。
+const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+/// HTTP 索引快照 TTL：10 分钟内视为刚拉取，超过即按缓存展示。
+const HTTP_INDEX_TTL_MS: u64 = 600_000;
+const HTTP_CACHE_SCHEMA: &str = "claw.skill-http-cache/v1";
 
 fn git_short_ref(dir: &Path) -> Option<String> {
     let output = Command::new("git")
@@ -713,12 +1062,51 @@ fn git_short_ref(dir: &Path) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// 完整 commit：只有 40 位 hex 才能作为完整性锚。
+fn git_full_ref(dir: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    is_pinned_commit(&value).then_some(value)
+}
+
+fn is_pinned_commit(value: &str) -> bool {
+    value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
 /// `git clone --depth 1`，30 秒硬超时；失败归类为 `git_not_found` / `clone_failed` / `timeout`。
 fn clone_with_timeout(value: &str, dest: &Path) -> Result<(), (&'static str, String)> {
-    let mut child = Command::new("git")
-        .arg("clone")
-        .arg("--depth")
-        .arg("1")
+    run_git_clone(value, None, dest)
+}
+
+/// 指定分支/标签的浅克隆：URL 里写死的 ref 必须和索引内容对齐。
+fn clone_with_timeout_ref(
+    value: &str,
+    reference: &str,
+    dest: &Path,
+) -> Result<(), (&'static str, String)> {
+    run_git_clone(value, Some(reference), dest)
+}
+
+fn run_git_clone(
+    value: &str,
+    reference: Option<&str>,
+    dest: &Path,
+) -> Result<(), (&'static str, String)> {
+    let mut command = Command::new("git");
+    command.arg("clone").arg("--depth").arg("1");
+    if let Some(reference) = reference {
+        command.arg("--branch").arg(reference);
+    }
+    let mut child = command
         .arg("--quiet")
         .arg("--")
         .arg(value)
@@ -764,7 +1152,10 @@ fn clone_with_timeout(value: &str, dest: &Path) -> Result<(), (&'static str, Str
                     let _ = child.wait();
                     return Err((
                         "timeout",
-                        "拉取仓库超时（30 秒），请重试或改用本地来源".to_string(),
+                        format!(
+                            "拉取仓库超时（{} 秒），请重试或改用本地来源",
+                            GIT_TIMEOUT.as_secs()
+                        ),
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -803,23 +1194,197 @@ fn sync_git_mirror(
     Ok(git_ref)
 }
 
-/// git 来源：clone 到镜像并回填 `git_ref`；非 git 直接返回 `Ok(())`。
-fn sync_if_git(
-    paths: &MarketPaths,
-    record: &mut SourceRecord,
-) -> Result<(), (&'static str, String)> {
-    if record.kind != "git" {
-        return Ok(());
+/// HTTP 索引原始响应快照：内容就是拉取时的响应体，不做二次加工。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HttpCache {
+    #[serde(default = "http_cache_schema")]
+    schema: String,
+    url: String,
+    fetched_at_unix_ms: u64,
+    body: String,
+}
+
+fn http_cache_schema() -> String {
+    HTTP_CACHE_SCHEMA.to_string()
+}
+
+fn read_http_cache(path: &Path) -> Option<HttpCache> {
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// GitHub 上索引文件的位置：repo 用来 clone，subdir 是索引文件所在目录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitHubIndexUrl {
+    repo: String,
+    reference: String,
+    subdir: String,
+}
+
+fn strip_github_host<'a>(value: &'a str, host: &str) -> Option<&'a str> {
+    value
+        .strip_prefix(&format!("https://{host}/"))
+        .or_else(|| value.strip_prefix(&format!("http://{host}/")))
+}
+
+/// 识别 `raw.githubusercontent.com` 与 `github.com/{raw,blob}` 三种索引 URL。
+fn parse_github_index_url(value: &str) -> Option<GitHubIndexUrl> {
+    let value = value.trim();
+    if let Some(rest) = strip_github_host(value, "raw.githubusercontent.com") {
+        // owner/repo/ref/rest...
+        return github_index_parts(rest, false);
     }
-    record.git_ref = sync_git_mirror(paths, record)?;
+    let rest = strip_github_host(value, "github.com")?;
+    github_index_parts(rest, true)
+}
+
+fn github_index_parts(rest: &str, has_marker: bool) -> Option<GitHubIndexUrl> {
+    let mut parts = rest.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if has_marker {
+        let marker = parts.next()?;
+        if marker != "raw" && marker != "blob" {
+            return None;
+        }
+    }
+    let reference = parts.next()?;
+    if owner.is_empty() || repo.is_empty() || reference.is_empty() {
+        return None;
+    }
+    let file = parts.collect::<Vec<_>>().join("/");
+    let file = file.trim_matches('/');
+    if file.is_empty() {
+        return None;
+    }
+    let subdir = file
+        .rsplit_once('/')
+        .map_or_else(String::new, |(dir, _)| dir.to_string());
+    Some(GitHubIndexUrl {
+        repo: format!("{owner}/{repo}"),
+        reference: reference.to_string(),
+        subdir,
+    })
+}
+
+fn fetch_http(url: &str) -> Result<String, (u16, String)> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .user_agent("claw-skill-market/1.0")
+        .build()
+        .map_err(|error| (500, format!("初始化 HTTP 客户端失败：{error}")))?;
+    let response = client.get(url).send().map_err(|error| {
+        if error.is_timeout() {
+            (
+                504,
+                format!(
+                    "拉取技能索引超时（{} 秒），请检查网络后重试",
+                    HTTP_TIMEOUT.as_secs()
+                ),
+            )
+        } else {
+            (502, format!("拉取技能索引失败：{error}"))
+        }
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err((502, format!("拉取技能索引返回 HTTP {}", status.as_u16())));
+    }
+    response
+        .text()
+        .map_err(|error| (502, format!("读取技能索引失败：{error}")))
+}
+
+/// GitHub 形态的 HTTP 来源：clone 指定 ref 到镜像，用 HEAD 作为完整性锚。
+fn sync_github_mirror(
+    paths: &MarketPaths,
+    record: &SourceRecord,
+    github: &GitHubIndexUrl,
+) -> Result<Option<String>, (&'static str, String)> {
+    fs::create_dir_all(paths.mirror_dir())
+        .map_err(|error| ("clone_failed", format!("创建镜像目录失败：{error}")))?;
+    let temp = paths.mirror_dir().join(format!(".tmp-{}", Uuid::new_v4()));
+    let repo_url = format!("https://github.com/{}.git", github.repo);
+    if let Err(error) = clone_with_timeout_ref(&repo_url, &github.reference, &temp) {
+        let _ = remove_any(&temp);
+        return Err(error);
+    }
+    let git_ref = git_short_ref(&temp);
+    let final_dir = paths.mirror_dir().join(&record.id);
+    if final_dir.exists() {
+        remove_any(&final_dir)
+            .map_err(|error| ("clone_failed", format!("替换旧镜像失败：{error}")))?;
+    }
+    fs::rename(&temp, &final_dir).map_err(|error| {
+        let _ = remove_any(&temp);
+        ("clone_failed", format!("保存仓库镜像失败：{error}"))
+    })?;
+    git_index_root(&final_dir, Some(&github.subdir)).map_err(|error| ("unreadable", error))?;
+    Ok(git_ref)
+}
+
+/// 强制联网拉取 HTTP 索引并落盘快照。
+///
+/// GitHub 形态先 clone 再写快照：快照与镜像必须指向同一个 commit，
+/// 任一步失败都保留旧快照/旧镜像，让列表仍可读。
+fn sync_http(paths: &MarketPaths, record: &mut SourceRecord) -> Result<(), (&'static str, String)> {
+    let url = record.value.trim().to_string();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err((
+            "fetch_failed",
+            "HTTP 来源必须是 http:// 或 https:// URL".to_string(),
+        ));
+    }
+    let github = parse_github_index_url(&url);
+    let body = fetch_http(&url).map_err(|(status, message)| {
+        if status == 504 {
+            ("timeout", message)
+        } else {
+            ("fetch_failed", message)
+        }
+    })?;
+    if let Some(github) = &github {
+        record.git_ref = sync_github_mirror(paths, record, github)?;
+    }
+    let Some(path) = paths.http_cache_path(&record.id) else {
+        return Err(("fetch_failed", "来源 id 不合法".to_string()));
+    };
+    let snapshot = HttpCache {
+        schema: http_cache_schema(),
+        url,
+        fetched_at_unix_ms: now_unix_ms(),
+        body,
+    };
+    write_json_atomic(&path, &snapshot)
+        .map_err(|error| ("fetch_failed", format!("保存索引快照失败：{error}")))?;
     Ok(())
 }
 
-/// git 解析失败 → HTTP 错误：无 git/拉取失败 502，超时 504。
+/// git/http-github 来源在新增/刷新时联网同步；local 与纯远程 http 不 clone。
+fn sync_source(
+    paths: &MarketPaths,
+    record: &mut SourceRecord,
+) -> Result<(), (&'static str, String)> {
+    match record.kind.as_str() {
+        "git" => {
+            record.git_ref = sync_git_mirror(paths, record)?;
+            Ok(())
+        }
+        "http" => sync_http(paths, record),
+        _ => Ok(()),
+    }
+}
+
+fn needs_auto_mirror(record: &SourceRecord) -> bool {
+    record.kind == "git"
+        || (record.kind == "http" && parse_github_index_url(&record.value).is_some())
+}
+
+/// 同步失败 → HTTP 错误：无 git/拉取/网络失败 502，超时 504。
 fn git_error(status: &str, message: String) -> MarketError {
     match status {
         "timeout" => MarketError::new(504, message),
-        "git_not_found" | "clone_failed" => MarketError::bad_gateway(message),
+        "git_not_found" | "clone_failed" | "fetch_failed" => MarketError::bad_gateway(message),
         _ => MarketError::unprocessable(message),
     }
 }
@@ -860,6 +1425,9 @@ fn source_view(record: &SourceRecord, resolved: &ResolvedSource) -> SourceView {
         checked_at_unix_ms: record.checked_at_unix_ms.unwrap_or_else(now_unix_ms),
         git_ref: record.git_ref.clone(),
         last_success_at_unix_ms: record.last_success_at_unix_ms,
+        builtin: record.builtin,
+        cached_at_unix_ms: resolved.fetched_at_unix_ms,
+        index_format: resolved.format.map(str::to_string),
     }
 }
 
@@ -882,12 +1450,19 @@ pub fn add_source(
     subdir: Option<&str>,
 ) -> Result<SourceView, MarketError> {
     let kind = kind.trim().to_ascii_lowercase();
-    if !matches!(kind.as_str(), "local" | "git") {
-        return Err(MarketError::bad_request("来源类型必须是 local 或 git"));
+    if !matches!(kind.as_str(), "local" | "git" | "http") {
+        return Err(MarketError::bad_request(
+            "来源类型必须是 local、git 或 http",
+        ));
     }
     let value = value.trim().to_string();
     if value.is_empty() {
         return Err(MarketError::bad_request("路径不能为空"));
+    }
+    if kind == "http" && !(value.starts_with("http://") || value.starts_with("https://")) {
+        return Err(MarketError::bad_request(
+            "HTTP 来源必须是 http:// 或 https:// URL",
+        ));
     }
     let mut registry = read_sources(paths);
     let mut record = SourceRecord {
@@ -901,16 +1476,12 @@ pub fn add_source(
         checked_at_unix_ms: None,
         git_ref: None,
         last_success_at_unix_ms: None,
+        builtin: false,
     };
-    // git 来源立即 clone 一次；失败也落盘，让用户能修正地址后重试。
-    let resolved = match sync_if_git(paths, &mut record) {
+    // git/http 来源立即联网同步一次；失败也落盘，让用户能修正地址后重试。
+    let resolved = match sync_source(paths, &mut record) {
         Ok(()) => resolve_source(paths, &record),
-        Err((status, error)) => ResolvedSource {
-            status,
-            last_error: Some(error),
-            root: None,
-            index: None,
-        },
+        Err((status, error)) => ResolvedSource::failed(status, error),
     };
     record.status = Some(resolved.status.to_string());
     record.last_error = resolved.last_error.clone();
@@ -926,34 +1497,37 @@ pub fn add_source(
 
 pub fn delete_source(paths: &MarketPaths, id: &str) -> Result<(), MarketError> {
     let mut registry = read_sources(paths);
-    let before = registry.sources.len();
-    let removed: Vec<String> = registry
-        .sources
-        .iter()
-        .filter(|source| source.id == id && source.kind == "git")
-        .map(|source| source.id.clone())
-        .collect();
-    registry.sources.retain(|source| source.id != id);
-    if registry.sources.len() == before {
+    let Some(record) = registry.sources.iter().find(|source| source.id == id) else {
         return Err(MarketError::not_found(format!("来源 {id} 不存在")));
+    };
+    // 内置源是「开箱可用」的保证，只允许刷新/停用，不允许删除。
+    if record.builtin {
+        return Err(MarketError::conflict(format!(
+            "来源 {id} 是内置来源，不能删除"
+        )));
     }
-    // 删除来源时一并清掉 git 镜像，避免下次同 id 复用陈旧内容。
-    for id in removed {
+    let mirrored = matches!(record.kind.as_str(), "git" | "http");
+    registry.sources.retain(|source| source.id != id);
+    // 删除来源时一并清掉镜像与索引快照，避免下次同 id 复用陈旧内容。
+    if mirrored {
         let _ = remove_any(&paths.mirror_dir().join(id));
+        if let Some(cache) = paths.http_cache_path(id) {
+            let _ = fs::remove_file(cache);
+        }
     }
     write_sources(paths, &registry)
         .map_err(|error| MarketError::new(500, format!("保存来源失败：{error}")))
 }
 
-/// 重新解析来源并持久化状态。git 来源会重新 clone（`resolved_ref` 随之更新）。
+/// 重新解析来源并持久化状态。git/http 来源会重新 clone/下载（`resolved_ref` 随之更新）。
 pub fn refresh_source(paths: &MarketPaths, id: &str) -> Result<SourceView, MarketError> {
     let mut registry = read_sources(paths);
     let Some(position) = registry.sources.iter().position(|source| source.id == id) else {
         return Err(MarketError::not_found(format!("来源 {id} 不存在")));
     };
     let mut record = registry.sources[position].clone();
-    // 刷新是用户主动触发的操作，git 失败必须报错（§4.2 第 7 条）。
-    let synced = sync_if_git(paths, &mut record);
+    // 刷新是用户主动触发的操作，同步失败必须报错（§4.2 第 7 条）。
+    let synced = sync_source(paths, &mut record);
     let resolved = resolve_source(paths, &record);
     // 失败状态覆盖「镜像仍可读」的 ok：否则刷新失败在界面上会瞬间消失。
     let (status, last_error) = match &synced {
@@ -1006,6 +1580,9 @@ fn read_index_cache(path: &Path) -> Option<IndexCache> {
     serde_json::from_str(&text).ok()
 }
 
+const MISSING_ANCHOR_DETAIL: &str =
+    "该来源只有远程索引，没有可绑定的仓库或 sha；请改用 git 来源或在索引中提供 sha256";
+
 pub fn market_index(paths: &MarketPaths, source_id: &str) -> Result<MarketIndexView, MarketError> {
     let registry = read_sources(paths);
     let Some(record) = registry
@@ -1018,6 +1595,7 @@ pub fn market_index(paths: &MarketPaths, source_id: &str) -> Result<MarketIndexV
     let resolved = resolve_source(paths, record);
     let view = source_view(record, &resolved);
     let installed = read_installed(paths);
+    let anchor = resolved.anchor.clone();
     let live_skills = match (resolved.root.as_deref(), resolved.index.as_ref()) {
         (Some(root), Some(index)) => index
             .skills
@@ -1046,30 +1624,69 @@ pub fn market_index(paths: &MarketPaths, source_id: &str) -> Result<MarketIndexV
                     reason_detail: analyzed.detail.clone(),
                     installed: installed_brief,
                     checksum: analyzed.expected_sha256.clone(),
+                    anchor: anchor.clone(),
+                }
+            })
+            .collect(),
+        // 纯远程索引没有本地根：无法校验路径与内容，只能展示、不能安装。
+        (None, Some(index)) => index
+            .skills
+            .iter()
+            .map(|entry| {
+                let name = entry.name.as_deref().unwrap_or("").trim().to_string();
+                let installed_brief = crate::sanitize_skill_invocation_name(&name)
+                    .as_deref()
+                    .and_then(|name| installed.skills.get(name))
+                    .map(|record| InstalledBrief {
+                        version: record.version.clone(),
+                        enabled: true,
+                    });
+                MarketSkillView {
+                    name: if name.is_empty() {
+                        "(未命名)".to_string()
+                    } else {
+                        name
+                    },
+                    version: entry
+                        .version
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|version| !version.is_empty())
+                        .map_or_else(|| "0.0.0+unknown".to_string(), ToString::to_string),
+                    description: entry.description.clone().unwrap_or_default(),
+                    tags: entry.tags.clone(),
+                    installable: false,
+                    reason: Some("missing_integrity_anchor".to_string()),
+                    reason_detail: Some(MISSING_ANCHOR_DETAIL.to_string()),
+                    installed: installed_brief,
+                    checksum: normalize_sha256(entry.sha256.as_deref()),
+                    anchor: None,
                 }
             })
             .collect(),
         _ => Vec::new(),
     };
     let live_ok = resolved.index.is_some();
-    // 刷新失败但镜像还能读时，内容来自本地镜像，同样按缓存标注。
-    let cached = !live_ok || view.status != "ok";
     let cache_path = index_cache_path(paths, &record.id);
-    let (skills, cached_at_unix_ms) = if cached {
-        if live_ok {
-            let cached_at = record.last_success_at_unix_ms.or_else(|| {
-                cache_path
-                    .as_deref()
-                    .and_then(read_index_cache)
-                    .map(|cache| cache.cached_at_unix_ms)
-            });
-            (live_skills, cached_at)
-        } else {
-            match cache_path.as_deref().and_then(read_index_cache) {
-                Some(cache) => (cache.skills, Some(cache.cached_at_unix_ms)),
-                None => (Vec::new(), record.last_success_at_unix_ms),
+    let (skills, live, cached, cached_at_unix_ms) = if record.kind == "http" && live_ok {
+        match resolved.fetched_at_unix_ms {
+            // 快照就是内容快照：TTL 内算「刚拉取」，超过则明说这是缓存。
+            Some(fetched_at) => {
+                let live = now_unix_ms().saturating_sub(fetched_at) <= HTTP_INDEX_TTL_MS;
+                (live_skills, live, !live, Some(fetched_at))
+            }
+            // 无 http 快照（如快照被删）：沿用通用 index-cache 兜底语义。
+            None => {
+                let (skills, cached_at) =
+                    cached_index_fallback(record, cache_path.as_deref(), live_skills, live_ok);
+                (skills, live_ok, false, cached_at)
             }
         }
+    } else if !live_ok || view.status != "ok" {
+        // 刷新失败但镜像还能读时，内容来自本地镜像，同样按缓存标注。
+        let (skills, cached_at) =
+            cached_index_fallback(record, cache_path.as_deref(), live_skills, live_ok);
+        (skills, live_ok, true, cached_at)
     } else {
         if let Some(path) = cache_path.as_deref() {
             let snapshot = IndexCache {
@@ -1080,7 +1697,7 @@ pub fn market_index(paths: &MarketPaths, source_id: &str) -> Result<MarketIndexV
             };
             let _ = write_json_atomic(path, &snapshot);
         }
-        (live_skills, None)
+        (live_skills, true, false, None)
     };
     Ok(MarketIndexView {
         source: MarketSourceBrief {
@@ -1090,12 +1707,34 @@ pub fn market_index(paths: &MarketPaths, source_id: &str) -> Result<MarketIndexV
             status: view.status,
             last_error: view.last_error,
             resolved_ref: record.git_ref.clone(),
+            index_format: resolved.format.map(str::to_string),
         },
         skills,
-        live: live_ok,
+        live,
         cached,
         cached_at_unix_ms,
     })
+}
+
+/// 通用索引快照兜底：优先生成时间，其次读旧缓存。
+fn cached_index_fallback(
+    record: &SourceRecord,
+    cache_path: Option<&Path>,
+    live_skills: Vec<MarketSkillView>,
+    live_ok: bool,
+) -> (Vec<MarketSkillView>, Option<u64>) {
+    if live_ok {
+        let cached_at = record.last_success_at_unix_ms.or_else(|| {
+            cache_path
+                .and_then(read_index_cache)
+                .map(|cache| cache.cached_at_unix_ms)
+        });
+        return (live_skills, cached_at);
+    }
+    match cache_path.and_then(read_index_cache) {
+        Some(cache) => (cache.skills, Some(cache.cached_at_unix_ms)),
+        None => (Vec::new(), record.last_success_at_unix_ms),
+    }
 }
 
 fn analyze_entry(root: &Path, entry: &MarketplaceEntry) -> AnalyzedEntry {
@@ -1688,20 +2327,24 @@ pub fn install(
         .ok_or_else(|| MarketError::bad_request("技能名不合法"))?;
 
     let sources = read_sources(paths);
-    let source = sources
+    let mut source = sources
         .sources
         .iter()
         .find(|source| source.id == source_id)
+        .cloned()
         .ok_or_else(|| MarketError::not_found(format!("来源 {source_id} 不存在")))?;
-    // git 来源正常在新增/刷新时已 clone；镜像丢失时补一次（30 秒超时）。
-    if source.kind == "git" && !paths.mirror_dir().join(&source.id).is_dir() {
-        if let Err((status, error)) = sync_git_mirror(paths, source) {
+    // 正常在新增/刷新时已同步；镜像丢失时补一次（30 秒超时）。
+    if needs_auto_mirror(&source) && !paths.mirror_dir().join(&source.id).is_dir() {
+        if let Err((status, error)) = sync_source(paths, &mut source) {
             return Err(git_error(status, error));
         }
     }
-    let resolved = resolve_source(paths, source);
+    let resolved = resolve_source(paths, &source);
     let (root, index) = match (resolved.root, resolved.index) {
         (Some(root), Some(index)) => (root, index),
+        (None, Some(_)) => {
+            return Err(MarketError::unprocessable(MISSING_ANCHOR_DETAIL));
+        }
         _ => {
             let message = resolved
                 .last_error
@@ -1756,7 +2399,7 @@ pub fn install(
                     kind: source.kind.clone(),
                     value: source.value.clone(),
                     subdir: source.subdir.clone(),
-                    resolved_ref: if source.kind == "git" {
+                    resolved_ref: if matches!(source.kind.as_str(), "git" | "http") {
                         git_short_ref(&paths.mirror_dir().join(&source.id))
                     } else {
                         None
@@ -2399,7 +3042,8 @@ mod tests {
         assert!(!live.cached);
         assert_eq!(live.skills.len(), 2);
 
-        fs::remove_file(fixture.source_root.join("marketplace.json")).expect("break source");
+        // 连技能目录一起删：只删索引会触发扫描适配器，仍是可用来源。
+        fs::remove_dir_all(&fixture.source_root).expect("break source");
         let degraded = market_index(&fixture.paths, &id).expect("degraded index");
         assert!(!degraded.live, "索引读不到时必须标非 live");
         assert!(degraded.cached, "必须有缓存兜底");
@@ -2415,7 +3059,7 @@ mod tests {
         let success = list_sources(&fixture.paths)[0]
             .last_success_at_unix_ms
             .expect("首次成功必须有时间");
-        fs::remove_file(fixture.source_root.join("marketplace.json")).expect("break source");
+        fs::remove_dir_all(&fixture.source_root).expect("break source");
         let failed = refresh_source(&fixture.paths, &id).expect("local refresh returns view");
         assert_eq!(failed.status, "unreadable");
         assert!(failed.last_error.is_some());
@@ -2578,5 +3222,250 @@ mod tests {
             .expect_err("unknown skill must fail");
         assert_eq!(error.status, 404);
         assert!(read_state(&fixture.paths).disabled.is_empty());
+    }
+
+    /// Claude marketplace：`plugins[].skills[]` 相对仓库根展开，path 去掉 `./`。
+    #[test]
+    fn claude_marketplace_index_expands_plugin_skills() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("repo");
+        write_skill(&root, "foo", "SKILL.md 里的描述", Some("foo"));
+        let plugin_dir = root.join(".claude-plugin");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        fs::write(
+            plugin_dir.join("marketplace.json"),
+            serde_json::to_vec_pretty(&json!({
+                "name": "anthropic-agent-skills",
+                "metadata": { "description": "官方技能", "version": "1.0.0" },
+                "plugins": [{
+                    "name": "document-skills",
+                    "description": "插件描述",
+                    "source": "./",
+                    "strict": false,
+                    "skills": ["./skills/foo"],
+                }],
+            }))
+            .expect("encode"),
+        )
+        .expect("write claude index");
+        let paths = MarketPaths::with_roots(
+            tmp.path().join("config").join("skill-market"),
+            tmp.path().join("config").join("skills"),
+        );
+        let id = add_source(
+            &paths,
+            "local",
+            root.to_str().expect("root utf8"),
+            Some("claude"),
+            None,
+        )
+        .expect("add source")
+        .id;
+
+        let index = market_index(&paths, &id).expect("market index");
+        assert_eq!(index.source.index_format.as_deref(), Some("claude"));
+        assert_eq!(index.skills.len(), 1);
+        assert_eq!(index.skills[0].name, "foo");
+        assert_eq!(index.skills[0].description, "插件描述");
+        assert_eq!(index.skills[0].version, "1.0.0");
+        assert!(index.skills[0].installable, "{:?}", index.skills[0].reason);
+
+        install(
+            &paths,
+            &id,
+            "foo",
+            None,
+            false,
+            &Mutex::new(()),
+            Fault::None,
+        )
+        .expect("claude 条目必须能安装");
+        assert!(paths.install_root.join("foo").join("SKILL.md").is_file());
+    }
+
+    /// 没有任何索引文件时扫描 `skills/<name>/SKILL.md`，描述来自 frontmatter。
+    #[test]
+    fn repo_without_index_is_scanned_for_skills() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("repo");
+        write_skill(&root, "bar", "来自 frontmatter 的描述", Some("bar"));
+        let paths = MarketPaths::with_roots(
+            tmp.path().join("config").join("skill-market"),
+            tmp.path().join("config").join("skills"),
+        );
+        let id = add_source(
+            &paths,
+            "local",
+            root.to_str().expect("root utf8"),
+            Some("scan"),
+            None,
+        )
+        .expect("add source")
+        .id;
+        let index = market_index(&paths, &id).expect("market index");
+        assert_eq!(index.source.index_format.as_deref(), Some("scan"));
+        assert_eq!(index.skills.len(), 1);
+        assert_eq!(index.skills[0].name, "bar");
+        assert_eq!(index.skills[0].description, "来自 frontmatter 的描述");
+        assert!(index.skills[0].installable);
+    }
+
+    /// 纯远程索引没有本地根：只展示，绝不为了「能装」放行。
+    #[test]
+    fn remote_only_index_requires_integrity_anchor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths =
+            MarketPaths::with_roots(tmp.path().join("skill-market"), tmp.path().join("skills"));
+        let body = json!({
+            "schema": MARKET_SCHEMA,
+            "skills": [{ "name": "remote", "version": "1.0.0", "path": "skills/remote" }],
+        })
+        .to_string();
+        let snapshot = HttpCache {
+            schema: http_cache_schema(),
+            url: "https://example.com/marketplace.json".to_string(),
+            fetched_at_unix_ms: now_unix_ms(),
+            body,
+        };
+        write_json_atomic(
+            &paths.http_cache_path("s_01").expect("cache path"),
+            &snapshot,
+        )
+        .expect("write snapshot");
+        write_sources(
+            &paths,
+            &SourcesRegistry {
+                schema: sources_schema(),
+                sources: vec![SourceRecord {
+                    id: "s_01".to_string(),
+                    kind: "http".to_string(),
+                    value: "https://example.com/marketplace.json".to_string(),
+                    name: Some("remote".to_string()),
+                    subdir: None,
+                    status: Some("ok".to_string()),
+                    last_error: None,
+                    checked_at_unix_ms: Some(now_unix_ms()),
+                    git_ref: None,
+                    last_success_at_unix_ms: Some(now_unix_ms()),
+                    builtin: false,
+                }],
+            },
+        )
+        .expect("write sources");
+
+        let index = market_index(&paths, "s_01").expect("market index");
+        assert_eq!(index.source.index_format.as_deref(), Some("http"));
+        assert!(index.live);
+        assert!(!index.cached);
+        assert_eq!(index.skills.len(), 1);
+        assert!(!index.skills[0].installable);
+        assert_eq!(
+            index.skills[0].reason.as_deref(),
+            Some("missing_integrity_anchor")
+        );
+        assert!(index.skills[0].anchor.is_none());
+    }
+
+    /// HTTP 快照超过 TTL 只能标缓存，不能谎称实时。
+    #[test]
+    fn stale_http_snapshot_is_reported_as_cached() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths =
+            MarketPaths::with_roots(tmp.path().join("skill-market"), tmp.path().join("skills"));
+        let fetched_at = now_unix_ms() - HTTP_INDEX_TTL_MS - 1;
+        let snapshot = HttpCache {
+            schema: http_cache_schema(),
+            url: "https://example.com/marketplace.json".to_string(),
+            fetched_at_unix_ms: fetched_at,
+            body: json!({
+                "schema": MARKET_SCHEMA,
+                "skills": [{ "name": "remote", "path": "skills/remote" }],
+            })
+            .to_string(),
+        };
+        write_json_atomic(
+            &paths.http_cache_path("s_01").expect("cache path"),
+            &snapshot,
+        )
+        .expect("write snapshot");
+        write_sources(
+            &paths,
+            &SourcesRegistry {
+                schema: sources_schema(),
+                sources: vec![SourceRecord {
+                    id: "s_01".to_string(),
+                    kind: "http".to_string(),
+                    value: "https://example.com/marketplace.json".to_string(),
+                    name: None,
+                    subdir: None,
+                    status: Some("ok".to_string()),
+                    last_error: None,
+                    checked_at_unix_ms: Some(fetched_at),
+                    git_ref: None,
+                    last_success_at_unix_ms: Some(fetched_at),
+                    builtin: false,
+                }],
+            },
+        )
+        .expect("write sources");
+        let index = market_index(&paths, "s_01").expect("market index");
+        assert!(!index.live);
+        assert!(index.cached);
+        assert_eq!(index.cached_at_unix_ms, Some(fetched_at));
+    }
+
+    /// 首次启动写入内置源；内置源不可删除；非 seed 路径不写文件。
+    #[test]
+    fn default_sources_are_seeded_but_not_deletable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut paths =
+            MarketPaths::with_roots(tmp.path().join("skill-market"), tmp.path().join("skills"));
+        paths.seed_defaults = true;
+        let sources = list_sources(&paths);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, "anthropics-skills");
+        assert_eq!(sources[0].kind, "git");
+        assert!(sources[0].builtin);
+        assert!(paths.sources_path().exists(), "首次启动必须落盘");
+
+        let error = delete_source(&paths, "anthropics-skills").expect_err("内置源不可删除");
+        assert_eq!(error.status, 409);
+
+        let quiet_tmp = tempfile::tempdir().expect("tempdir");
+        let quiet = MarketPaths::with_roots(
+            quiet_tmp.path().join("skill-market"),
+            quiet_tmp.path().join("skills"),
+        );
+        assert!(list_sources(&quiet).is_empty());
+        assert!(!quiet.sources_path().exists(), "单测路径不能自动 seeding");
+    }
+
+    /// 三种 GitHub 索引 URL 都要能派生出 repo/ref/索引所在目录。
+    #[test]
+    fn github_index_urls_are_derived() {
+        let raw = parse_github_index_url(
+            "https://raw.githubusercontent.com/anthropics/skills/main/.claude-plugin/marketplace.json",
+        )
+        .expect("raw url");
+        assert_eq!(raw.repo, "anthropics/skills");
+        assert_eq!(raw.reference, "main");
+        assert_eq!(raw.subdir, ".claude-plugin");
+
+        let root_raw = parse_github_index_url(
+            "https://github.com/anthropics/skills/raw/main/marketplace.json",
+        )
+        .expect("raw blob url");
+        assert_eq!(root_raw.reference, "main");
+        assert_eq!(root_raw.subdir, "");
+
+        let blob = parse_github_index_url(
+            "https://github.com/anthropics/skills/blob/v1.0.0/skills/x/marketplace.json",
+        )
+        .expect("blob url");
+        assert_eq!(blob.reference, "v1.0.0");
+        assert_eq!(blob.subdir, "skills/x");
+
+        assert!(parse_github_index_url("https://example.com/marketplace.json").is_none());
+        assert!(parse_github_index_url("https://github.com/anthropics/skills").is_none());
     }
 }

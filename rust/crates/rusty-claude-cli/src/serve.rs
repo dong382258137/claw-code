@@ -3800,6 +3800,7 @@ async fn api_skill_sources(
     }
     Json(json!({
         "sources": crate::skill_market::list_sources(&state.skill_market),
+        "recommended": crate::skill_market::recommended_sources(),
     }))
     .into_response()
 }

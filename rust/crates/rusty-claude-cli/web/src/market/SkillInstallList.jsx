@@ -11,6 +11,14 @@ const REASON_LABELS = {
   incompatible: '版本不兼容',
   too_large: '目录过大',
   checksum_mismatch: '校验失败',
+  missing_integrity_anchor: '没有可锚定的 commit',
+}
+
+const FORMAT_LABELS = {
+  native: '自家索引',
+  claude: 'Claude marketplace',
+  scan: '扫描仓库',
+  http: '远程索引',
 }
 
 // 后端时间戳是 unix 毫秒；缺失时返回空串，由调用方决定文案。
@@ -94,7 +102,17 @@ export function SkillInstallList({ sourceId, onChanged }) {
     <div className="skill-install-list">
       <div className="skill-install-head">
         <h3>{market.source.name || market.source.id}</h3>
-        <span className="chip">{market.skills.length} 个条目</span>
+        <div className="skill-install-badges">
+          {market.source.index_format ? (
+            <span className="chip">
+              {FORMAT_LABELS[market.source.index_format] || market.source.index_format}
+            </span>
+          ) : null}
+          {market.source.resolved_ref ? (
+            <span className="chip">commit {market.source.resolved_ref}</span>
+          ) : null}
+          <span className="chip">{market.skills.length} 个条目</span>
+        </div>
       </div>
       {market.cached ? (
         <div className="skill-notice warn">

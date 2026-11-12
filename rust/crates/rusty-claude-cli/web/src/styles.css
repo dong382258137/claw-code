@@ -1193,6 +1193,13 @@ details.plan > summary { display: flex; justify-content: space-between; gap: 10p
 .skill-source-status.unreadable, .skill-source-status.clone_failed { color: var(--danger); border-color: var(--danger); }
 .skill-source-meta { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 6px; font-size: 11px; color: var(--label-caption); }
 .skill-source-error { font-size: 11px; color: var(--danger); }
+.skill-recommend { margin-top: 8px; padding: 12px; background: var(--layer-1); border: 0.5px solid var(--border-l1); border-radius: var(--r-sm); }
+.skill-recommend-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.skill-recommend-head h3 { margin: 0; font-size: 13px; color: var(--label-primary); }
+.skill-recommend-list { display: flex; flex-direction: column; gap: 8px; }
+.skill-recommend-card { padding: 10px 12px; background: var(--layer-2); border: 0.5px solid var(--border-l2); border-radius: var(--r-sm); }
+.skill-recommend-value { word-break: break-all; }
+.skill-install-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .skill-source-actions { display: flex; gap: 12px; margin-top: 8px; }
 .skill-link { font-size: 12px; color: var(--link); cursor: pointer; }
 .skill-link.danger { color: var(--danger); }
