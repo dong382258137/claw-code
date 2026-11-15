@@ -1082,7 +1082,7 @@ fn is_pinned_commit(value: &str) -> bool {
     value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
-/// `git clone --depth 1`，30 秒硬超时；失败归类为 `git_not_found` / `clone_failed` / `timeout`。
+/// `git clone --depth 1`（首次镜像）；失败归类为 `git_not_found` / `clone_failed` / `timeout`。
 fn clone_with_timeout(value: &str, dest: &Path) -> Result<(), (&'static str, String)> {
     run_git_clone(value, None, dest)
 }
@@ -1106,11 +1106,61 @@ fn run_git_clone(
     if let Some(reference) = reference {
         command.arg("--branch").arg(reference);
     }
-    let mut child = command
+    command.arg("--quiet").arg("--").arg(value).arg(dest);
+    run_git_process(command, "拉取仓库失败")
+}
+
+/// 已存在镜像的增量更新：只 fetch 目标 ref，再把工作树重置到 FETCH_HEAD。
+///
+/// 镜像本身是浅克隆（`--depth 1`），命中缓存时只需传输一个 commit 的差异；
+/// 不再每次把整个仓库重新下载一遍。显式传 URL 而不用远端配置，避免用户
+/// 改过来源地址后 fetch 到旧仓库。
+fn fetch_git_mirror(
+    dir: &Path,
+    url: &str,
+    reference: Option<&str>,
+) -> Result<(), (&'static str, String)> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(dir)
+        .arg("fetch")
+        .arg("--depth")
+        .arg("1")
+        .arg("--no-tags")
         .arg("--quiet")
-        .arg("--")
-        .arg(value)
-        .arg(dest)
+        .arg(url);
+    if let Some(reference) = reference {
+        command.arg(reference);
+    }
+    run_git_process(command, "拉取仓库更新失败")
+}
+
+/// fetch 成功后把工作树对齐到 FETCH_HEAD，并清掉上游已删除的文件。
+fn reset_git_mirror(dir: &Path) -> Result<(), (&'static str, String)> {
+    let mut reset = Command::new("git");
+    reset
+        .arg("-C")
+        .arg(dir)
+        .arg("reset")
+        .arg("--hard")
+        .arg("--quiet")
+        .arg("FETCH_HEAD");
+    run_git_process(reset, "更新本地镜像失败")?;
+    let mut clean = Command::new("git");
+    clean.arg("-C").arg(dir).arg("clean").arg("-fdq");
+    let _ = run_git_process(clean, "清理镜像旧文件失败");
+    Ok(())
+}
+
+/// 镜像是否可直接增量更新：目录存在且确实是 git 工作区。
+fn reusable_mirror(dir: &Path) -> bool {
+    dir.join(".git").exists()
+}
+
+/// 统一的 git 子进程执行：硬超时 + 首行 stderr 归类。
+fn run_git_process(mut command: Command, failure: &str) -> Result<(), (&'static str, String)> {
+    let mut child = command
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1143,7 +1193,7 @@ fn run_git_clone(
                     .to_string();
                 return Err((
                     "clone_failed",
-                    format!("拉取仓库失败：{first}。请检查网络或仓库地址"),
+                    format!("{failure}：{first}。请检查网络或仓库地址"),
                 ));
             }
             Ok(None) => {
@@ -1167,20 +1217,28 @@ fn run_git_clone(
     }
 }
 
-/// 重新克隆并把旧镜像原子替换掉；失败时清空临时目录。返回短 commit。
+/// 首次克隆，后续刷新走增量 fetch；返回短 commit。
 fn sync_git_mirror(
     paths: &MarketPaths,
     record: &SourceRecord,
 ) -> Result<Option<String>, (&'static str, String)> {
     fs::create_dir_all(paths.mirror_dir())
         .map_err(|error| ("clone_failed", format!("创建镜像目录失败：{error}")))?;
+    let final_dir = paths.mirror_dir().join(&record.id);
+    if reusable_mirror(&final_dir) {
+        // 镜像已存在：只取增量。失败时保留旧镜像，列表仍可读。
+        fetch_git_mirror(&final_dir, &record.value, None)?;
+        reset_git_mirror(&final_dir)?;
+        git_index_root(&final_dir, record.subdir.as_deref())
+            .map_err(|error| ("unreadable", error))?;
+        return Ok(git_short_ref(&final_dir));
+    }
     let temp = paths.mirror_dir().join(format!(".tmp-{}", Uuid::new_v4()));
     if let Err(error) = clone_with_timeout(&record.value, &temp) {
         let _ = remove_any(&temp);
         return Err(error);
     }
     let git_ref = git_short_ref(&temp);
-    let final_dir = paths.mirror_dir().join(&record.id);
     if final_dir.exists() {
         remove_any(&final_dir)
             .map_err(|error| ("clone_failed", format!("替换旧镜像失败：{error}")))?;
@@ -1296,6 +1354,7 @@ fn fetch_http(url: &str) -> Result<String, (u16, String)> {
 }
 
 /// GitHub 形态的 HTTP 来源：clone 指定 ref 到镜像，用 HEAD 作为完整性锚。
+/// 镜像已存在时只 fetch 该 ref 的增量。
 fn sync_github_mirror(
     paths: &MarketPaths,
     record: &SourceRecord,
@@ -1303,14 +1362,20 @@ fn sync_github_mirror(
 ) -> Result<Option<String>, (&'static str, String)> {
     fs::create_dir_all(paths.mirror_dir())
         .map_err(|error| ("clone_failed", format!("创建镜像目录失败：{error}")))?;
-    let temp = paths.mirror_dir().join(format!(".tmp-{}", Uuid::new_v4()));
     let repo_url = format!("https://github.com/{}.git", github.repo);
+    let final_dir = paths.mirror_dir().join(&record.id);
+    if reusable_mirror(&final_dir) {
+        fetch_git_mirror(&final_dir, &repo_url, Some(&github.reference))?;
+        reset_git_mirror(&final_dir)?;
+        git_index_root(&final_dir, Some(&github.subdir)).map_err(|error| ("unreadable", error))?;
+        return Ok(git_short_ref(&final_dir));
+    }
+    let temp = paths.mirror_dir().join(format!(".tmp-{}", Uuid::new_v4()));
     if let Err(error) = clone_with_timeout_ref(&repo_url, &github.reference, &temp) {
         let _ = remove_any(&temp);
         return Err(error);
     }
     let git_ref = git_short_ref(&temp);
-    let final_dir = paths.mirror_dir().join(&record.id);
     if final_dir.exists() {
         remove_any(&final_dir)
             .map_err(|error| ("clone_failed", format!("替换旧镜像失败：{error}")))?;
@@ -3467,5 +3532,63 @@ mod tests {
 
         assert!(parse_github_index_url("https://example.com/marketplace.json").is_none());
         assert!(parse_github_index_url("https://github.com/anthropics/skills").is_none());
+    }
+
+    fn run_test_git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} 失败：{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// 镜像已存在时必须走增量 fetch：`.git` 里的探针文件不会被重新克隆冲掉。
+    #[test]
+    fn git_source_refresh_uses_incremental_fetch() {
+        let fixture = fixture();
+        let repo = fixture._tmp.path().join("origin");
+        write_skill(&repo, "demo", "演示技能", Some("demo"));
+        run_test_git(&repo, &["init", "-q", "-b", "main"]);
+        run_test_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_test_git(&repo, &["config", "user.name", "test"]);
+        run_test_git(&repo, &["add", "."]);
+        run_test_git(&repo, &["commit", "-q", "-m", "init"]);
+
+        let id = add_source(
+            &fixture.paths,
+            "git",
+            repo.to_str().expect("repo path utf8"),
+            Some("local-git"),
+            None,
+        )
+        .expect("add git source")
+        .id;
+        let mirror = fixture.paths.mirror_dir().join(&id);
+        assert!(mirror.join("skills").join("demo").join("SKILL.md").exists());
+        let first = git_full_ref(&mirror).expect("first head");
+
+        let probe = mirror.join(".git").join("claw-incremental-probe");
+        fs::write(&probe, b"probe").expect("write probe");
+
+        write_skill(&repo, "second", "第二个技能", Some("second"));
+        run_test_git(&repo, &["add", "."]);
+        run_test_git(&repo, &["commit", "-q", "-m", "second"]);
+
+        let view = refresh_source(&fixture.paths, &id).expect("refresh");
+        let second = git_full_ref(&mirror).expect("second head");
+        assert_ne!(first, second, "刷新后 HEAD 必须前进");
+        assert!(probe.exists(), "刷新必须复用镜像，不能重新 clone");
+        assert!(mirror
+            .join("skills")
+            .join("second")
+            .join("SKILL.md")
+            .exists());
+        assert_eq!(view.skill_count, 2);
     }
 }
