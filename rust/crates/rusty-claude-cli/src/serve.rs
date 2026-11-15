@@ -621,6 +621,8 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .delete(api_session_delete),
             )
             .route("/api/session/{id}/stream", get(api_stream))
+            // 单块全文：会话视图里的长文本/工具输出会被截断，前端按 ref 回读磁盘原文。
+            .route("/api/block", get(api_block))
             .route("/api/session/{id}/prompt", post(api_prompt))
             .route("/api/session/{id}/interrupt", post(api_interrupt))
             .route("/api/session/{id}/status", get(api_status))
@@ -1010,6 +1012,75 @@ async fn api_session(
         )
             .into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct BlockQuery {
+    t: Option<String>,
+    /// `session_id:message_index:block_index`，由会话视图里的 `truncated.ref` 下发。
+    r: Option<String>,
+}
+
+/// 回读单个 block 的完整内容（会话视图为了体积只给截断版）。
+///
+/// 数据一直完整存在于磁盘 JSONL 里；这里只负责按索引取回原文，
+/// 让前端「查看全文」在刷新后依然可用。
+async fn api_block(State(state): State<AppState>, Query(query): Query<BlockQuery>) -> Response {
+    if !authorize(&state, &AuthQuery { t: query.t.clone() }) {
+        return unauthorized();
+    }
+    let Some(raw) = query.r.as_deref() else {
+        return (StatusCode::BAD_REQUEST, "缺少 r 参数".to_string()).into_response();
+    };
+    // session id 里不含冒号，从右侧切两刀即可拿到两个索引。
+    let mut parts = raw.rsplitn(3, ':');
+    let block_index = parts.next().and_then(|value| value.parse::<usize>().ok());
+    let message_index = parts.next().and_then(|value| value.parse::<usize>().ok());
+    let session_id = parts.next();
+    let (Some(block_index), Some(message_index), Some(session_id)) =
+        (block_index, message_index, session_id)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "r 参数格式应为 id:message:block".to_string(),
+        )
+            .into_response();
+    };
+    let path = match resolve_session(&state, session_id) {
+        Ok((path, _workspace)) => path,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let session = match runtime::Session::load_from_path(&path) {
+        Ok(session) => session,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
+    let Some(message) = session.messages.get(message_index) else {
+        return (StatusCode::NOT_FOUND, "消息不存在".to_string()).into_response();
+    };
+    let Some(block) = message.blocks.get(block_index) else {
+        return (StatusCode::NOT_FOUND, "内容块不存在".to_string()).into_response();
+    };
+    let value = match block {
+        runtime::ContentBlock::Text { text } => json!({ "kind": "text", "text": text }),
+        runtime::ContentBlock::Thinking { thinking, .. } => {
+            json!({ "kind": "thinking", "text": thinking })
+        }
+        runtime::ContentBlock::ToolUse { name, input, .. } => {
+            json!({ "kind": "tool_use", "name": name, "input": input })
+        }
+        runtime::ContentBlock::ToolResult {
+            tool_name,
+            output,
+            is_error,
+            ..
+        } => json!({
+            "kind": "tool_result",
+            "name": tool_name,
+            "output": output,
+            "is_error": is_error,
+        }),
+    };
+    Json(value).into_response()
 }
 
 async fn api_stream(
@@ -1805,16 +1876,30 @@ async fn api_status(
 
 // ---------------- P3：终端面板（PTY + WebSocket） ----------------
 
-/// WebSocket 终端：升级后在工作区里开一个真实 PTY（Windows 为 ConPTY）。
+#[derive(Deserialize)]
+struct TerminalQuery {
+    t: Option<String>,
+    /// 当前会话所属工作区；缺省时退回 serve 启动目录。
+    workspace: Option<String>,
+}
+
+/// WebSocket 终端：升级后在**指定工作区**里开一个真实 PTY（Windows 为 ConPTY）。
+///
+/// cwd 不能依赖进程级 `set_current_dir`：同一进程里并行跑着多个工作区的会话，
+/// 改全局 cwd 会互相踩。这里把工作区解析成绝对路径后交给 `CommandBuilder::cwd`，
+/// 由子进程自己带 cwd。
 async fn ws_terminal(
     State(state): State<AppState>,
-    Query(auth): Query<AuthQuery>,
+    Query(query): Query<TerminalQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !authorize(&state, &auth) {
+    if !authorize(&state, &AuthQuery { t: query.t.clone() }) {
         return unauthorized();
     }
-    let workspace = state.workspace.clone();
+    let workspace = match resolve_workspace(&state, query.workspace.as_deref()) {
+        Ok(path) => path,
+        Err((code, message)) => return (code, message).into_response(),
+    };
     ws.on_upgrade(move |socket| terminal_session(socket, workspace))
 }
 
@@ -4430,10 +4515,12 @@ fn session_title(path: &Path) -> String {
 
 fn session_view(path: &Path) -> Result<Value, String> {
     let session = runtime::Session::load_from_path(path).map_err(|error| error.to_string())?;
+    let session_id = session.session_id.clone();
     let messages: Vec<Value> = session
         .messages
         .iter()
-        .map(|message| {
+        .enumerate()
+        .map(|(message_index, message)| {
             let role = match message.role {
                 runtime::MessageRole::System => "system",
                 runtime::MessageRole::User => "user",
@@ -4442,33 +4529,52 @@ fn session_view(path: &Path) -> Result<Value, String> {
             };
             // 保持原始 block 顺序：思考 → 文本 → 工具调用 → 工具结果。
             let mut blocks = Vec::new();
-            for block in &message.blocks {
-                match block {
-                    runtime::ContentBlock::Text { text } => blocks.push(json!({
+            for (block_index, block) in message.blocks.iter().enumerate() {
+                let mut value = match block {
+                    runtime::ContentBlock::Text { text } => json!({
                         "kind": "text",
                         "text": truncate_middle(text, 12_000),
-                    })),
-                    runtime::ContentBlock::Thinking { thinking, .. } => blocks.push(json!({
+                    }),
+                    runtime::ContentBlock::Thinking { thinking, .. } => json!({
                         "kind": "thinking",
                         "text": truncate_middle(thinking, 4_000),
-                    })),
-                    runtime::ContentBlock::ToolUse { name, input, .. } => blocks.push(json!({
+                    }),
+                    runtime::ContentBlock::ToolUse { name, input, .. } => json!({
                         "kind": "tool_use",
                         "name": name,
                         "input": truncate_middle(input, 2_000),
-                    })),
+                    }),
                     runtime::ContentBlock::ToolResult {
                         tool_name,
                         output,
                         is_error,
                         ..
-                    } => blocks.push(json!({
+                    } => json!({
                         "kind": "tool_result",
                         "name": tool_name,
                         "output": truncate_middle(output, 4_000),
                         "is_error": is_error,
-                    })),
+                    }),
+                };
+                // 只给被截断的块下发 ref：前端据此显示「查看全文」，回读 /api/block。
+                let (raw, limit) = match block {
+                    runtime::ContentBlock::Text { text } => (text.as_str(), 12_000),
+                    runtime::ContentBlock::Thinking { thinking, .. } => (thinking.as_str(), 4_000),
+                    runtime::ContentBlock::ToolUse { input, .. } => (input.as_str(), 2_000),
+                    runtime::ContentBlock::ToolResult { output, .. } => (output.as_str(), 4_000),
+                };
+                if let Some(object) = value.as_object_mut() {
+                    if raw.chars().count() > limit {
+                        object.insert(
+                            "truncated".to_string(),
+                            json!({
+                                "ref": format!("{session_id}:{message_index}:{block_index}"),
+                                "chars": raw.chars().count(),
+                            }),
+                        );
+                    }
                 }
+                blocks.push(value);
             }
             json!({
                 "role": role,
