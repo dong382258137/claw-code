@@ -375,6 +375,35 @@ export default function App() {
     }
   }, [currentId, push])
 
+  const deleteSessions = useCallback(async (ids) => {
+    if (!ids.length) return
+    try {
+      const body = await postJson('/api/sessions/delete', { ids })
+      const deleted = body.deleted || []
+      const skipped = body.skipped || []
+      if (deleted.length) {
+        setSessions((list) => list.filter((item) => !deleted.includes(item.id)))
+        setSessionTotal((total) => Math.max(0, total - deleted.length))
+        // 删掉当前正在看的会话：回到「未选择会话」，与单条删除一致。
+        if (currentId && deleted.includes(currentId)) {
+          setCurrent(null)
+          setMessages([])
+          setLive('')
+          setLiveThinking('')
+          setLiveTools([])
+          setApprovals([])
+        }
+      }
+      if (skipped.length) {
+        push(`已删除 ${deleted.length} 个会话，${skipped.length} 个未删除（运行中或已被删除）`, 'error')
+      } else {
+        push(`已删除 ${deleted.length} 个会话`)
+      }
+    } catch (error) {
+      push(`批量删除失败：${error.message}`, 'error')
+    }
+  }, [currentId, push])
+
   const decideApproval = useCallback(async (approval, allow) => {
     setApprovals((list) => list.filter((item) => item.id !== approval.id))
     try {
@@ -490,6 +519,7 @@ export default function App() {
       activeWorkspace={activeWorkspace}
       onRename={renameSession}
       onDelete={deleteSession}
+      onDeleteMany={deleteSessions}
       total={sessionTotal}
       onLoadMore={loadMoreSessions}
       onSettings={() => setSettingsOpen(true)}

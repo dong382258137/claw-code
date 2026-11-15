@@ -4,6 +4,7 @@
 //! 端点：
 //!   GET /                          → 内嵌单页
 //!   GET /api/sessions?t=           → 会话列表（按修改时间倒序，最多 50 条）
+//!   POST /api/sessions/delete?t=   → 批量删除会话（运行中的会话会被跳过并在 skipped 中报告）
 //!   GET /api/session/{id}?t=       → 单个会话的消息快照
 //!   GET /api/session/{id}/stream?t=→ SSE 快照流（内容变化才推送，约 0.9s 一轮）
 //!
@@ -612,6 +613,7 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let app = Router::new()
             .route("/", get(index))
             .route("/api/sessions", get(api_sessions).post(api_create_session))
+            .route("/api/sessions/delete", post(api_sessions_delete))
             .route(
                 "/api/session/{id}",
                 get(api_session)
@@ -898,21 +900,61 @@ async fn api_session_delete(
     if !authorize(&state, &auth) {
         return unauthorized();
     }
-    let (path, workspace) = match resolve_session(&state, &id) {
-        Ok(found) => found,
-        Err((code, message)) => return (code, message).into_response(),
-    };
-    if state.scheduler.is_active(&id) {
-        return (StatusCode::CONFLICT, "会话正在执行或仍在排队，不能删除").into_response();
+    match remove_session(&state, &id) {
+        Ok(()) => Json(json!({ "deleted": id })).into_response(),
+        Err((code, message)) => (code, message).into_response(),
     }
-    if let Err(error) = std::fs::remove_file(&path) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+}
+
+#[derive(Deserialize)]
+struct DeleteSessionsBody {
+    ids: Vec<String>,
+}
+
+/// 批量删除：逐条复用单条删除路径。运行中/不存在的会话不中断整批，
+/// 分别落到 `skipped` 里返回，前端据此提示「删了几个、几个没删」。
+async fn api_sessions_delete(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<DeleteSessionsBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
     }
-    state.scheduler.forget(&id);
-    state.events.forget(&id);
-    remove_session_title(&workspace, &id);
-    let _ = std::fs::remove_file(web_todos_path(&workspace, &id));
-    Json(json!({ "deleted": id })).into_response()
+    if body.ids.is_empty() {
+        return (StatusCode::BAD_REQUEST, "未指定要删除的会话").into_response();
+    }
+    let mut deleted = Vec::new();
+    let mut skipped = Vec::new();
+    let mut seen = BTreeSet::new();
+    for id in body.ids {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        match remove_session(&state, &id) {
+            Ok(()) => deleted.push(id),
+            Err((_code, message)) => skipped.push(json!({ "id": id, "reason": message })),
+        }
+    }
+    Json(json!({ "deleted": deleted, "skipped": skipped })).into_response()
+}
+
+/// 删除会话文件及其附属状态（运行中拒绝）。单条与批量删除共用。
+fn remove_session(state: &AppState, id: &str) -> Result<(), (StatusCode, String)> {
+    let (path, workspace) = resolve_session(state, id)?;
+    if state.scheduler.is_active(id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "会话正在执行或仍在排队，不能删除".to_string(),
+        ));
+    }
+    std::fs::remove_file(&path)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    state.scheduler.forget(id);
+    state.events.forget(id);
+    remove_session_title(&workspace, id);
+    let _ = std::fs::remove_file(web_todos_path(&workspace, id));
+    Ok(())
 }
 
 async fn api_session(

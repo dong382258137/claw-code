@@ -214,6 +214,12 @@ aside.collapsed .brand b, aside.collapsed .search, aside.collapsed .session-list
 .session-actions button { width: 26px; height: 26px; padding: 0; color: var(--label-secondary); }
 .session-more { padding: 8px 4px; }
 .session-more button { width: 100%; border: 1px solid var(--border-l2); }
+.session-check { display: flex; align-items: center; padding: 0 2px 0 8px; }
+.session-check input { width: 14px; height: 14px; cursor: pointer; accent-color: var(--link); }
+.session-row.selected .session { background: var(--nav-active); }
+.batch-bar { display: flex; align-items: center; gap: 6px; padding: 2px 8px 6px; }
+.batch-bar button { padding: 3px 8px; font-size: 12px; border-radius: var(--r-sm); }
+.batch-bar .batch-count { margin-left: auto; color: var(--label-caption); font-size: 12px; white-space: nowrap; }
 
 main { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; position: relative; background: var(--bg-base); }
 
@@ -1083,6 +1089,9 @@ details.plan > summary { display: flex; justify-content: space-between; gap: 10p
 
 .projects-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px 4px; color: var(--label-3); font-size: 12px; letter-spacing: .04em; }
 .projects-head button { border: 0; background: transparent; color: var(--label-3); cursor: pointer; font-size: 14px; }
+.projects-head-actions { display: flex; align-items: center; gap: 2px; }
+.projects-head .batch-toggle { font-size: 12px; padding: 2px 6px; border-radius: var(--r-sm); }
+.projects-head .batch-toggle:hover, .projects-head .batch-toggle.active { color: var(--label-primary); background: var(--layer-2); }
 .project { margin: 2px 6px; }
 .project-head { display: flex; align-items: center; gap: 4px; border-radius: 8px; }
 .project-head:hover { background: rgba(255,255,255,.04); }
