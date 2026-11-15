@@ -1286,3 +1286,20 @@ details.process-thinking .expand-full { margin: 4px 0 8px; }
   border-radius: var(--r-sm);
   background: rgba(242, 90, 90, 0.08);
 }
+
+/* ── 任务面板：可编辑计划 / SSE 连接指示（第二批 C） ───────────────── */
+.pane-toolbar button.active { background: var(--active); border-color: var(--link); color: var(--label-primary); }
+.task-conn { width: 7px; height: 7px; border-radius: 50%; margin-left: auto; background: var(--label-caption); opacity: 0.5; }
+.task-conn.on { background: var(--success); opacity: 1; }
+.plan-edit { display: flex; flex-direction: column; gap: 6px; padding: 4px 4px 8px; }
+.plan-edit > input,
+.plan-step-fields input {
+  width: 100%; box-sizing: border-box; padding: 5px 8px; font: inherit; font-size: 12.5px;
+  color: var(--label-primary); background: var(--input-major); border: 1px solid var(--border-l1); border-radius: var(--r-sm);
+}
+.plan-step { display: flex; align-items: flex-start; gap: 6px; }
+.plan-step-no { flex: none; width: 16px; line-height: 26px; font-size: 11px; color: var(--label-caption); text-align: right; }
+.plan-step-fields { flex: 1; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.plan-step select { flex: none; height: 26px; font-size: 12px; color: var(--label-primary); background: var(--input-major); border: 1px solid var(--border-l1); border-radius: var(--r-sm); }
+.plan-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding-top: 2px; }
+.plan-actions .muted { font-size: 11.5px; }
