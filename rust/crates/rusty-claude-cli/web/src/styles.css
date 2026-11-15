@@ -1287,6 +1287,46 @@ details.process-thinking .expand-full { margin: 4px 0 8px; }
   background: rgba(242, 90, 90, 0.08);
 }
 
+/* ---------- 第二批 D：工具卡定制渲染（本批新增，仅追加，勿重排上方样式） ---------- */
+/* 对齐 TUI 工具卡的信息层次：命令 / 路径 / diff / 读写计数 / 错误高亮。 */
+.process-tool.tool-card { margin: 6px 0; padding-left: 8px; border-left: 2px solid transparent; }
+.process-tool.tool-card.running { border-left-color: var(--border-l2); }
+.process-tool.tool-card.error { border-left-color: var(--danger); }
+.tool-card-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 13px; padding: 2px 0; }
+.tool-card-head .tool-icon { flex: none; width: 16px; text-align: center; color: var(--label-caption); }
+.tool-card-head .tool-verb { flex: none; color: var(--label-secondary); font-weight: 600; }
+.tool-card-head .tool-target { min-width: 0; max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--label-primary); }
+.tool-inline { font-family: var(--font-code); font-size: 12px; color: var(--link); background: var(--code-inline); border-radius: var(--r-xs); padding: 0 4px; }
+.tool-path { font-family: var(--font-code); font-size: 12px; color: var(--link); padding: 0 4px; border-radius: var(--r-xs); max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-path:hover:not(:disabled) { background: var(--hover); text-decoration: underline; }
+.tool-badge { margin-left: auto; flex: none; font-size: 11px; line-height: 18px; padding: 0 8px; border-radius: 999px; color: var(--label-caption); background: var(--layer-2); }
+.process-tool.error .tool-badge { color: var(--danger); }
+.tool-meta { font-size: 12px; color: var(--label-caption); padding: 0 0 2px 22px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-card-body pre { margin: 4px 0; }
+.tool-card-body pre.tool-term { max-height: 120px; padding: 6px 8px; background: var(--code-block); border-left: 2px solid var(--border-l3); color: var(--label-primary); }
+.tool-card-body pre.tool-term .prompt { color: var(--success); margin-right: 4px; }
+.tool-card-body pre.tool-stdout { color: var(--label-secondary); }
+.tool-card-body pre.tool-stderr,
+.tool-card-body pre.tool-error-text { color: var(--danger); background: rgba(242, 90, 90, 0.08); }
+.tool-card-body pre.tool-code { max-height: 240px; overflow: auto; }
+.tool-more { font-size: 11px; color: var(--label-caption); margin: 0 0 4px 22px; }
+.tool-files { list-style: none; margin: 2px 0 4px; padding: 0 0 0 22px; display: flex; flex-direction: column; gap: 1px; }
+.tool-files .tool-path { max-width: 100%; text-align: left; }
+.tool-todos { list-style: none; margin: 2px 0 4px; padding: 0 0 0 22px; font-size: 12.5px; color: var(--label-secondary); }
+.tool-todos li { display: flex; gap: 6px; line-height: 20px; }
+.tool-todos .done { color: var(--success); }
+.tool-todos .active { color: var(--link); }
+.tool-links { list-style: none; margin: 2px 0 4px; padding: 0 0 0 22px; display: flex; flex-direction: column; gap: 3px; font-size: 12.5px; }
+.tool-links a { color: var(--link); text-decoration: none; }
+.tool-links a:hover { text-decoration: underline; }
+.tool-link-sub { color: var(--label-caption); font-size: 11.5px; }
+.tool-raw { margin: 4px 0 2px; }
+.tool-raw > summary { cursor: pointer; font-size: 11px; color: var(--label-caption); }
+.tool-raw pre { max-height: 240px; margin: 3px 0; }
+.tool-raw-label { margin-top: 4px; font-size: 10.5px; letter-spacing: 0.04em; color: var(--label-caption); }
+.tool-empty { font-size: 12px; color: var(--label-caption); padding-left: 22px; }
+
+
 /* ── 任务面板：可编辑计划 / SSE 连接指示（第二批 C） ───────────────── */
 .pane-toolbar button.active { background: var(--active); border-color: var(--link); color: var(--label-primary); }
 .task-conn { width: 7px; height: 7px; border-radius: 50%; margin-left: auto; background: var(--label-caption); opacity: 0.5; }

@@ -3,17 +3,7 @@ import { Markdown } from '../markdown'
 import { groupTurns, processTitle } from '../turns'
 import { fmtClock } from '../shared/utils.js'
 import { api } from '../api'
-
-function colorizePatch(patch) {
-  return String(patch || '').split('\n').map((line, index) => {
-    let cls = ''
-    if (line.startsWith('@@')) cls = 'l-hunk'
-    else if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff ')) cls = 'l-meta'
-    else if (line.startsWith('+')) cls = 'l-add'
-    else if (line.startsWith('-')) cls = 'l-del'
-    return <span key={index} className={cls}>{line + '\n'}</span>
-  })
-}
+import { ToolCard, FullTextButton } from './ToolCard'
 
 export function Conversation({ messages, optimistic, live, liveThinking, liveTools, loading }) {
   const ref = useRef(null)
@@ -161,21 +151,7 @@ export function UserMessage({ message, pending }) {
 }
 
 // 截断块专用：按 ref 回读磁盘原文，展开后原位替换（刷新前后都可用）。
-function FullTextButton({ meta, onExpand, expanding }) {
-  if (!meta?.ref) return null
-  const busy = expanding === meta.ref
-  return (
-    <button
-      type="button"
-      className="ghost expand-full"
-      onClick={() => onExpand(meta)}
-      disabled={busy}
-      title="从会话文件读取未截断的完整内容"
-    >
-      {busy ? '读取中…' : `查看全文（${meta.chars} 字）`}
-    </button>
-  )
-}
+// 组件本体在 ToolCard.jsx，AnswerMessage 与工具卡共用。
 
 export function AnswerMessage({ text, ts, meta, onExpand, expanding }) {
   const [copied, setCopied] = useState(false)
@@ -200,8 +176,6 @@ export function AnswerMessage({ text, ts, meta, onExpand, expanding }) {
 }
 
 export function ProcessRow({ row, truncations, onExpand, expanding }) {
-  const inputMeta = truncations?.get(row.input)
-  const outputMeta = truncations?.get(row.output)
   if (row.kind === 'thinking') {
     return (
       <details className="process-thinking">
@@ -212,18 +186,13 @@ export function ProcessRow({ row, truncations, onExpand, expanding }) {
     )
   }
   if (row.kind === 'tool') {
-    const state = row.output === null ? 'running' : row.error ? 'error' : 'done'
-    const mark = state === 'running' ? '◌' : state === 'error' ? '✗' : '✓'
-    const output = row.output || ''
-    const isDiff = /^(diff --git|@@ )/m.test(output) || output.includes('\n@@ ')
     return (
-      <details className={`process-tool ${state}`} open={state === 'running'}>
-        <summary><span className="tool-mark">{mark}</span> {row.name}</summary>
-        {row.input ? <pre className="tool-input">{row.input}</pre> : null}
-        <FullTextButton meta={inputMeta} onExpand={onExpand} expanding={expanding} />
-        {output ? (isDiff ? <pre className="patch">{colorizePatch(output)}</pre> : <pre>{output}</pre>) : null}
-        <FullTextButton meta={outputMeta} onExpand={onExpand} expanding={expanding} />
-      </details>
+      <ToolCard
+        row={row}
+        truncations={truncations}
+        onExpand={onExpand}
+        expanding={expanding}
+      />
     )
   }
   return <div className="process-text"><Markdown text={row.text} /></div>
