@@ -24,7 +24,7 @@ use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{Html, IntoResponse, Json, Response};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -139,6 +139,34 @@ struct TodosBody {
     items: Vec<TodoItemBody>,
 }
 
+/// Web 端计划编辑的单步输入。
+#[derive(Deserialize)]
+struct PlanStepBody {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    acceptance_criteria: String,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// `PUT /api/session/{id}/plan` 与 confirm 的请求体；字段全部可选，按增量更新。
+#[derive(Deserialize, Default)]
+struct PlanUpdateBody {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    approved: Option<bool>,
+    #[serde(default)]
+    task_summary: Option<String>,
+    #[serde(default)]
+    steps: Option<Vec<PlanStepBody>>,
+    #[serde(default)]
+    plan_id: Option<String>,
+}
+
 fn web_todos_path(workspace: &Path, id: &str) -> PathBuf {
     workspace
         .join(".claw")
@@ -146,16 +174,369 @@ fn web_todos_path(workspace: &Path, id: &str) -> PathBuf {
         .join(format!("{id}.json"))
 }
 
-fn load_web_todos(workspace: &Path, id: &str) -> Vec<Value> {
-    std::fs::read_to_string(web_todos_path(workspace, id))
+/// 待办 sidecar 的完整状态：`revision` 由 Web 端每次写入递增，SSE 事件与
+/// 快照都带上它，前端据此丢弃乱序/重复事件（重连后先到的旧快照不会覆盖新状态）。
+fn web_todos_state(workspace: &Path, id: &str) -> (Vec<Value>, u64) {
+    let value = std::fs::read_to_string(web_todos_path(workspace, id))
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| value["items"].as_array().cloned())
+        .unwrap_or(Value::Null);
+    let items = value["items"].as_array().cloned().unwrap_or_default();
+    // 旧版 sidecar 没有 revision，按 0 处理，保持向后兼容。
+    (items, value["revision"].as_u64().unwrap_or(0))
+}
+
+fn load_web_todos(workspace: &Path, id: &str) -> Vec<Value> {
+    web_todos_state(workspace, id).0
+}
+
+fn web_plan_path(workspace: &Path, id: &str) -> PathBuf {
+    workspace
+        .join(".claw")
+        .join("web-plan")
+        .join(format!("{id}.json"))
+}
+
+/// 计划步骤状态统一成前端使用的五种小写值。
+///
+/// 来源有两处：PlanArtifact 文件用 Rust 枚举序列化出的 `Pending`/`Succeeded`
+/// 等首字母大写值，历史 TodoWrite 又用 `completed`/`in_progress`。统一成
+/// `pending|executing|done|failed|skipped` 后，前端只认一套。
+fn normalize_plan_status(raw: &str) -> &'static str {
+    match raw {
+        "Executing" | "executing" | "in_progress" | "running" => "executing",
+        "Succeeded" | "succeeded" | "completed" | "done" => "done",
+        "Failed" | "failed" => "failed",
+        "Skipped" | "skipped" => "skipped",
+        _ => "pending",
+    }
+}
+
+/// 写回 PlanArtifact 文件时的状态值是 Serde 枚举名，必须转回。
+fn artifact_status(status: &str) -> &'static str {
+    match status {
+        "executing" => "Executing",
+        "done" => "Succeeded",
+        "failed" => "Failed",
+        "skipped" => "Skipped",
+        _ => "Pending",
+    }
+}
+
+/// `.claw/plans/*.json` 全部读出，按最近修改倒序。
+fn read_plan_artifacts(root: &Path) -> Vec<Value> {
+    let dir = root.join(".claw").join("plans");
+    let mut plans = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let value = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .unwrap_or(Value::Null);
+            plans.push(json!({
+                "id": id,
+                "updated_ms": modified_ms(&path),
+                "plan": value,
+            }));
+        }
+    }
+    plans.sort_by_key(|plan| std::cmp::Reverse(plan["updated_ms"].as_u64().unwrap_or(0)));
+    plans
+}
+
+fn plan_steps_from_artifact(value: &Value) -> Vec<Value> {
+    value["steps"]
+        .as_array()
+        .map(|steps| {
+            steps
+                .iter()
+                .take(50)
+                .enumerate()
+                .filter_map(|(index, step)| {
+                    let description = step["description"].as_str().unwrap_or("").trim();
+                    if description.is_empty() {
+                        return None;
+                    }
+                    Some(json!({
+                        "id": step["id"].as_str().map_or_else(|| format!("s{}", index + 1), str::to_string),
+                        "description": description,
+                        "acceptance_criteria": step["acceptance_criteria"].as_str().unwrap_or(""),
+                        "status": normalize_plan_status(step["status"].as_str().unwrap_or("pending")),
+                    }))
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
 
-/// 把 Web 端维护的待办清单作为上下文前缀注入 prompt，让 agent 看得到当前进度。
-fn prompt_with_web_todos(workspace: &Path, id: &str, text: &str) -> String {
+/// 没有 sidecar 时，从会话里最后一次 EnterPlanMode/ExitPlanMode 推断计划模式。
+fn session_plan_mode_hint(path: &Path) -> Option<bool> {
+    let session = runtime::Session::load_from_path(path).ok()?;
+    for message in session.messages.iter().rev() {
+        for block in message.blocks.iter().rev() {
+            let runtime::ContentBlock::ToolUse { name, .. } = block else {
+                continue;
+            };
+            match name.as_str() {
+                "EnterPlanMode" => return Some(true),
+                "ExitPlanMode" => return Some(false),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Web 端看到的计划状态。
+///
+/// 优先级：`.claw/web-plan/<session>.json`（用户在 Web 端改过）→ 最新的
+/// `.claw/plans/*.json`（CLI 规划器写的 PlanArtifact）→ 空。sidecar 缺失时
+/// 返回的是只读草稿（`source: "artifact"`），用户第一次保存才落盘。
+fn load_web_plan(workspace: &Path, session_path: &Path, id: &str) -> Value {
+    let sidecar = std::fs::read_to_string(web_plan_path(workspace, id))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    if let Some(mut value) = sidecar {
+        value["source"] = json!("web");
+        value["session"] = json!(id);
+        return value;
+    }
+    let enabled = session_plan_mode_hint(session_path).unwrap_or(false);
+    let plan = read_plan_artifacts(workspace)
+        .into_iter()
+        .next()
+        .and_then(|artifacts| {
+            let artifact = &artifacts["plan"];
+            let steps = plan_steps_from_artifact(artifact);
+            if steps.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "id": artifacts["id"],
+                "task_summary": artifact["task_summary"].as_str().unwrap_or(""),
+                "steps": steps,
+            }))
+        });
+    json!({
+        "session": id,
+        "enabled": enabled,
+        "approved": false,
+        "revision": 0,
+        "source": "artifact",
+        "plan": plan,
+    })
+}
+
+/// 把 Web 编辑写回同 id 的 PlanArtifact 文件（保留 attempts/verify/risk 等字段）。
+/// 失败只返回 false，不影响 sidecar 的保存。
+fn merge_plan_artifact(workspace: &Path, plan: &Value) -> bool {
+    let Some(plan_id) = plan["id"].as_str() else {
+        return false;
+    };
+    if plan_id.starts_with("web-") {
+        return false;
+    }
+    let path = workspace
+        .join(".claw")
+        .join("plans")
+        .join(format!("{plan_id}.json"));
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(mut artifact) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    artifact["task_summary"] = plan["task_summary"].clone();
+    let existing = artifact["steps"].as_array().cloned().unwrap_or_default();
+    let steps: Vec<Value> = plan["steps"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|step| {
+            let step_id = step["id"].as_str().unwrap_or("");
+            let mut merged = existing
+                .iter()
+                .find(|item| item["id"].as_str() == Some(step_id))
+                .cloned()
+                .unwrap_or_else(|| {
+                    json!({
+                        "id": step_id,
+                        "description": "",
+                        "acceptance_criteria": "",
+                        "verify_command": null,
+                        "last_tool_use_id": null,
+                        "status": "Pending",
+                        "attempts": 0,
+                        "risk_level": "Low",
+                    })
+                });
+            merged["description"] = step["description"].clone();
+            merged["acceptance_criteria"] = step["acceptance_criteria"].clone();
+            merged["status"] = json!(artifact_status(
+                step["status"].as_str().unwrap_or("pending")
+            ));
+            merged
+        })
+        .collect();
+    artifact["steps"] = Value::Array(steps);
+    atomic_write(&path, &artifact.to_string()).is_ok()
+}
+
+fn sanitize_plan_steps(steps: &[PlanStepBody]) -> Vec<Value> {
+    let mut used = BTreeSet::new();
+    steps
+        .iter()
+        .take(50)
+        .enumerate()
+        .filter_map(|(index, step)| {
+            let description = step.description.trim();
+            if description.is_empty() {
+                return None;
+            }
+            let mut step_id = step
+                .id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map_or_else(|| format!("s{}", index + 1), str::to_string);
+            while used.contains(&step_id) {
+                step_id.push('_');
+            }
+            used.insert(step_id.clone());
+            Some(json!({
+                "id": step_id,
+                "description": truncate_chars(description, 500),
+                "acceptance_criteria": truncate_chars(step.acceptance_criteria.trim(), 500),
+                "status": normalize_plan_status(step.status.as_deref().unwrap_or("pending")),
+            }))
+        })
+        .collect()
+}
+
+/// 保存 Web 计划：sidecar 必写；plan id 指向真实 artifact 时同时回写文件。
+fn save_web_plan(
+    workspace: &Path,
+    session_path: &Path,
+    id: &str,
+    body: &PlanUpdateBody,
+) -> Result<Value, (StatusCode, String)> {
+    let current = load_web_plan(workspace, session_path, id);
+    let current_plan = &current["plan"];
+    let steps = body.steps.as_deref().map_or_else(
+        || current_plan["steps"].clone(),
+        |items| Value::Array(sanitize_plan_steps(items)),
+    );
+    let task_summary = body.task_summary.as_deref().map(str::trim).map_or_else(
+        || {
+            current_plan["task_summary"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        },
+        str::to_string,
+    );
+    let plan_id = body
+        .plan_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            current_plan["id"]
+                .as_str()
+                .map(str::to_string)
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            (!steps.as_array().is_some_and(Vec::is_empty)).then(|| format!("web-{}", now_ms()))
+        });
+    let step_values = steps.as_array().cloned().unwrap_or_default();
+    // 只切计划模式（enabled）且当前没有计划时，不要把空对象落成「计划」。
+    let keep_plan =
+        current_plan.is_object() || body.steps.is_some() || !task_summary.trim().is_empty();
+    let plan = if keep_plan {
+        json!({
+            "id": plan_id,
+            "task_summary": truncate_chars(&task_summary, 500),
+            "steps": step_values,
+        })
+    } else {
+        Value::Null
+    };
+    let enabled = body
+        .enabled
+        .unwrap_or_else(|| current["enabled"].as_bool().unwrap_or(false));
+    // 编辑条目后旧的「已确认」不再成立，必须重新确认；显式 approved 优先。
+    let approved = body
+        .approved
+        .unwrap_or_else(|| current["approved"].as_bool().unwrap_or(false) && body.steps.is_none());
+    let revision = current["revision"].as_u64().unwrap_or(0) + 1;
+    let state = json!({
+        "session": id,
+        "enabled": enabled,
+        "approved": approved,
+        "revision": revision,
+        "source": "web",
+        "plan": plan,
+    });
+    let path = web_plan_path(workspace, id);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    atomic_write(&path, &state.to_string())
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if let Some(plan) = state["plan"].as_object() {
+        let _ = merge_plan_artifact(workspace, &Value::Object(plan.clone()));
+    }
+    Ok(state)
+}
+
+/// 组装注入 prompt 的 Web 上下文：计划模式指令 + 确认过的计划 + 待办清单。
+fn prompt_with_web_context(workspace: &Path, session_path: &Path, id: &str, text: &str) -> String {
+    let mut prefix = String::new();
+    let plan_state = load_web_plan(workspace, session_path, id);
+    if plan_state["enabled"].as_bool().unwrap_or(false) {
+        prefix.push_str(
+            "[计划模式] 当前会话处于计划模式：先用计划形式回应（任务理解、步骤、验收标准），\
+             暂不直接修改代码；用户确认计划后再执行。\n\n",
+        );
+    }
+    if let Some(plan) = plan_state["plan"].as_object() {
+        let summary = plan["task_summary"].as_str().unwrap_or("").trim();
+        let steps = plan["steps"].as_array().cloned().unwrap_or_default();
+        if !summary.is_empty() || !steps.is_empty() {
+            let mut block = String::from("[Web 计划（用户在 Web 端维护，作为当前执行计划）]\n");
+            if !summary.is_empty() {
+                block.push_str(&format!("任务: {summary}\n"));
+            }
+            for (index, step) in steps.iter().enumerate() {
+                block.push_str(&format!(
+                    "{}. [{}] {}",
+                    index + 1,
+                    step["status"].as_str().unwrap_or("pending"),
+                    step["description"].as_str().unwrap_or("")
+                ));
+                let acceptance = step["acceptance_criteria"].as_str().unwrap_or("");
+                if !acceptance.is_empty() {
+                    block.push_str(&format!("（验收：{acceptance}）"));
+                }
+                block.push('\n');
+            }
+            if plan_state["approved"].as_bool().unwrap_or(false) {
+                block.push_str("（用户已确认该计划，请按顺序继续执行。）\n");
+            }
+            block.push('\n');
+            prefix.push_str(&block);
+        }
+    }
     let mut lines = Vec::new();
     for item in load_web_todos(workspace, id).iter().take(100) {
         let label = item["text"].as_str().unwrap_or("").trim();
@@ -165,14 +546,17 @@ fn prompt_with_web_todos(workspace: &Path, id: &str, text: &str) -> String {
         let done = item["done"].as_bool().unwrap_or(false);
         lines.push(format!("- [{}] {}", if done { 'x' } else { ' ' }, label));
     }
-    if lines.is_empty() {
-        return text.to_string();
+    if !lines.is_empty() {
+        prefix.push_str(&format!(
+            "[Web 待办状态（用户在 Web 端维护，可作为当前任务清单）]\n{}\n\n",
+            lines.join("\n")
+        ));
     }
-    format!(
-        "[Web 待办状态（用户在 Web 端维护，可作为当前任务清单）]\n{}\n\n{}",
-        lines.join("\n"),
-        text
-    )
+    if prefix.is_empty() {
+        text.to_string()
+    } else {
+        format!("{prefix}{text}")
+    }
 }
 
 /// 上下文引用：`@path` / `@path:12` / `@path:12-40`（行号从 1 起）。
@@ -689,6 +1073,9 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 "/api/session/{id}/todos",
                 get(api_todos_get).post(api_todos_set),
             )
+            // 计划：GET 快照 / PUT 编辑（并写回 PlanArtifact）/ confirm 确认并继续。
+            .route("/api/session/{id}/plan", get(api_plan_get).put(api_plan_set))
+            .route("/api/session/{id}/plan/confirm", post(api_plan_confirm))
             .route("/api/session/{id}/events", get(api_events))
             .route("/api/session/{id}/approval", post(api_approval))
             // 语音讨论：无工具纯对话，与 agent 会话完全隔离（不落盘、不碰工作区）。
@@ -1402,6 +1789,27 @@ impl SessionWorker {
                     json!({ "session": emit_sid, "kind": "delta", "text": text })
                 }
                 runtime::StatusEvent::ToolUse { id, name, input } => {
+                    // 计划/待办类工具一出现就推增量事件：等 turn 结束再刷会让
+                    // 面板在长工具循环里长时间滞后。
+                    match name.as_str() {
+                        "TodoWrite" => {
+                            if let Ok(value) = serde_json::from_str::<Value>(&input) {
+                                if let Some(items) = value["todos"].as_array() {
+                                    sender.emit(
+                                        &emit_sid,
+                                        json!({ "kind": "todos", "scope": "agent", "items": items }),
+                                    );
+                                }
+                            }
+                        }
+                        "EnterPlanMode" => {
+                            sender.emit(&emit_sid, json!({ "kind": "plan_mode", "enabled": true }));
+                        }
+                        "ExitPlanMode" => {
+                            sender.emit(&emit_sid, json!({ "kind": "plan_mode", "enabled": false }));
+                        }
+                        _ => {}
+                    }
                     json!({ "session": emit_sid, "kind": "tool_use", "id": id, "name": name, "input": input })
                 }
                 runtime::StatusEvent::ToolResult {
@@ -1555,6 +1963,26 @@ fn spawn_session_worker(state: AppState, session_id: String) {
                 }
                 // 收尾权由 worker 与看门狗共享：谁先 swap 成功谁发 done。
                 if !turn.finished.swap(true, Ordering::SeqCst) {
+                    // turn 结束是计划文件/任务工具唯一可靠的落盘点：先推一次
+                    // 快照，前端无需在 done 后再轮询任务面板。
+                    if let Ok(snapshot) = tasks_snapshot(&turn.job.session_path, &worker_session)
+                    {
+                        task_state
+                            .events
+                            .emit(&worker_session, json!({ "kind": "tasks", "tasks": snapshot }));
+                    }
+                    let plan_state = load_web_plan(
+                        &turn.job.workspace,
+                        &turn.job.session_path,
+                        &worker_session,
+                    );
+                    task_state
+                        .events
+                        .emit(&worker_session, json!({ "kind": "plan", "state": plan_state }));
+                    task_state.events.emit(
+                        &worker_session,
+                        json!({ "kind": "plans", "plans": read_plan_artifacts(&turn.job.workspace) }),
+                    );
                     task_state
                         .events
                         .emit(&worker_session, json!({ "kind": "done" }));
@@ -1623,7 +2051,7 @@ async fn api_prompt(
 
     // `@path:12-40` 这类引用直接展开成带行号的代码块，省掉 agent 首轮 read_file 往返。
     let expanded_text = expand_mentions(&session_workspace, &body.text);
-    let text = prompt_with_web_todos(&session_workspace, &id, &expanded_text);
+    let text = prompt_with_web_context(&session_workspace, &path, &id, &expanded_text);
     let job = PromptJob {
         session_id: id.clone(),
         session_path: path,
@@ -2385,30 +2813,7 @@ async fn api_plans(State(state): State<AppState>, Query(query): Query<PathQuery>
         Ok(root) => root,
         Err((code, message)) => return (code, message).into_response(),
     };
-    let dir = root.join(".claw").join("plans");
-    let mut plans = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                continue;
-            }
-            let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                continue;
-            };
-            let value = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                .unwrap_or(Value::Null);
-            plans.push(json!({
-                "id": id,
-                "updated_ms": modified_ms(&path),
-                "plan": value,
-            }));
-        }
-    }
-    plans.sort_by_key(|plan| std::cmp::Reverse(plan["updated_ms"].as_u64().unwrap_or(0)));
-    Json(json!({ "plans": plans })).into_response()
+    Json(json!({ "plans": read_plan_artifacts(&root) })).into_response()
 }
 
 /// 附件：工作区图片 + `.claw/paste-cache` 里的粘贴文本，供预览面板列取。
@@ -3222,7 +3627,8 @@ async fn api_todos_get(
         Ok(found) => found,
         Err((code, message)) => return (code, message).into_response(),
     };
-    Json(json!({ "session": id, "items": load_web_todos(&workspace, &id) })).into_response()
+    let (items, revision) = web_todos_state(&workspace, &id);
+    Json(json!({ "session": id, "items": items, "revision": revision })).into_response()
 }
 
 async fn api_todos_set(
@@ -3254,13 +3660,30 @@ async fn api_todos_set(
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match atomic_write(&path, &json!({ "items": items }).to_string()) {
-        Ok(()) => Json(json!({ "session": id, "items": items })).into_response(),
+    let revision = web_todos_state(&workspace, &id).1 + 1;
+    match atomic_write(
+        &path,
+        &json!({ "items": items, "revision": revision }).to_string(),
+    ) {
+        Ok(()) => {
+            // 订阅端凭 revision 去重：写入成功才推，前端不必轮询或手动刷新。
+            state.events.emit(
+                &id,
+                json!({
+                    "kind": "todos",
+                    "scope": "web",
+                    "revision": revision,
+                    "items": items,
+                }),
+            );
+            Json(json!({ "session": id, "items": items, "revision": revision })).into_response()
+        }
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
 
-async fn api_tasks(
+/// 计划快照：sidecar 优先，缺失时回落到最新的 PlanArtifact 草稿。
+async fn api_plan_get(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
     Query(auth): Query<AuthQuery>,
@@ -3268,15 +3691,123 @@ async fn api_tasks(
     if !authorize(&state, &auth) {
         return unauthorized();
     }
-    let path = match resolve_session(&state, &id) {
-        Ok((path, _workspace)) => path,
+    let (session_path, workspace) = match resolve_session(&state, &id) {
+        Ok(found) => found,
         Err((code, message)) => return (code, message).into_response(),
     };
-    let session = match runtime::Session::load_from_path(&path) {
-        Ok(session) => session,
-        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
-    };
+    Json(load_web_plan(&workspace, &session_path, &id)).into_response()
+}
 
+async fn api_plan_set(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<PlanUpdateBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let (session_path, workspace) = match resolve_session(&state, &id) {
+        Ok(found) => found,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    match save_web_plan(&workspace, &session_path, &id, &body) {
+        Ok(saved) => {
+            state
+                .events
+                .emit(&id, json!({ "kind": "plan", "state": saved.clone() }));
+            Json(saved).into_response()
+        }
+        Err((code, message)) => (code, message).into_response(),
+    }
+}
+
+/// 确认计划并真正开跑下一轮：先落盘 approved，再按现有 prompt 通道入队。
+async fn api_plan_confirm(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<PlanUpdateBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let (session_path, workspace) = match resolve_session(&state, &id) {
+        Ok(found) => found,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let body = PlanUpdateBody {
+        approved: Some(true),
+        // 确认即进入执行：注入的「暂不改代码」计划模式指令要同时撤掉，
+        // 否则同一轮里既要求别动手又要求继续执行。
+        enabled: Some(false),
+        ..body
+    };
+    let saved = match save_web_plan(&workspace, &session_path, &id, &body) {
+        Ok(saved) => saved,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    if saved["plan"].is_null() {
+        return (StatusCode::BAD_REQUEST, "还没有可确认的计划：请先添加步骤").into_response();
+    }
+    state
+        .events
+        .emit(&id, json!({ "kind": "plan", "state": saved.clone() }));
+    let text = "计划已确认，请按当前计划继续执行。";
+    match enqueue_session_prompt(&state, &id, text, "workspace-write", None) {
+        Ok(status) => Json(json!({ "session": id, "plan": saved, "turn": status })).into_response(),
+        Err((code, message)) => (code, message).into_response(),
+    }
+}
+
+/// 计划确认后的入队：与 `api_prompt` 同一条路径（@引用展开 + Web 上下文注入）。
+fn enqueue_session_prompt(
+    state: &AppState,
+    id: &str,
+    text: &str,
+    permission: &str,
+    model: Option<String>,
+) -> Result<Value, (StatusCode, String)> {
+    let (path, workspace) = resolve_session(state, id)?;
+    let expanded_text = expand_mentions(&workspace, text);
+    let prompt = prompt_with_web_context(&workspace, &path, id, &expanded_text);
+    let job = PromptJob {
+        session_id: id.to_string(),
+        session_path: path,
+        workspace,
+        text: prompt,
+        permission: crate::permission_mode_from_label(permission),
+        model,
+    };
+    match state.scheduler.enqueue(job) {
+        Ok(enqueued) => {
+            if enqueued.start_worker {
+                spawn_session_worker(state.clone(), id.to_string());
+            }
+            Ok(json!({
+                "status": "queued",
+                "state": SessionState::Queued.label(),
+                "position": enqueued.position,
+                "session": id,
+            }))
+        }
+        Err(EnqueueError::QueueFull) => Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "该会话排队已满，请等待前面的消息处理完成后再确认".to_string(),
+        )),
+        Err(EnqueueError::OrphanLimit { active, limit }) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("当前有 {active} 个僵死会话线程（上限 {limit}），暂时无法确认计划"),
+        )),
+    }
+}
+
+/// `任务工具 / 定时记录 / 历史 TodoWrite / 计划模式` 的派生快照。
+///
+/// 抽成函数是为了让「turn 结束时主动推一次 SSE」与 `GET /tasks` 用同一份逻辑，
+/// 避免两条路径的字段/截断规则漂移。
+fn tasks_snapshot(path: &Path, id: &str) -> Result<Value, String> {
+    let session = runtime::Session::load_from_path(path).map_err(|error| error.to_string())?;
     let mut todos: Option<Vec<Value>> = None;
     let mut tasks: Vec<Value> = Vec::new();
     let mut crons: Vec<Value> = Vec::new();
@@ -3313,14 +3844,31 @@ async fn api_tasks(
         }
     }
 
-    Json(json!({
+    Ok(json!({
         "session": id,
         "plan_mode": plan_mode,
         "todos": todos.unwrap_or_default(),
         "tasks": tasks,
         "crons": crons,
     }))
-    .into_response()
+}
+
+async fn api_tasks(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let path = match resolve_session(&state, &id) {
+        Ok((path, _workspace)) => path,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    match tasks_snapshot(&path, &id) {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error).into_response(),
+    }
 }
 
 async fn api_meta(State(state): State<AppState>, Query(auth): Query<AuthQuery>) -> Response {
@@ -5003,10 +5551,72 @@ mod tests {
         let items = load_web_todos(dir.path(), id);
         assert_eq!(items.len(), 2);
 
-        let prompt = prompt_with_web_todos(dir.path(), id, "继续");
+        let prompt = prompt_with_web_context(dir.path(), &dir.path().join("s.jsonl"), id, "继续");
         assert!(prompt.contains("- [ ] 写测试"), "prompt: {prompt}");
         assert!(prompt.contains("- [x] 跑测试"), "prompt: {prompt}");
         assert!(prompt.ends_with("继续"));
+    }
+
+    #[test]
+    fn web_plan_edits_round_trip_and_inject_into_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "session-plan-1-0";
+        let session_path = dir.path().join("s.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+        let body = PlanUpdateBody {
+            enabled: Some(true),
+            approved: None,
+            task_summary: Some("实现订阅式任务面板".to_string()),
+            steps: Some(vec![
+                PlanStepBody {
+                    id: None,
+                    description: "补 SSE 事件".to_string(),
+                    acceptance_criteria: "不刷新也能看到".to_string(),
+                    status: Some("done".to_string()),
+                },
+                PlanStepBody {
+                    id: None,
+                    description: "计划可编辑".to_string(),
+                    acceptance_criteria: "保存后下轮可见".to_string(),
+                    status: None,
+                },
+            ]),
+            plan_id: None,
+        };
+        let saved = save_web_plan(dir.path(), &session_path, id, &body).expect("save plan");
+        assert_eq!(saved["revision"], 1);
+        assert_eq!(saved["approved"], false);
+        assert_eq!(saved["plan"]["steps"][0]["status"], "done");
+        assert!(saved["plan"]["id"].as_str().unwrap().starts_with("web-"));
+
+        let prompt = prompt_with_web_context(dir.path(), &session_path, id, "继续");
+        assert!(prompt.contains("[计划模式]"), "prompt: {prompt}");
+        assert!(prompt.contains("1. [done] 补 SSE 事件"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("2. [pending] 计划可编辑"),
+            "prompt: {prompt}"
+        );
+        assert!(prompt.ends_with("继续"));
+
+        // 确认后再注入：多一行「已确认」。
+        let confirm = PlanUpdateBody {
+            approved: Some(true),
+            ..PlanUpdateBody::default()
+        };
+        let confirmed = save_web_plan(dir.path(), &session_path, id, &confirm).expect("confirm");
+        assert_eq!(confirmed["approved"], true);
+        assert_eq!(confirmed["revision"], 2);
+        let prompt = prompt_with_web_context(dir.path(), &session_path, id, "继续");
+        assert!(prompt.contains("用户已确认该计划"), "prompt: {prompt}");
+    }
+
+    #[test]
+    fn plan_status_normalizes_artifact_and_todo_names() {
+        assert_eq!(normalize_plan_status("Succeeded"), "done");
+        assert_eq!(normalize_plan_status("in_progress"), "executing");
+        assert_eq!(normalize_plan_status("Pending"), "pending");
+        assert_eq!(artifact_status("done"), "Succeeded");
+        assert_eq!(artifact_status("pending"), "Pending");
     }
 
     /// 一个真实形状的 patch：两文件、多 hunk，含 section 标题。
