@@ -15,7 +15,12 @@ use serde::{Deserialize, Serialize};
 const SESSION_VERSION: u32 = 1;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
 const MAX_ROTATED_FILES: usize = 3;
-const MAX_JSONL_FIELD_CHARS: usize = 4 * 1024;
+/// 单字段落盘上限。
+///
+/// Web 端会把长文本截断显示，并支持「查看全文」回读磁盘；若这里仍在 4K 截断，
+/// 磁盘上就没有全文可读。放宽到 64K 字符：既能容纳常见的长回答/工具输出，
+/// 又仍小于 256KB 的轮转阈值（中文 64K 字符约 192KB）。
+const MAX_JSONL_FIELD_CHARS: usize = 64 * 1024;
 const JSONL_TRUNCATION_MARKER: &str = "… [truncated for session JSONL]";
 const JSONL_REDACTION_MARKER: &str = "[redacted]";
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1971,6 +1976,9 @@ mod tests {
             "OPENAI_API_KEY={secret}\n{}",
             "tool-output ".repeat(super::MAX_JSONL_FIELD_CHARS)
         );
+        // 工具输出在进入会话前已按 50KB 分档截断，落盘时不会再触发 JSONL 截断；
+        // 这里用一条超长助手文本覆盖 JSONL 单字段上限。
+        let oversized_text = "x".repeat(super::MAX_JSONL_FIELD_CHARS + 16);
         let mut session = Session::new();
         session
             .push_message(ConversationMessage::assistant(vec![
@@ -1989,6 +1997,11 @@ mod tests {
                 false,
             ))
             .expect("tool result should append");
+        session
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: oversized_text,
+            }]))
+            .expect("assistant text should append");
 
         session.save_to_path(&path).expect("session should save");
         let persisted = fs::read_to_string(&path).expect("session jsonl should read");
@@ -2007,8 +2020,39 @@ mod tests {
         };
         assert!(!output.contains(secret));
         assert!(output.contains(super::JSONL_REDACTION_MARKER));
-        assert!(output.ends_with(super::JSONL_TRUNCATION_MARKER));
-        assert!(output.chars().count() <= super::MAX_JSONL_FIELD_CHARS);
+        assert!(output.contains("[... 输出过长已截断"));
+        assert!(!output.contains(super::JSONL_TRUNCATION_MARKER));
+
+        let ContentBlock::Text { text } = &restored.messages[2].blocks[0] else {
+            panic!("restored third message should be text");
+        };
+        assert!(text.ends_with(super::JSONL_TRUNCATION_MARKER));
+        assert!(text.chars().count() <= super::MAX_JSONL_FIELD_CHARS);
+    }
+
+    #[test]
+    fn jsonl_keeps_long_text_readable_after_reload() {
+        // Web 端「查看全文」依赖磁盘上保留完整内容：15k 字回答必须原样落盘并可重新读回。
+        let path = temp_session_path("jsonl-long-text");
+        let long_text = "开头".to_string() + &"甲乙丙丁".repeat(3_757) + "结尾";
+        assert_eq!(long_text.chars().count(), 15_032);
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: long_text.clone(),
+            }]))
+            .expect("assistant append should succeed");
+        session.save_to_path(&path).expect("session should save");
+
+        let persisted = fs::read_to_string(&path).expect("session jsonl should read");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert!(!persisted.contains(super::JSONL_TRUNCATION_MARKER));
+        let ContentBlock::Text { text } = &restored.messages[0].blocks[0] else {
+            panic!("restored message should be text");
+        };
+        assert_eq!(text, &long_text);
     }
 
     // ---- 痛点 2:分档截断测试 ----

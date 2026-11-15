@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Markdown } from '../markdown'
 import { groupTurns, processTitle } from '../turns'
 import { fmtClock } from '../shared/utils.js'
+import { api } from '../api'
 
 function colorizePatch(patch) {
   return String(patch || '').split('\n').map((line, index) => {
@@ -19,6 +20,59 @@ export function Conversation({ messages, optimistic, live, liveThinking, liveToo
   const stick = useRef(true)
   const [atBottom, setAtBottom] = useState(true)
   const [visibleCount, setVisibleCount] = useState(120)
+  // 被截断的块：ref → 磁盘原文。只在用户点「查看全文」时回读，不破坏列表体积。
+  const [expanded, setExpanded] = useState({})
+  const [expanding, setExpanding] = useState('')
+  const [expandError, setExpandError] = useState('')
+
+  // 以「屏幕上那串截断文本」为 key 把元数据传给子组件，
+  // 这样不必改动 turns.js 的行结构也能定位到具体块。
+  const truncations = useMemo(() => {
+    const map = new Map()
+    for (const message of messages || []) {
+      for (const block of message.blocks || []) {
+        const meta = block.truncated
+        if (!meta?.ref) continue
+        const value = block.kind === 'tool_use' ? block.input : block.kind === 'tool_result' ? block.output : block.text
+        if (typeof value === 'string' && value) map.set(value, { ...meta, kind: block.kind })
+      }
+    }
+    return map
+  }, [messages])
+
+  const patched = useMemo(() => {
+    if (!Object.keys(expanded).length) return messages || []
+    return (messages || []).map((message) => {
+      if (!(message.blocks || []).some((block) => block.truncated?.ref && expanded[block.truncated.ref])) {
+        return message
+      }
+      return {
+        ...message,
+        blocks: message.blocks.map((block) => {
+          const full = block.truncated?.ref ? expanded[block.truncated.ref] : ''
+          if (!full) return block
+          const field = block.kind === 'tool_use' ? 'input' : block.kind === 'tool_result' ? 'output' : 'text'
+          return { ...block, [field]: full }
+        }),
+      }
+    })
+  }, [messages, expanded])
+
+  const expand = async (meta) => {
+    if (!meta?.ref || expanding) return
+    setExpanding(meta.ref)
+    setExpandError('')
+    try {
+      const data = await api('/api/block?r=' + encodeURIComponent(meta.ref))
+      const text = data.text ?? data.input ?? data.output ?? ''
+      setExpanded((prev) => ({ ...prev, [meta.ref]: text }))
+    } catch (error) {
+      setExpandError(String(error?.message || error))
+    } finally {
+      setExpanding('')
+    }
+  }
+
   useEffect(() => {
     const node = ref.current
     if (!node) return
@@ -41,8 +95,8 @@ export function Conversation({ messages, optimistic, live, liveThinking, liveToo
     setAtBottom(true)
   }
   const visible = useMemo(
-    () => (messages || []).filter((message) => (message.blocks || []).length > 0),
-    [messages],
+    () => patched.filter((message) => (message.blocks || []).length > 0),
+    [patched],
   )
   const shown = visible.length > visibleCount ? visible.slice(-visibleCount) : visible
   const turns = useMemo(() => groupTurns(shown), [shown])
@@ -68,7 +122,16 @@ export function Conversation({ messages, optimistic, live, liveThinking, liveToo
             </button>
           </div>
         )}
-        {turns.map((turn, index) => <TurnView key={index} turn={turn} />)}
+        {turns.map((turn, index) => (
+          <TurnView
+            key={index}
+            turn={turn}
+            truncations={truncations}
+            onExpand={expand}
+            expanding={expanding}
+          />
+        ))}
+        {expandError && <div className="truncation-error">读取全文失败：{expandError}</div>}
         {optimistic && (
           <UserMessage
             pending
@@ -97,7 +160,24 @@ export function UserMessage({ message, pending }) {
   )
 }
 
-export function AnswerMessage({ text, ts }) {
+// 截断块专用：按 ref 回读磁盘原文，展开后原位替换（刷新前后都可用）。
+function FullTextButton({ meta, onExpand, expanding }) {
+  if (!meta?.ref) return null
+  const busy = expanding === meta.ref
+  return (
+    <button
+      type="button"
+      className="ghost expand-full"
+      onClick={() => onExpand(meta)}
+      disabled={busy}
+      title="从会话文件读取未截断的完整内容"
+    >
+      {busy ? '读取中…' : `查看全文（${meta.chars} 字）`}
+    </button>
+  )
+}
+
+export function AnswerMessage({ text, ts, meta, onExpand, expanding }) {
   const [copied, setCopied] = useState(false)
   const copy = async () => {
     try {
@@ -112,18 +192,22 @@ export function AnswerMessage({ text, ts }) {
         <span className="who">助手</span>
         {ts ? <span className="ts">{fmtClock(ts)}</span> : null}
         <button className="ghost" onClick={copy}>{copied ? '已复制' : '复制'}</button>
+        <FullTextButton meta={meta} onExpand={onExpand} expanding={expanding} />
       </div>
       <div className="msg-body"><Markdown text={text} /></div>
     </div>
   )
 }
 
-export function ProcessRow({ row }) {
+export function ProcessRow({ row, truncations, onExpand, expanding }) {
+  const inputMeta = truncations?.get(row.input)
+  const outputMeta = truncations?.get(row.output)
   if (row.kind === 'thinking') {
     return (
       <details className="process-thinking">
         <summary>思考</summary>
         <pre>{row.text}</pre>
+        <FullTextButton meta={truncations?.get(row.text)} onExpand={onExpand} expanding={expanding} />
       </details>
     )
   }
@@ -136,14 +220,16 @@ export function ProcessRow({ row }) {
       <details className={`process-tool ${state}`} open={state === 'running'}>
         <summary><span className="tool-mark">{mark}</span> {row.name}</summary>
         {row.input ? <pre className="tool-input">{row.input}</pre> : null}
+        <FullTextButton meta={inputMeta} onExpand={onExpand} expanding={expanding} />
         {output ? (isDiff ? <pre className="patch">{colorizePatch(output)}</pre> : <pre>{output}</pre>) : null}
+        <FullTextButton meta={outputMeta} onExpand={onExpand} expanding={expanding} />
       </details>
     )
   }
   return <div className="process-text"><Markdown text={row.text} /></div>
 }
 
-export function ProcessGroup({ rows, live = false, durationMs = 0 }) {
+export function ProcessGroup({ rows, live = false, durationMs = 0, truncations, onExpand, expanding }) {
   const [open, setOpen] = useState(live)
   useEffect(() => { if (live) setOpen(true) }, [live])
   if (!rows.length) return null
@@ -154,18 +240,46 @@ export function ProcessGroup({ rows, live = false, durationMs = 0 }) {
         <span className="process-label">{processTitle(rows, live, durationMs)}</span>
         <span className={`process-chevron ${open ? 'open' : ''}`}>⌄</span>
       </button>
-      {open && <div className="process-body">{rows.map((row, index) => <ProcessRow key={index} row={row} />)}</div>}
+      {open && (
+        <div className="process-body">
+          {rows.map((row, index) => (
+            <ProcessRow
+              key={index}
+              row={row}
+              truncations={truncations}
+              onExpand={onExpand}
+              expanding={expanding}
+            />
+          ))}
+        </div>
+      )}
     </div>
   )
 }
 
-export function TurnView({ turn }) {
+export function TurnView({ turn, truncations, onExpand, expanding }) {
   const durationMs = turn.ts && turn.end ? Math.max(0, turn.end - turn.ts) : 0
   return (
     <div className="turn">
       {turn.user && <UserMessage message={turn.user} />}
-      {turn.rows.length > 0 && <ProcessGroup rows={turn.rows} durationMs={durationMs} />}
-      {turn.answer && <AnswerMessage text={turn.answer} ts={turn.end} />}
+      {turn.rows.length > 0 && (
+        <ProcessGroup
+          rows={turn.rows}
+          durationMs={durationMs}
+          truncations={truncations}
+          onExpand={onExpand}
+          expanding={expanding}
+        />
+      )}
+      {turn.answer && (
+        <AnswerMessage
+          text={turn.answer}
+          ts={turn.end}
+          meta={truncations?.get(turn.answer)}
+          onExpand={onExpand}
+          expanding={expanding}
+        />
+      )}
     </div>
   )
 }

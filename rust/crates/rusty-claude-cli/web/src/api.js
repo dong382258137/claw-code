@@ -42,7 +42,7 @@ export const postJson = (path, body) =>
   })
 
 export const wsUrl = (path) =>
-  `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${path}?t=${encodeURIComponent(token)}`
+  `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${path}${path.includes('?') ? '&' : '?'}t=${encodeURIComponent(token)}`
 
 export const rawUrl = (path, workspace) =>
   withToken(withWorkspace('/api/workspace/raw?path=' + encodeURIComponent(path), workspace))

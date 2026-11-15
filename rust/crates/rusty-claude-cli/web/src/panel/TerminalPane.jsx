@@ -4,7 +4,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { wsUrl } from '../api'
 
-export function TerminalPane() {
+export function TerminalPane({ workspace }) {
   const [status, setStatus] = useState('未连接')
   const [fullscreen, setFullscreen] = useState(false)
   const hostRef = useRef(null)
@@ -30,7 +30,8 @@ export function TerminalPane() {
     sendJson({ type: 'resize', cols: term.cols, rows: term.rows })
   }, [sendJson])
 
-  // 终端只初始化一次：xterm 实例随渲染重建会丢掉滚屏缓冲区与光标状态。
+  // 终端随工作区重建：xterm 实例重建会丢滚屏，但切工作区时 cwd 必须跟着变。
+  // 同一工作区内仍保持单实例（workspace 不变就不会重跑）。
   useEffect(() => {
     const host = hostRef.current
     if (!host) return
@@ -49,7 +50,12 @@ export function TerminalPane() {
       fit.fit()
     } catch (_) {}
 
-    const socket = new WebSocket(wsUrl('/ws/terminal'))
+    // cwd 由后端按 workspace 参数传给 PTY 子进程，不使用进程级 set_current_dir，
+    // 避免并发工作区互相踩。
+    const path = workspace
+      ? `/ws/terminal?workspace=${encodeURIComponent(workspace)}`
+      : '/ws/terminal'
+    const socket = new WebSocket(wsUrl(path))
     socket.binaryType = 'arraybuffer'
     socket.onopen = () => {
       setStatus('已连接')
@@ -80,7 +86,7 @@ export function TerminalPane() {
       termRef.current = null
       fitRef.current = null
     }
-  }, [pushResize])
+  }, [pushResize, workspace])
 
   useEffect(() => {
     if (fullscreen) setTimeout(pushResize, 80)
