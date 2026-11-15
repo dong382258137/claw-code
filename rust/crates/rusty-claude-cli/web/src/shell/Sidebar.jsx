@@ -200,7 +200,16 @@ export function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onTo
                           title={session.workspace || ''}
                         >
                           <span className="title">{session.title || session.id}</span>
-                          <span className="meta">{relTime(session.modified)}</span>
+                          <span className="meta">
+                            {/* 并行任务可见：不打开会话也能看出它在跑 / 在排队。 */}
+                            {session.state === 'running' && (
+                              <span className="session-state running">运行中{session.queued > 0 ? ` · 队列 ${session.queued}` : ''}</span>
+                            )}
+                            {session.state === 'queued' && (
+                              <span className="session-state queued">排队中{session.position > 0 ? `（第 ${session.position} 位）` : ''}</span>
+                            )}
+                            <span>{relTime(session.modified)}</span>
+                          </span>
                         </button>
                         {!selecting && (
                           <span className="session-actions">

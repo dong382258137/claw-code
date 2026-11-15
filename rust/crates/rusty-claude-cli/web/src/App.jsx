@@ -15,9 +15,20 @@ import { Panel } from './panel/Panel.jsx'
 import { SettingsPage } from './settings/SettingsPage.jsx'
 import { MarketPage } from './market/MarketPage.jsx'
 
+// 与后端 scheduler::MAX_QUEUE_PER_SESSION 保持一致：满 5 条时前端提前提示，不再发请求。
+const QUEUE_LIMIT = 5
+
 export default function App() {
   const [sessions, setSessions] = useState([])
   const [sessionTotal, setSessionTotal] = useState(0)
+  // 侧栏轮询看到的调度状态（服务端每行返回 state/position/queued），
+  // 用于「任务跑完」的提示；sessions state 本身供 Sidebar 渲染。
+  const busyRef = useRef(new Map())
+  const sessionsRef = useRef([])
+  sessionsRef.current = sessions
+  // 已加载条数：点过「加载更多」后轮询仍按这个数量拉，避免翻出来的页被冲掉。
+  const sessionsLimitRef = useRef(50)
+  const loadingMoreRef = useRef(false)
   const [workspaces, setWorkspaces] = useState([])
   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false)
   const [filter, setFilter] = useState('')
@@ -36,6 +47,9 @@ export default function App() {
   const [messages, setMessages] = useState([])
   const [optimistic, setOptimistic] = useState(null)
   const [running, setRunning] = useState(false)
+  // 当前会话的调度状态：idle / queued / running + 等待条数 + 队首位次。
+  // mine 是本次发送在队列里的位次（来自 POST /prompt 的 202 响应）。
+  const [queue, setQueue] = useState({ state: 'idle', position: 0, queued: 0, mine: 0 })
   // SSE 回调里读 running 会拿到创建闭包时的旧值（该 effect 只依赖 currentId/push），
   // 用 ref 同步最新运行态，供「重试」动作判断本轮是否仍在跑。
   const runningRef = useRef(false)
@@ -71,6 +85,11 @@ export default function App() {
   const route = useRoute()
 
   const currentId = current?.id || null
+  // 轮询回调里要用最新的 currentId 判断「完成的是不是当前正在看的会话」。
+  const currentIdRef = useRef(null)
+  currentIdRef.current = currentId
+  // 窄屏（<1100px）时右侧面板不再是网格列，改为浮层抽屉：按钮文案必须与真实可见性一致。
+  const [narrow, setNarrow] = useState(() => window.innerWidth <= 1100)
   // 「当前工作区」在没有选中会话时取用户手选的目标工作区，其次退回服务端默认工作区。
   const activeWorkspace = current?.workspace || draftWorkspace || meta.workspace || ''
 
@@ -91,23 +110,51 @@ export default function App() {
   const loadSessions = useCallback(async () => {
     try {
       const [body, wsBody] = await Promise.all([
-        api('/api/sessions?all=1&limit=200&offset=0'),
+        api(`/api/sessions?all=1&limit=${sessionsLimitRef.current}&offset=0`),
         api('/api/workspaces').catch(() => ({ workspaces: [] })),
       ])
-      setSessions(body.sessions || [])
+      const list = body.sessions || []
+      // 对比上一次轮询的忙碌集合：从「运行/排队」回到 idle 的会话给一句完成提示，
+      // 用户切到别的会话时也能知道后台任务已经跑完，不用回来干等。
+      const busy = new Map()
+      for (const item of list) {
+        if (item.state && item.state !== 'idle') busy.set(item.id, item.state)
+      }
+      const finished = [...busyRef.current.keys()]
+        .filter((id) => !busy.has(id) && id !== currentIdRef.current)
+      busyRef.current = busy
+      setSessions(list)
       setSessionTotal(body.total || 0)
       setWorkspaces(wsBody.workspaces || [])
-    } catch (_) {}
-  }, [])
+      if (finished.length) {
+        const titles = finished.map((id) => list.find((item) => item.id === id)?.title || id)
+        push(`任务已完成：${titles.slice(0, 3).join('、')}${finished.length > 3 ? ` 等 ${finished.length} 个` : ''}`)
+      }
+      return list
+    } catch (_) {
+      return []
+    }
+  }, [push])
   const loadMoreSessions = useCallback(async () => {
+    if (loadingMoreRef.current) return
+    loadingMoreRef.current = true
     try {
-      const body = await api(`/api/sessions?all=1&limit=200&offset=${sessions.length}`)
-      setSessions((list) => [...list, ...(body.sessions || []).filter((item) => !list.some((old) => old.id === item.id))])
+      const next = Math.min(sessionsLimitRef.current + 50, 500)
+      const body = await api(`/api/sessions?all=1&limit=${next}&offset=0`)
+      const list = body.sessions || []
+      sessionsLimitRef.current = next
+      setSessions(list)
       setSessionTotal(body.total || 0)
+      if (list.length <= sessionsRef.current.length) {
+        // 服务端确实没有更多了：给一句明确交代，而不是点了没反应。
+        push(`已加载全部 ${list.length} 个会话`)
+      }
     } catch (error) {
       push(`加载更多失败：${error.message}`, 'error')
+    } finally {
+      loadingMoreRef.current = false
     }
-  }, [push, sessions.length])
+  }, [push])
 
   const addWorkspace = useCallback(async (path) => {
     const trimmed = String(path || '').trim()
@@ -131,10 +178,19 @@ export default function App() {
     return null
   }, [loadSessions])
 
+  // 有会话在跑/排队时加快轮询（3s），空闲时退回 10s：
+  // 侧栏的「运行中」「排队中」和跑完提示都依赖这份列表刷新。
   useEffect(() => {
-    loadSessions()
-    const timer = setInterval(loadSessions, 10000)
-    return () => clearInterval(timer)
+    let cancelled = false
+    let timer = 0
+    const tick = async () => {
+      const list = await loadSessions()
+      if (cancelled) return
+      const active = list.some((item) => item.state && item.state !== 'idle')
+      timer = setTimeout(tick, active ? 3000 : 10000)
+    }
+    tick()
+    return () => { cancelled = true; clearTimeout(timer) }
   }, [loadSessions])
 
   /* ---------- 会话订阅（单一 /events 事件流） ---------- */
@@ -162,11 +218,27 @@ export default function App() {
     if (!currentId) return undefined
     const timer = setInterval(() => {
       api(`/api/session/${encodeURIComponent(currentId)}/status`)
-        .then((state) => setRunning(Boolean(state.running)))
+        .then((state) => {
+          setRunning(Boolean(state.running))
+          setQueue((current) => ({
+            state: state.state || 'idle',
+            position: state.position || 0,
+            queued: state.queued || 0,
+            // 队列空了，旧的「你的消息第 N 位」就该作废。
+            mine: state.state === 'idle' || !state.queued ? 0 : current.mine,
+          }))
+        })
         .catch(() => {})
     }, 1200)
     return () => clearInterval(timer)
   }, [currentId])
+
+  // 1100px 是 styles.css 里面板让位的断点：跨过它时面板要从网格列切到浮层抽屉。
+  useEffect(() => {
+    const onResize = () => setNarrow(window.innerWidth <= 1100)
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
 
   // Web 热升级：服务重启期间轮询 /api/meta，恢复后自动 reload 拿到新前端。
   useEffect(() => {
@@ -285,6 +357,7 @@ export default function App() {
     setLive('')
     setOptimistic(null)
     setApprovals([])
+    setQueue({ state: 'idle', position: 0, queued: 0, mine: 0 })
   }, [])
 
   // 返回新建的会话（失败返回 null）。发送路径需要在「没有选中会话」时自动建会话，
@@ -420,8 +493,15 @@ export default function App() {
     if (sendLockRef.current) return
     const trimmed = text.trim()
     if (!trimmed) return
+    // 队列满时不再发请求：后端会 429，这里提前给出可读提示。
+    if ((queue.queued || 0) >= QUEUE_LIMIT) {
+      push(`队列已满（${queue.queued}/${QUEUE_LIMIT}），请等前面的消息处理完成后再发送`, 'error')
+      return
+    }
     lastPromptRef.current = trimmed
     sendLockRef.current = true
+    // 本轮是否已在跑：运行中追加的消息只入队，不能清空正在流式输出的内容。
+    const wasBusy = runningRef.current
     try {
       let sessionId = retrySessionId || currentId
       if (!sessionId) {
@@ -431,9 +511,11 @@ export default function App() {
         if (!created) { setRunning(false); return }
         sessionId = created.id
       }
-      setLive('')
-      setLiveThinking('')
-      setLiveTools([])
+      if (!wasBusy) {
+        setLive('')
+        setLiveThinking('')
+        setLiveTools([])
+      }
       // baseline 记录发送前的用户消息条数：快照里的用户消息变多就说明这条已落盘，
       // 乐观气泡随之清除。不按文本比对，因为服务端会展开 @引用再落盘。
       const baseline = sessionId === currentId
@@ -441,22 +523,27 @@ export default function App() {
         : 0
       // 带上 sessionId：新会话的订阅 effect 会立刻跑一次，不能把刚输入的内容清掉。
       setOptimistic({ text: trimmed, at: Date.now(), sessionId, baseline })
-      setRunning(true)
+      if (!wasBusy) setRunning(true)
       try {
-        await postJson(`/api/session/${encodeURIComponent(sessionId)}/prompt`, {
+        const result = await postJson(`/api/session/${encodeURIComponent(sessionId)}/prompt`, {
           text: trimmed,
           permission: webSettings.permission || 'workspace-write',
           model: webSettings.model || undefined,
         })
+        // 202 会带回排队位次：运行中追加的消息要明确告诉用户排在第几位。
+        if (result && result.status === 'queued' && wasBusy) {
+          setQueue((current) => ({ ...current, mine: result.position || 0 }))
+          push(`已加入排队：第 ${result.position} 位${result.position > 1 ? `（前面还有 ${result.position - 1} 条）` : ''}`)
+        }
       } catch (error) {
         setOptimistic(null)
-        setRunning(false)
+        if (!wasBusy) setRunning(false)
         push(`发送失败：${error.message}`, 'error', { label: '重试', run: () => send(text, sessionId) })
       }
     } finally {
       sendLockRef.current = false
     }
-  }, [activeWorkspace, createSession, currentId, messages, push, webSettings.model, webSettings.permission])
+  }, [activeWorkspace, createSession, currentId, messages, push, queue.queued, webSettings.model, webSettings.permission])
   sendRef.current = send
 
   const stop = useCallback(async () => {
@@ -559,6 +646,7 @@ export default function App() {
       <Conversation messages={messages} optimistic={optimistic} live={live} liveThinking={liveThinking} liveTools={liveTools} loading={loadingSession} />
       <Composer
         running={running}
+        queue={queue}
         onSend={send}
         onStop={stop}
         onQuickAction={runQuickAction}
@@ -613,11 +701,19 @@ export default function App() {
   return (
     <div className={`app ${dock === 'left' ? 'dock-left' : ''}`}>
       {sidebar}
-      {chatRoute && dock === 'left' && panelOpen && <div className="splitter" onMouseDown={startResize} />}
-      {chatRoute && dock === 'left' && panel}
+      {chatRoute && dock === 'left' && panelOpen && !narrow && <div className="splitter" onMouseDown={startResize} />}
+      {chatRoute && dock === 'left' && !narrow && panel}
       {chatRoute ? chatMain : marketMain}
-      {chatRoute && dock === 'right' && panelOpen && <div className="splitter" onMouseDown={startResize} />}
-      {chatRoute && dock === 'right' && panel}
+      {chatRoute && dock === 'right' && panelOpen && !narrow && <div className="splitter" onMouseDown={startResize} />}
+      {chatRoute && dock === 'right' && !narrow && panel}
+      {/* 窄屏没有面板列：改为浮层抽屉，保证「显示/隐藏面板」按钮与真实可见性一致。 */}
+      {chatRoute && narrow && panelOpen && (
+        <div className="panel-drawer-mask" onClick={closePanel} role="presentation">
+          <div className={`panel-drawer ${dock}`} onClick={(event) => event.stopPropagation()}>
+            {panel}
+          </div>
+        </div>
+      )}
       {workspacePickerOpen && (
         <WorkspacePicker
           workspaces={workspaces}

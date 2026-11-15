@@ -823,23 +823,51 @@ async fn api_sessions(
     if query.t.as_deref() != Some(state.token.as_str()) {
         return unauthorized();
     }
-    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
     let offset = query.offset.unwrap_or(0);
+
+    // 每行带上调度状态：前端侧栏不打开会话也能看出「运行中」「排队中（第 N 位）」。
+    // 状态只存在于本进程内存，未提交过的会话恒为 idle。
+    let decorate = |items: &mut Vec<Value>| {
+        for item in items.iter_mut() {
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if id.is_empty() {
+                continue;
+            }
+            let status = state.scheduler.status(&id);
+            if let Some(object) = item.as_object_mut() {
+                object.insert("state".to_string(), json!(status.state.label()));
+                object.insert("position".to_string(), json!(status.position));
+                object.insert("queued".to_string(), json!(status.queued));
+            }
+        }
+    };
 
     if matches!(query.all.as_deref(), Some("1" | "true")) {
         let mut sessions: Vec<Value> = Vec::new();
+        let mut total = 0usize;
+        // 每个工作区取 offset+limit 条：全局第 N 条必然落在所属工作区的前 N 条内，
+        // 固定取 50 会让第 51 条起永远翻不到，且聚合出来的 total 也被低估。
+        let per_workspace = offset.saturating_add(limit);
         for root in session_roots(&state) {
             let Ok(store) = runtime::SessionStore::from_cwd(&root) else {
                 continue;
             };
-            if let Ok(Value::Object(map)) = list_sessions(store.sessions_dir(), &root, 0, 50) {
+            if let Ok(Value::Object(map)) =
+                list_sessions(store.sessions_dir(), &root, 0, per_workspace)
+            {
+                total += map.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
                 if let Some(items) = map.get("sessions").and_then(Value::as_array) {
                     sessions.extend(items.iter().cloned());
                 }
             }
         }
         sessions.sort_by_key(|item| std::cmp::Reverse(item["modified"].as_u64().unwrap_or(0)));
-        let total = sessions.len();
+        decorate(&mut sessions);
         let page: Vec<Value> = sessions.into_iter().skip(offset).take(limit).collect();
         return Json(json!({
             "sessions": page,
@@ -858,7 +886,12 @@ async fn api_sessions(
         return (StatusCode::BAD_REQUEST, "无法读取该工作区的会话目录").into_response();
     };
     match list_sessions(store.sessions_dir(), &workspace, offset, limit) {
-        Ok(value) => Json(value).into_response(),
+        Ok(mut value) => {
+            if let Some(items) = value.get_mut("sessions").and_then(Value::as_array_mut) {
+                decorate(items);
+            }
+            Json(value).into_response()
+        }
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     }
 }

@@ -12,7 +12,7 @@ import {
 } from '../shared/constants.js'
 import { basename, formatTokens, resolveModelLabel, voiceClock } from '../shared/utils.js'
 
-export function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission, model, onModel, workspace, workspaces = [], sessionModel = '', onVoiceDiscussion, onNewInWorkspace, onPickWorkspace, onOpenWorkspacePicker, stats, pendingRef, onRefUsed, pendingDraft, onDraftUsed }) {
+export function Composer({ running, queue, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission, model, onModel, workspace, workspaces = [], sessionModel = '', onVoiceDiscussion, onNewInWorkspace, onPickWorkspace, onOpenWorkspacePicker, stats, pendingRef, onRefUsed, pendingDraft, onDraftUsed }) {
   const [value, setValue] = useState('')
   const [files, setFiles] = useState([])
   const [suggest, setSuggest] = useState(null)
@@ -180,10 +180,19 @@ export function Composer({ running, onSend, onStop, onQuickAction, onError, curr
     requestAnimationFrame(focusEnd)
   }
 
+  // 运行中也可以继续发送：后端会入队（最多 5 条），这里只负责把位次/满员说清楚。
+  const queueLimit = 5
+  const queued = queue?.queued || 0
+  const queueFull = queued >= queueLimit
+
   const submit = () => {
-    if (running || voiceActiveRef.current) return
+    if (voiceActiveRef.current) return
     const text = value
     if (!text.trim()) return
+    if (queueFull) {
+      onError?.(`队列已满（${queued}/${queueLimit}），请等前面的消息处理完成后再发送`)
+      return
+    }
     setSuggest(null)
     setOpenMenu(null)
     setFooterMenu(null)
@@ -480,6 +489,13 @@ export function Composer({ running, onSend, onStop, onQuickAction, onError, curr
           ))}
         </div>
       )}
+      {!voiceActive && (queueFull || queued > 0 || (queue?.mine || 0) > 1) && (
+        <div className={`queue-hint ${queueFull ? 'full' : ''}`}>
+          {queueFull
+            ? `队列已满（${queued}/${queueLimit}），等前面的消息处理完成后再发送`
+            : `已排队：${queued} 条待处理${(queue?.mine || 0) > 1 ? ` · 你的消息第 ${queue.mine} 位` : ''}`}
+        </div>
+      )}
       <div
         className={`composer-box ${dragging ? 'dragging' : ''}`}
         onClick={(event) => { if (!event.target.closest('button, input, textarea, .popover')) areaRef.current?.focus() }}
@@ -645,9 +661,22 @@ export function Composer({ running, onSend, onStop, onQuickAction, onError, curr
           <button type="button" className="icon-btn" title="语音讨论" aria-label="语音讨论" onClick={onVoiceDiscussion}>
             <Icon name="wave" />
           </button>
-          {running
-            ? <button type="button" className="send-btn stop" onClick={onStop} title="停止" aria-label="停止"><Icon name="stop" size={16} /></button>
-            : <button type="submit" className="send-btn" disabled={!canSend} title={!canSend ? '输入内容后发送（Enter）' : currentId ? '发送（Enter）' : '发送（Enter）· 会在当前工作区新建任务'} aria-label="发送"><Icon name="arrowUp" /></button>}
+          {running && (
+            <button type="button" className="send-btn stop" onClick={onStop} title="停止" aria-label="停止"><Icon name="stop" size={16} /></button>
+          )}
+          <button
+            type="submit"
+            className="send-btn"
+            disabled={!canSend || queueFull}
+            title={queueFull
+              ? `队列已满（${queued}/${queueLimit}）`
+              : !canSend
+                ? '输入内容后发送（Enter）'
+                : running
+                  ? '追加发送（Enter）· 会排在当前任务之后'
+                  : currentId ? '发送（Enter）' : '发送（Enter）· 会在当前工作区新建任务'}
+            aria-label="发送"
+          ><Icon name="arrowUp" /></button>
         </div>
         )}
         <input ref={uploadRef} type="file" multiple style={{ display: 'none' }} onChange={(event) => uploadFile(event.target.files)} />
