@@ -434,8 +434,13 @@ export default function App() {
       setLive('')
       setLiveThinking('')
       setLiveTools([])
+      // baseline 记录发送前的用户消息条数：快照里的用户消息变多就说明这条已落盘，
+      // 乐观气泡随之清除。不按文本比对，因为服务端会展开 @引用再落盘。
+      const baseline = sessionId === currentId
+        ? (messages || []).filter((message) => message.role === 'user').length
+        : 0
       // 带上 sessionId：新会话的订阅 effect 会立刻跑一次，不能把刚输入的内容清掉。
-      setOptimistic({ text: trimmed, at: Date.now(), sessionId })
+      setOptimistic({ text: trimmed, at: Date.now(), sessionId, baseline })
       setRunning(true)
       try {
         await postJson(`/api/session/${encodeURIComponent(sessionId)}/prompt`, {
@@ -451,7 +456,7 @@ export default function App() {
     } finally {
       sendLockRef.current = false
     }
-  }, [activeWorkspace, createSession, currentId, push, webSettings.model, webSettings.permission])
+  }, [activeWorkspace, createSession, currentId, messages, push, webSettings.model, webSettings.permission])
   sendRef.current = send
 
   const stop = useCallback(async () => {

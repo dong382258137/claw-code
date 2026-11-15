@@ -41,9 +41,15 @@ export function useSessionEvents({
       setLoadingSession(false)
       const last = view.messages?.[view.messages.length - 1]
       if (last && last.role === 'assistant') { setLive(''); setLiveThinking(''); setLiveTools([]) }
+      // 乐观消息的清除条件只认「服务端多了一条用户消息」：
+      // 之前是「最后一条是 user 才清」，而 done 时快照最后一条必然是 assistant，
+      // 于是气泡连同「发送中…」永久留在底部，形成重复的用户消息。
+      // 也不能按文本比对：服务端落盘前会展开 @引用/追加 Web 待办，文本已被改写。
       setOptimistic((pending) => {
         if (!pending) return null
-        return last && last.role === 'user' ? null : pending
+        if (pending.sessionId && pending.sessionId !== currentId) return pending
+        const userCount = (view.messages || []).filter((message) => message.role === 'user').length
+        return userCount > (pending.baseline || 0) ? null : pending
       })
     }
 
@@ -51,10 +57,15 @@ export function useSessionEvents({
       .then((view) => applySnapshot(view))
       .catch(() => {})
 
-    // 首次加载：失败要提示用户，这是「会话打不开」而不是「重连抖动」。
+    // 首次加载同样走 applySnapshot：effect 因依赖变化重跑时，服务端快照里
+    // 可能已经包含刚发出的消息，必须用同一套条件清掉乐观气泡。
     api(`/api/session/${encodeURIComponent(currentId)}`)
-      .then((view) => { if (!closed) { setCurrent((current) => ({ ...view, title: current?.title || view.id })); setMessages(view.messages || []); setLoadingSession(false) } })
-      .catch((error) => { setLoadingSession(false); push(`读取会话失败：${error.message}`, 'error') })
+      .then((view) => applySnapshot(view))
+      .catch((error) => {
+        if (closed) return
+        setLoadingSession(false)
+        push(`读取会话失败：${error.message}`, 'error')
+      })
 
     // 服务端可能已经退出或重启（token 随之更换）：断线时对账一次真实 running
     // 状态，别让 UI 永远停在“运行中”。
