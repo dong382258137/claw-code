@@ -1076,6 +1076,12 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             // 计划：GET 快照 / PUT 编辑（并写回 PlanArtifact）/ confirm 确认并继续。
             .route("/api/session/{id}/plan", get(api_plan_get).put(api_plan_set))
             .route("/api/session/{id}/plan/confirm", post(api_plan_confirm))
+            // 轮次检查点：列表 / 回滚（dry-run 预览 + token 确认）。
+            .route("/api/session/{id}/checkpoints", get(api_checkpoints))
+            .route(
+                "/api/session/{id}/checkpoints/rollback",
+                post(api_checkpoint_rollback),
+            )
             .route("/api/session/{id}/events", get(api_events))
             .route("/api/session/{id}/approval", post(api_approval))
             // 语音讨论：无工具纯对话，与 agent 会话完全隔离（不落盘、不碰工作区）。
@@ -1918,6 +1924,20 @@ fn spawn_session_worker(state: AppState, session_id: String) {
                     continue;
                 }
 
+                // 首轮开始前留一份「起始状态」：这是用户能回到的「所有改动之前」。
+                // 检查点与会话目录一起放在工作区 `.claw/checkpoints/<session>/` 下，
+                // 与 git 无关，非 git 目录同样有效。
+                if crate::checkpoint::list(&turn.job.workspace, &worker_session).is_empty() {
+                    if let Err(error) = crate::checkpoint::create(
+                        &turn.job.workspace,
+                        &worker_session,
+                        "起始状态（首轮开始前）",
+                        Some(0),
+                    ) {
+                        eprintln!("[serve] checkpoint baseline failed: {error}");
+                    }
+                }
+
                 // 单轮 panic 只影响本轮：转成普通错误，worker 继续接下一轮。
                 let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     worker.run_turn(&turn)
@@ -1983,6 +2003,30 @@ fn spawn_session_worker(state: AppState, session_id: String) {
                         &worker_session,
                         json!({ "kind": "plans", "plans": read_plan_artifacts(&turn.job.workspace) }),
                     );
+                    // 成功的轮次结束即打点：之后用户可以把工作区恢复到这一轮结束时的样子。
+                    // 失败/被中止的轮次不建点，避免把半途状态当成可回滚目标。
+                    if !failed && !turn.signal.is_aborted() {
+                        let label = crate::checkpoint::last_user_label(&turn.job.session_path)
+                            .unwrap_or_else(|| "本轮改动".to_string());
+                        match crate::checkpoint::create(
+                            &turn.job.workspace,
+                            &worker_session,
+                            &label,
+                            None,
+                        ) {
+                            Ok(_) => task_state.events.emit(
+                                &worker_session,
+                                json!({
+                                    "kind": "checkpoints",
+                                    "checkpoints": crate::checkpoint::list(
+                                        &turn.job.workspace,
+                                        &worker_session,
+                                    ),
+                                }),
+                            ),
+                            Err(error) => eprintln!("[serve] checkpoint failed: {error}"),
+                        }
+                    }
                     task_state
                         .events
                         .emit(&worker_session, json!({ "kind": "done" }));
@@ -3406,6 +3450,19 @@ async fn api_diff(State(state): State<AppState>, Query(query): Query<PathQuery>)
         Err((code, message)) => return (code, message).into_response(),
     };
     let workspace = &workspace;
+    // 非 git 目录下 `git diff` 只会返回一行错误文本，面板此前安静地显示 0 个改动。
+    // 明确返回 is_git=false，让前端解释原因并给出替代做法。
+    if !crate::checkpoint::is_git_work_tree(workspace) {
+        return Json(json!({
+            "is_git": false,
+            "patch": "",
+            "files": [],
+            "untracked": [],
+            "hunks": [],
+            "note": "当前工作区不是 git 仓库，无法读取差异。",
+        }))
+        .into_response();
+    }
     // 结构化解析必须基于完整 patch（截断会切断 hunk），展示用的 patch 才截断。
     let raw = git_diff_text(workspace, query.path.as_deref());
     let patch = truncate_middle(&raw, 200_000);
@@ -3473,6 +3530,7 @@ async fn api_diff(State(state): State<AppState>, Query(query): Query<PathQuery>)
         .collect();
 
     Json(json!({
+        "is_git": true,
         "patch": patch,
         "files": files,
         "untracked": untracked,
@@ -3560,6 +3618,73 @@ async fn api_diff_discard(
         }))
         .into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CheckpointRollbackBody {
+    /// 来自 `GET /api/session/{id}/checkpoints` 的 `checkpoints[].id`。
+    checkpoint: String,
+    /// `true` 只计算计划（恢复/删除哪些文件），不写盘。
+    #[serde(default)]
+    dry_run: bool,
+    /// dry-run 返回的计划哈希；真正执行时必须带回，工作区在预览后变化则 409。
+    #[serde(default)]
+    token: Option<String>,
+}
+
+/// 轮次检查点列表。与 diff 是否可用无关：非 git 目录同样可以建检查点并回滚。
+async fn api_checkpoints(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let (_, workspace) = match resolve_session(&state, &id) {
+        Ok(found) => found,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    Json(json!({
+        "checkpoints": crate::checkpoint::list(&workspace, &id),
+        "is_git": crate::checkpoint::is_git_work_tree(&workspace),
+    }))
+    .into_response()
+}
+
+/// 回滚到指定轮次检查点：先 dry-run 预览，再带 token 执行。
+async fn api_checkpoint_rollback(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<CheckpointRollbackBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let (_, workspace) = match resolve_session(&state, &id) {
+        Ok(found) => found,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let result = if body.dry_run {
+        crate::checkpoint::plan(&workspace, &id, &body.checkpoint)
+    } else {
+        match body.token.as_deref() {
+            Some(token) => crate::checkpoint::rollback(&workspace, &id, &body.checkpoint, token),
+            None => {
+                return (StatusCode::BAD_REQUEST, "缺少确认 token，请先预览回滚计划")
+                    .into_response()
+            }
+        }
+    };
+    match result {
+        Ok(plan) => Json(json!({ "ok": true, "plan": plan })).into_response(),
+        Err(error) => {
+            let status =
+                StatusCode::from_u16(error.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, error.to_string()).into_response()
+        }
     }
 }
 

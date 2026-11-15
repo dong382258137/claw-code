@@ -7,6 +7,7 @@
     clippy::unused_self
 )]
 pub mod app;
+pub mod checkpoint;
 pub mod commands_handler;
 pub mod doctor;
 pub mod format;

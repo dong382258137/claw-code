@@ -1343,3 +1343,74 @@ details.process-thinking .expand-full { margin: 4px 0 8px; }
 .plan-step select { flex: none; height: 26px; font-size: 12px; color: var(--label-primary); background: var(--input-major); border: 1px solid var(--border-l1); border-radius: var(--r-sm); }
 .plan-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding-top: 2px; }
 .plan-actions .muted { font-size: 11.5px; }
+
+/* ── 第三批 E：diff 行级引用 / 轮次检查点 / 非 git 提示 ───────────────── */
+.diff-git-notice {
+  margin: 8px; padding: 10px 12px; border: 1px solid var(--border-l2); border-radius: var(--r-md);
+  background: var(--layer-1); font-size: 12.5px; line-height: 20px; color: var(--label-secondary);
+}
+.diff-git-notice strong { display: block; color: var(--warn); margin-bottom: 4px; }
+.diff-git-notice p { margin: 4px 0; }
+.diff-git-notice ul { margin: 4px 0 0; padding-left: 18px; }
+.diff-git-notice code {
+  font-family: var(--font-code); font-size: 12px; background: var(--code-inline);
+  border-radius: var(--r-xs); padding: 0 4px;
+}
+.diff-lines { display: flex; flex-direction: column; padding: 4px 0; }
+.diff-line { display: flex; align-items: flex-start; gap: 6px; line-height: 18px; cursor: text; user-select: none; }
+.diff-line:hover { background: var(--hover); }
+.diff-line.selected { background: rgba(122, 170, 255, 0.18); }
+.diff-line.l-add { background: var(--diff-add-bg); }
+.diff-line.l-del { background: var(--diff-del-bg); }
+.diff-line.l-add.selected,
+.diff-line.l-del.selected { outline: 1px solid var(--link); outline-offset: -1px; }
+.diff-ln {
+  flex: none; width: 40px; text-align: right; padding-right: 6px; color: var(--label-caption);
+  font-family: var(--font-code); font-size: 11.5px;
+}
+.diff-code {
+  flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word;
+  font-family: var(--font-code); font-size: 12.5px; color: var(--label-primary);
+}
+.diff-sel-slot {
+  flex: none; height: 34px; display: flex; align-items: center; padding: 0 8px;
+  border-bottom: 1px solid var(--border-l1); background: var(--layer-1); overflow: hidden;
+}
+.diff-sel-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: nowrap; width: 100%;
+  font-size: 12px; color: var(--label-secondary); overflow: hidden;
+}
+.diff-sel-bar .path {
+  max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--font-code); color: var(--link);
+}
+.cp-panel {
+  margin: 6px 8px; padding: 8px; border: 1px solid var(--border-l1);
+  border-radius: var(--r-md); background: var(--layer-1);
+}
+.cp-title {
+  display: flex; align-items: baseline; gap: 8px; font-size: 12.5px;
+  font-weight: 600; color: var(--label-primary); margin-bottom: 6px;
+}
+.cp-title .muted { font-weight: 400; font-size: 11.5px; color: var(--label-caption); }
+.cp-row {
+  display: flex; align-items: center; gap: 8px; padding: 5px 4px;
+  border-top: 1px solid var(--border-l1); font-size: 12px;
+}
+.cp-seq { flex: none; min-width: 56px; color: var(--link); }
+.cp-label {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; color: var(--label-secondary);
+}
+.cp-meta { flex: none; text-align: right; font-size: 11px; line-height: 15px; color: var(--label-caption); }
+.cp-confirm {
+  margin-top: 8px; padding: 8px; border: 1px solid var(--border-l2); border-radius: var(--r-sm);
+  background: var(--layer-2); font-size: 12px; display: flex; flex-direction: column; gap: 6px;
+}
+.cp-summary { color: var(--label-secondary); }
+.cp-confirm .warn { color: var(--warn); }
+.cp-sample {
+  max-height: 140px; overflow: auto; margin: 0; padding: 6px; background: var(--code-block);
+  border-radius: var(--r-xs); font-family: var(--font-code); font-size: 11.5px; white-space: pre-wrap;
+}
+.cp-actions { display: flex; gap: 6px; justify-content: flex-end; }
