@@ -711,18 +711,24 @@ fn workspaces_registry_path() -> Option<PathBuf> {
     home_dir().map(|home| home.join(".claw").join("web-workspaces.json"))
 }
 
-fn load_workspaces() -> Vec<PathBuf> {
-    let Some(path) = workspaces_registry_path() else {
-        return Vec::new();
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&text) else {
-        return Vec::new();
-    };
+/// 读取注册表**原始条目**（保留目录已失效的历史条目），供写入侧合并使用。
+///
+/// 返回 `None` 表示读取或解析失败：调用方必须放弃写回，否则一次瞬时读失败
+/// 或半截文件就会把整张注册表覆盖掉（这正是条目被永久写没的根因）。
+fn read_workspace_entries(path: &Path) -> Option<Vec<Value>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Array(items)) => Some(items),
+        _ => None,
+    }
+}
+
+/// 展示/聚合侧过滤：只保留真实存在的目录。
+///
+/// 过滤只发生在这里，绝不回写到磁盘——目录瞬时不可用时条目仍然保留。
+fn workspace_paths_from_entries(entries: &[Value]) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for item in items {
+    for item in entries {
         let Some(raw) = item.as_str() else {
             continue;
         };
@@ -734,28 +740,65 @@ fn load_workspaces() -> Vec<PathBuf> {
     out
 }
 
-fn save_workspaces(list: &[PathBuf]) {
+fn load_workspaces() -> Vec<PathBuf> {
     let Some(path) = workspaces_registry_path() else {
-        return;
+        return Vec::new();
     };
+    let Some(entries) = read_workspace_entries(&path) else {
+        return Vec::new();
+    };
+    workspace_paths_from_entries(&entries)
+}
+
+fn save_workspace_entries(path: &Path, entries: &[Value]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let value = Value::Array(
-        list.iter()
-            .map(|item| Value::String(item.display().to_string()))
-            .collect(),
-    );
-    let _ = atomic_write(&path, &value.to_string());
+    let _ = atomic_write(path, &Value::Array(entries.to_vec()).to_string());
+}
+
+/// 注册表去重比较：Windows 路径大小写不敏感，且容忍尾部斜杠差异。
+fn same_workspace_path(recorded: &str, candidate: &Path) -> bool {
+    let recorded = recorded.trim().trim_end_matches(['\\', '/']);
+    let candidate_text = candidate.to_string_lossy();
+    let candidate = candidate_text.trim().trim_end_matches(['\\', '/']);
+    if cfg!(windows) {
+        recorded.eq_ignore_ascii_case(candidate)
+    } else {
+        recorded == candidate
+    }
+}
+
+/// 把工作区追加进指定注册表文件，返回是否真的写入。
+///
+/// 写回时保留原始条目（包括目录暂时不存在的），只在展示侧过滤；
+/// 读取/解析失败时保持文件原样。
+fn register_workspace_at(registry: &Path, workspace: &Path) -> bool {
+    let mut entries = match std::fs::read_to_string(registry) {
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(Value::Array(items)) => items,
+            // 解析失败：不覆盖可能仍含有效条目的文件。
+            _ => return false,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        // 读取失败（权限/占用等）：不覆盖。
+        Err(_) => return false,
+    };
+    if entries.iter().any(|item| {
+        item.as_str()
+            .is_some_and(|raw| same_workspace_path(raw, workspace))
+    }) {
+        return false;
+    }
+    entries.push(Value::String(workspace.display().to_string()));
+    save_workspace_entries(registry, &entries);
+    true
 }
 
 fn register_workspace(path: &Path) {
-    let mut list = load_workspaces();
-    if list.iter().any(|item| item == path) {
-        return;
+    if let Some(registry) = workspaces_registry_path() {
+        register_workspace_at(&registry, path);
     }
-    list.push(path.to_path_buf());
-    save_workspaces(&list);
 }
 
 /// 解析请求里的 workspace 参数：缺省=当前默认工作区；显式路径必须存在，并自动登记。
@@ -6028,5 +6071,57 @@ mod tests {
             parse_picker_output(b" \r\n\t").is_none(),
             "纯空白也视为取消"
         );
+    }
+
+    /// 回归：注册表里目录暂时不存在的条目必须原样保留，不能被过滤后的表覆盖。
+    #[test]
+    fn register_workspace_keeps_entries_for_missing_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("web-workspaces.json");
+        let missing = dir.path().join("gone");
+        let alive = dir.path().join("alive");
+        std::fs::create_dir_all(&alive).unwrap();
+        let original =
+            serde_json::json!([missing.display().to_string(), alive.display().to_string()]);
+        std::fs::write(&registry, original.to_string()).unwrap();
+
+        assert!(register_workspace_at(&registry, &dir.path().join("new-ws")));
+
+        let raw: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(&registry).unwrap()).unwrap();
+        assert_eq!(raw.len(), 3, "写回不得丢条目：{raw:?}");
+        assert!(raw.contains(&missing.display().to_string()));
+        assert!(raw.contains(&alive.display().to_string()));
+
+        // 展示侧只保留真实存在的目录，但磁盘上的条目仍是 3 条。
+        let entries = read_workspace_entries(&registry).unwrap();
+        assert_eq!(workspace_paths_from_entries(&entries), vec![alive]);
+        assert_eq!(read_workspace_entries(&registry).unwrap().len(), 3);
+    }
+
+    /// 回归：注册表读取/解析失败时保持原文件不动，绝不写回空表。
+    #[test]
+    fn register_workspace_does_not_overwrite_unreadable_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("web-workspaces.json");
+        let broken = "{ not json";
+        std::fs::write(&registry, broken).unwrap();
+
+        assert!(!register_workspace_at(&registry, &dir.path().join("ws")));
+        assert_eq!(std::fs::read_to_string(&registry).unwrap(), broken);
+    }
+
+    /// 同名路径（大小写/尾部斜杠差异）不应重复登记。
+    #[test]
+    fn register_workspace_deduplicates_equivalent_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("web-workspaces.json");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let recorded = format!("{}\\", ws.display());
+        std::fs::write(&registry, serde_json::json!([recorded]).to_string()).unwrap();
+
+        assert!(!register_workspace_at(&registry, &ws));
+        assert_eq!(read_workspace_entries(&registry).unwrap().len(), 1);
     }
 }
