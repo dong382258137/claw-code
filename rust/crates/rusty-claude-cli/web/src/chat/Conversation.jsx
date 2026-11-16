@@ -90,6 +90,9 @@ export function Conversation({ messages, optimistic, live, liveThinking, liveToo
   )
   const shown = visible.length > visibleCount ? visible.slice(-visibleCount) : visible
   const turns = useMemo(() => groupTurns(shown), [shown])
+  // 流式过程不一定伴随正文增量：工具型 turn 往往是先 thinking/tool_use，
+  // 直到最后才吐一段 delta。只看 live（正文）会让整段执行过程不可见。
+  const streaming = Boolean(live) || Boolean(liveThinking) || (liveTools || []).length > 0
   return (
     <>
       <div className="messages" ref={ref} onScroll={onScroll}>
@@ -99,7 +102,7 @@ export function Conversation({ messages, optimistic, live, liveThinking, liveToo
             <div className="skeleton" /><div className="skeleton short" /><div className="skeleton" />
           </div>
         )}
-        {!loading && visible.length === 0 && !optimistic && !live && (
+        {!loading && visible.length === 0 && !optimistic && !streaming && (
           <div className="empty">
             <div>直接输入即可发送 —— 未选会话时会在当前工作区新建任务。</div>
             <div className="empty-hint">Enter 发送 · Shift+Enter 换行 · / 快捷操作 · @ 引用文件</div>
@@ -128,7 +131,7 @@ export function Conversation({ messages, optimistic, live, liveThinking, liveToo
             message={{ role: 'user', blocks: [{ kind: 'text', text: optimistic.text }], ts: optimistic.at }}
           />
         )}
-        {live && <LiveTurn thinking={liveThinking} tools={liveTools || []} text={live} />}
+        {streaming && <LiveTurn thinking={liveThinking} tools={liveTools || []} text={live} />}
         </div>
       </div>
       {!atBottom && <button className="jump" onClick={jumpToLatest}>回到最新 ↓</button>}
