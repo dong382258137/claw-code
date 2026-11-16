@@ -6,7 +6,7 @@ import { TasksPane } from './TasksPane.jsx'
 import { AttachmentsPane } from './AttachmentsPane.jsx'
 import { TerminalPane } from './TerminalPane.jsx'
 
-export function Panel({ tab, onTab, onClose, onDock, width, currentId, workspace, meta, onError, onToast, onReference }) {
+export function Panel({ tab, onTab, onClose, onDock, width, currentId, workspace, meta, taskEvent, connected, onError, onToast, onReference }) {
   // 终端只在第一次打开时挂载，之后保持连接；避免每次加载页面都起一个 PTY。
   const [terminalMounted, setTerminalMounted] = useState(tab === 'terminal')
   const [fullscreen, setFullscreen] = useState(false)
@@ -32,7 +32,7 @@ export function Panel({ tab, onTab, onClose, onDock, width, currentId, workspace
         {/* 五个面板常驻，切换只隐藏：终端连接、文件浏览状态不会因切标签丢失。 */}
         <div className={`pane-wrap ${tab === 'files' ? 'active' : ''}`}><FilesPane workspace={workspace} onError={onError} onReference={onReference} /></div>
         <div className={`pane-wrap ${tab === 'diff' ? 'active' : ''}`}><DiffPane workspace={workspace} currentId={currentId} onError={onError} onReference={onReference} /></div>
-        <div className={`pane-wrap ${tab === 'tasks' ? 'active' : ''}`}><TasksPane currentId={currentId} workspace={workspace} onError={onError} /></div>
+        <div className={`pane-wrap ${tab === 'tasks' ? 'active' : ''}`}><TasksPane currentId={currentId} workspace={workspace} taskEvent={taskEvent} connected={connected} onError={onError} /></div>
         <div className={`pane-wrap ${tab === 'attachments' ? 'active' : ''}`}><AttachmentsPane workspace={workspace} onError={onError} /></div>
         <div className={`pane-wrap ${tab === 'terminal' ? 'active' : ''}`}>{terminalMounted && <TerminalPane workspace={workspace} />}</div>
       </div>

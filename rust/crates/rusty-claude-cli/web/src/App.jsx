@@ -45,6 +45,9 @@ export default function App() {
   // SSE 订阅 effect 不能依赖 send（每次渲染都是新闭包），用 ref 拿最新实现。
   const sendRef = useRef(null)
   const [messages, setMessages] = useState([])
+  // 任务面板的增量事件（待办/计划）：由唯一的会话 EventSource 转发，
+  // 避免 TasksPane 再单独开一条连接。
+  const [taskEvent, setTaskEvent] = useState(null)
   const [optimistic, setOptimistic] = useState(null)
   const [running, setRunning] = useState(false)
   // 当前会话的调度状态：idle / queued / running + 等待条数 + 队首位次。
@@ -209,6 +212,7 @@ export default function App() {
     setLoadingSession,
     setConnected,
     setPendingDraft,
+    setTaskEvent,
     lastPromptRef,
     runningRef,
     sendRef,
@@ -690,6 +694,8 @@ export default function App() {
       currentId={currentId}
       workspace={activeWorkspace}
       meta={meta}
+      taskEvent={taskEvent}
+      connected={connected}
       onError={panelError}
       onToast={push}
       onReference={setPendingRef}

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
-import { api, postJson, withToken, withWorkspace } from '../api'
+import { api, postJson, withWorkspace } from '../api'
 
 const EMPTY_TASKS = { todos: [], tasks: [], crons: [], plan_mode: null }
 const EMPTY_PLAN = { enabled: false, approved: false, revision: 0, source: 'none', plan: null }
@@ -29,7 +29,7 @@ const putJson = (path, body) =>
     body: JSON.stringify(body),
   })
 
-export function TasksPane({ currentId, workspace, onError }) {
+export function TasksPane({ currentId, workspace, taskEvent, connected, onError }) {
   const [data, setData] = useState(EMPTY_TASKS)
   const [goal, setGoal] = useState(null)
   const [plans, setPlans] = useState([])
@@ -39,7 +39,6 @@ export function TasksPane({ currentId, workspace, onError }) {
   const [dirty, setDirty] = useState(false)
   const [newTodo, setNewTodo] = useState('')
   const [saving, setSaving] = useState(false)
-  const [connected, setConnected] = useState(false)
   const [notice, setNotice] = useState('')
 
   // 版本号用于丢弃乱序/重复事件：SSE 事件与 GET 快照都带 revision，
@@ -48,7 +47,9 @@ export function TasksPane({ currentId, workspace, onError }) {
   const planRev = useRef(-1)
   // 用户正在编辑时不让后台事件覆盖草稿。
   const dirtyRef = useRef(false)
-  const openedOnce = useRef(false)
+  // 断线重连（connected 由 App 的唯一事件流透传）后补一次快照。
+  const prevConnected = useRef(connected)
+  const firstConnectedRun = useRef(true)
 
   const markDirty = useCallback((value) => {
     dirtyRef.current = value
@@ -95,14 +96,15 @@ export function TasksPane({ currentId, workspace, onError }) {
     }).catch((error) => onError?.(`任务加载失败：${error.message}`))
   }, [applyPlan, currentId, onError, sessionPath, workspace])
 
-  // 切换会话：先清空所有派生状态，再订阅 + 拉一次快照，
-  // 避免上一个会话的待办/计划短暂串台或与事件叠加成重复条目。
+  // 切换会话：清空所有派生状态并拉一次快照。
+  // 实时事件由 App 的唯一 EventSource 透传（taskEvent），这里不再单独建连接。
   useEffect(() => {
     if (!currentId) return undefined
     todoRev.current = -1
     planRev.current = -1
-    openedOnce.current = false
     dirtyRef.current = false
+    firstConnectedRun.current = true
+    prevConnected.current = connected
     setData(EMPTY_TASKS)
     setWebTodos([])
     setPlans([])
@@ -112,61 +114,59 @@ export function TasksPane({ currentId, workspace, onError }) {
     setDirty(false)
     setNotice('')
     setSaving(false)
-    setConnected(false)
-
-    const source = new EventSource(withToken(sessionPath('/events')))
-    const onStream = (event) => {
-      let payload
-      try {
-        payload = JSON.parse(event.data)
-      } catch (_) {
-        return
-      }
-      switch (payload.kind) {
-        case 'todos':
-          if (payload.scope === 'agent') {
-            setData((prev) => ({ ...prev, todos: payload.items || [] }))
-          } else {
-            const revision = Number(payload.revision || 0)
-            if (revision >= todoRev.current) {
-              todoRev.current = revision
-              setWebTodos(payload.items || [])
-            }
-          }
-          break
-        case 'plan':
-          applyPlan(payload.state)
-          break
-        case 'plan_mode':
-          setData((prev) => ({ ...prev, plan_mode: Boolean(payload.enabled) }))
-          // sidecar 是 Web 端权威状态；没有 sidecar 时才跟随 agent 的工具调用。
-          setPlanState((prev) => (prev.source === 'web' ? prev : { ...prev, enabled: Boolean(payload.enabled) }))
-          break
-        case 'tasks':
-          if (payload.tasks) setData(payload.tasks)
-          break
-        case 'plans':
-          setPlans(payload.plans || [])
-          break
-        default:
-          break
-      }
-    }
-    source.addEventListener('stream', onStream)
-    source.onopen = () => {
-      setConnected(true)
-      // 断线重连后事件可能已丢，用一次快照对齐（不是轮询，只在重连时发生）。
-      if (openedOnce.current) loadAll()
-      openedOnce.current = true
-    }
-    source.onerror = () => setConnected(false)
     loadAll()
-    return () => {
-      source.removeEventListener('stream', onStream)
-      source.close()
-      setConnected(false)
+    return undefined
+    // connected 只在切换会话时取初始值，断线重连由下面的 effect 处理。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [applyPlan, currentId, loadAll])
+
+  // 应用 App 转发的任务事件。事件带着会话 id：切会话瞬间的尾事件不会被误用。
+  useEffect(() => {
+    if (!taskEvent || taskEvent.sessionId !== currentId) return
+    const payload = taskEvent.payload || {}
+    switch (payload.kind) {
+      case 'todos':
+        if (payload.scope === 'agent') {
+          setData((prev) => ({ ...prev, todos: payload.items || [] }))
+        } else {
+          const revision = Number(payload.revision || 0)
+          if (revision >= todoRev.current) {
+            todoRev.current = revision
+            setWebTodos(payload.items || [])
+          }
+        }
+        break
+      case 'plan':
+        applyPlan(payload.state)
+        break
+      case 'plan_mode':
+        setData((prev) => ({ ...prev, plan_mode: Boolean(payload.enabled) }))
+        // sidecar 是 Web 端权威状态；没有 sidecar 时才跟随 agent 的工具调用。
+        setPlanState((prev) => (prev.source === 'web' ? prev : { ...prev, enabled: Boolean(payload.enabled) }))
+        break
+      case 'tasks':
+        if (payload.tasks) setData(payload.tasks)
+        break
+      case 'plans':
+        setPlans(payload.plans || [])
+        break
+      default:
+        break
     }
-  }, [applyPlan, currentId, loadAll, sessionPath])
+  }, [applyPlan, currentId, taskEvent])
+
+  // 断线重连（connected false → true）后事件可能已丢，补一次快照；
+  // 首次挂载不重复拉取（切换会话的 effect 已经拉过）。
+  useEffect(() => {
+    if (firstConnectedRun.current) {
+      firstConnectedRun.current = false
+      prevConnected.current = connected
+      return
+    }
+    const was = prevConnected.current
+    prevConnected.current = connected
+    if (connected && !was && currentId) loadAll()
+  }, [connected, currentId, loadAll])
 
   const saveTodos = useCallback(async (items) => {
     setWebTodos(items)

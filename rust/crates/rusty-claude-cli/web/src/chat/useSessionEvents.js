@@ -1,6 +1,10 @@
 import { useEffect } from 'react'
 import { api, withToken } from '../api'
 
+// 任务面板关心的增量事件：与对话事件共用同一条 EventSource，
+// 由这里转发给 App，再由 App 传给 TasksPane（不再另开一条连接）。
+const TASK_EVENT_KINDS = new Set(['todos', 'plan', 'plan_mode', 'tasks', 'plans'])
+
 // 会话事件订阅：唯一一条 /api/session/:id/events EventSource。
 // 快照不再轮询 /stream —— 连接建立（含重连）、收到 done、收到 reset 时，
 // 主动通过 GET /api/session/:id 拉取一次完整快照做状态对齐，其余时间只吃增量。
@@ -19,6 +23,7 @@ export function useSessionEvents({
   setLoadingSession,
   setConnected,
   setPendingDraft,
+  setTaskEvent,
   lastPromptRef,
   runningRef,
   sendRef,
@@ -32,6 +37,9 @@ export function useSessionEvents({
     setLive('')
     setMessages([])
     setLoadingSession(true)
+    // 任务面板与对话共用这一条事件流：切会话时先清掉上一个会话的尾事件，
+    // 避免新面板挂载时把旧会话的待办/计划又应用一次。
+    setTaskEvent(null)
 
     // 与旧 /stream snapshot 完全一致的落地方式，保证终态渲染行为不变。
     const applySnapshot = (view) => {
@@ -123,6 +131,10 @@ export function useSessionEvents({
             return next
           })
         }
+        else if (TASK_EVENT_KINDS.has(data.kind)) {
+          // 任务面板的增量事件：随会话 id 一起转发，面板切会话后不会误用旧事件。
+          setTaskEvent({ sessionId: currentId, payload: data })
+        }
         else if (data.kind === 'done') {
           setRunning(false)
           // 终态落地：turn 结束时 Rust 侧已把完整消息写盘，拉一次快照把
@@ -151,5 +163,5 @@ export function useSessionEvents({
     })
     events.onerror = () => { setConnected(false); reconcile() }
     return () => { closed = true; events.close() }
-  }, [currentId, push])
+  }, [currentId, push, setTaskEvent])
 }
