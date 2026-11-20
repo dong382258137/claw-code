@@ -452,10 +452,13 @@ impl PersistentMemory {
         memory.enforce_limits(now, ACTIVE_MAX_ENTRIES);
         // Rebuild semantic L1 index from entries. Only active entries are
         // indexed — superseded / expired ones are in `archive` and not
-        // useful for recall.
+        // useful for recall. Orphans are excluded for the same reason they
+        // are excluded from rendering: their classification is undecided,
+        // so recalling them surfaces unmanaged noise into the prompt's
+        // dynamic region.
         let mut recaller = SemanticRecaller::new();
         for entry in &memory.entries {
-            if entry.is_active(now) {
+            if entry.is_active(now) && !entry.orphan {
                 recaller.add_l1_entry(&entry_id(&entry.content), &entry.content, &entry.source);
             }
         }
@@ -707,10 +710,19 @@ impl PersistentMemory {
         if !projection.is_empty() {
             sections.push(projection);
         }
+        // 孤儿条目不进注入前缀。
+        //
+        // `orphan = true` 表示该条目的 subject 无法映射到受控词表（见
+        // [`PersistentMemory::migrate_taxonomy`]），即「这条记忆归哪一类」本身
+        // 就没有定论。把它当正常事实每轮注入，等于用未分类的噪声占用缓存
+        // 前缀——它既无法被 subject+attribute 覆盖语义管理（`apply_upsert`
+        // 按这对键 supersede），也不会被 `/memory rm` 以外的路径清理。
+        // 孤儿仍保留在 `entries` 里供 `/memory` 面板审阅与人工归位
+        // （见 [`PersistentMemory::orphan_entries`]），只是不参与渲染。
         let active: Vec<&MemoryEntry> = self
             .active_entries(now_ms())
             .into_iter()
-            .filter(|entry| entry.kind != EntryKind::UserProfile)
+            .filter(|entry| entry.kind != EntryKind::UserProfile && !entry.orphan)
             .collect();
         if !active.is_empty() {
             sections.push(render_entries(&active, now_ms()));
@@ -1179,6 +1191,12 @@ impl PersistentMemory {
             report.conflicts += retired;
         }
         // L1：内容完全相同的活跃条目 → 刷新验证时间，不重复插入。
+        //
+        // 同时回填元数据：条目可能是旧版本写的（`kind` 缺省为 `fact`、
+        // `subject`/`attribute` 为 `None`）。若只刷新时间戳，这些条目永远
+        // 停在旧形态 —— `kind != UserProfile` 就进不了 Human 只读投影，
+        // `subject = None` 就参与不了 subject+attribute 冲突判定。
+        // 只在**当前值为空/缺省**时回填，绝不覆盖已有的更具体取值。
         if let Some(existing) = self
             .entries
             .iter_mut()
@@ -1186,6 +1204,18 @@ impl PersistentMemory {
         {
             existing.last_verified_at = now;
             existing.evidence_count = existing.evidence_count.saturating_add(1);
+            if existing.kind == EntryKind::Fact && op.kind != EntryKind::Fact {
+                existing.kind = op.kind;
+            }
+            if existing.subject.is_none() {
+                existing.subject = op.subject.clone();
+            }
+            if existing.attribute.is_none() {
+                existing.attribute = op.attribute.clone();
+            }
+            if existing.basis == Basis::Inferred && op.basis != Basis::Inferred {
+                existing.basis = op.basis;
+            }
             return true;
         }
         // L3：同 subject 下语义近重复（>0.95）跳过，避免脑补改写。
@@ -1510,6 +1540,207 @@ impl PersistentMemory {
     }
 }
 
+// ===== Q5(2026-11-19):逐轮用户风格/偏好观察 =====
+//
+// 用户诉求:「提取我的每一次发言，从中理解我的喜好和风格，并固化到记忆中」。
+//
+// 与 Phase 1 LLM 提取器（[`crate::memory_extract`]）的分工：
+// * LLM 提取器按**内容**标准抽取（稳定偏好 / 用户纠正 / 踩坑根因 / 长期约束），
+//   默认 NOOP，受窗口合并与二现门槛约束 —— 适合稀疏的高价值事实；
+// * 本通道按**表达形式**做确定性模式匹配，零 LLM、零延迟、可每轮运行 ——
+//   覆盖「风格」这类高频、单条信息量小但累积价值高的信号。
+//
+// 为何风格通道不用 LLM：
+// * Salemi et al., *LaMP: When Large Language Models Meet Personalization*
+//   (ACL 2024, arXiv:2304.11406) 显示 profile 的收益来自**相关性**而非规模，
+//   检索回来的少量高相关 profile 优于全量堆叠；
+// * *The Personalization Mirage* (arXiv:2608.04570, 2026) 指出 LLM 自建
+//   profile 会系统性**过度推断**（over-inference）—— 凭空补出证据不支持的
+//   用户属性，且自监测（self-monitoring）无法可靠拦截。
+// 确定性关键词匹配的召回上限低，但**不会编造**。对长期记忆而言精度优先于
+// 召回：一条错误的长期偏好会污染此后每个会话的系统前缀。
+//
+// 写入路径遵循 Phase 1 的边界落盘契约：构造 [`MemoryOp`] → `apply_ops`
+// （纯内存）→ 追加 journal；全量快照由会话边界 `flush` 统一落盘。因此本通道
+// 每轮运行也不会产生每轮全量写盘。subject/attribute 取自受控词表
+// （`work_style.*` / `language_pref.reply_language`），同一类信号反复出现
+// 只会刷新 `last_verified_at`，不会膨胀记忆。
+
+/// 一条风格信号的受控归类。
+///
+/// `subject` / `attribute` 必须存在于 [`MemoryTaxonomy`] 词表中，且**同一
+/// subject 下各信号必须用不同 attribute** —— [`PersistentMemory::apply_upsert`]
+/// 按 subject+attribute 覆盖旧条目，共用一个 attribute 会让后写入的信号
+/// 逐条顶掉先写入的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StyleSignal {
+    /// 受控 subject（如 `work_style` / `language_pref`）。
+    pub subject: &'static str,
+    /// 受控 attribute（如 `answer_length` / `reply_language`）。
+    pub attribute: &'static str,
+    /// 可直接持久化为记忆条目的短事实。
+    pub content: &'static str,
+}
+
+/// 从单条用户发言中提取确定性的喜好/风格信号（零 LLM）。
+///
+/// 只做**保守**判定：宁可漏掉，也不把噪音写进长期记忆。无信号时返回空 vec。
+///
+/// 覆盖 6 类可观测的表达形式偏好：回复语言、详略、结构化输出、自主性
+/// （不要反问）、第一性原理、权威来源要求。
+#[must_use]
+pub fn extract_style_signals(text: &str) -> Vec<StyleSignal> {
+    let mut signals = Vec::new();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return signals;
+    }
+    let lower = trimmed.to_lowercase();
+    let contains_any = |keys: &[&str]| keys.iter().any(|key| lower.contains(key));
+
+    // 1. 回复语言：CJK 存在 ⇒ 用户以中文交流，默认用中文回复。
+    if trimmed
+        .chars()
+        .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+    {
+        signals.push(StyleSignal {
+            subject: "language_pref",
+            attribute: "reply_language",
+            content: "user writes in Chinese; reply in Chinese by default",
+        });
+    }
+
+    // 2. 详略偏好（简洁 vs 详尽）。两者互斥，用同一 attribute 让后者顶掉前者：
+    //    用户先要详细、后说别啰嗦，最终生效的应是「简洁」。
+    if contains_any(&[
+        "简洁",
+        "简短",
+        "精简",
+        "别啰嗦",
+        "concise",
+        "be brief",
+        "keep it short",
+    ]) {
+        signals.push(StyleSignal {
+            subject: "work_style",
+            attribute: "answer_length",
+            content: "user prefers concise, to-the-point answers",
+        });
+    }
+    if contains_any(&[
+        "详细",
+        "展开",
+        "具体说明",
+        "逐条",
+        "in detail",
+        "elaborate",
+        "explain fully",
+    ]) {
+        signals.push(StyleSignal {
+            subject: "work_style",
+            attribute: "answer_length",
+            content: "user wants thorough, detailed explanations",
+        });
+    }
+
+    // 3. 结构化输出偏好。
+    if contains_any(&["表格", "列表", "清单", "table", "bullet"]) {
+        signals.push(StyleSignal {
+            subject: "work_style",
+            attribute: "output_format",
+            content: "user likes structured output (tables/lists)",
+        });
+    }
+
+    // 4. 自主性：用户明确表示不要被反问。
+    if contains_any(&[
+        "不要问我",
+        "别问我",
+        "自行决策",
+        "自己决定",
+        "don't ask me",
+        "decide yourself",
+        "no questions",
+    ]) {
+        signals.push(StyleSignal {
+            subject: "work_style",
+            attribute: "autonomy",
+            content: "user wants autonomous decisions — do not ask, decide and proceed",
+        });
+    }
+
+    // 5. 严谨性：第一性原理 / 权威来源。两项独立，故用不同 attribute。
+    if contains_any(&["第一性原理", "first principle"]) {
+        signals.push(StyleSignal {
+            subject: "work_style",
+            attribute: "reasoning_style",
+            content: "user values first-principles reasoning",
+        });
+    }
+    if contains_any(&[
+        "论文",
+        "权威",
+        "引用",
+        "paper",
+        "citation",
+        "cite",
+        "reference",
+    ]) {
+        signals.push(StyleSignal {
+            subject: "work_style",
+            attribute: "sourcing",
+            content: "user expects authoritative sources/citations for claims",
+        });
+    }
+
+    signals
+}
+
+/// 把逐轮风格信号折入记忆，返回**新增**条目数。
+///
+/// `texts` 通常是最近若干条 user 发言（至少含本轮发言）。幂等：同一信号
+/// 重复出现只刷新 `last_verified_at`，不新增条目。
+///
+/// 调用方无需自己做内容去重 —— [`PersistentMemory::apply_upsert`] 的 L1
+/// 精确内容判定已经覆盖；本函数只用 `seen` 消除**同一批内**的重复 op。
+pub fn observe_user_style(memory: &mut PersistentMemory, texts: &[String]) -> usize {
+    let before = memory.entries.len();
+    let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
+        std::collections::HashSet::new();
+    let mut ops: Vec<MemoryOp> = Vec::new();
+    for text in texts {
+        // 注入块（`[Web 计划…]` 等外壳）不是用户发言，必须先剥离：
+        // 否则「任务/计划」等字样会被当成用户的表达偏好写进长期记忆。
+        let cleaned = crate::task_state::strip_injected_prefix(text);
+        for signal in extract_style_signals(cleaned) {
+            if !seen.insert((signal.subject, signal.attribute)) {
+                continue;
+            }
+            ops.push(MemoryOp {
+                op: OpKind::Upsert,
+                kind: EntryKind::UserProfile,
+                subject: Some(signal.subject.to_string()),
+                attribute: Some(signal.attribute.to_string()),
+                content: signal.content.to_string(),
+                confidence: Confidence::High,
+                basis: Basis::Inferred,
+                explicit: false,
+                evidence_count: 1,
+                source: "style-observer".to_string(),
+                ..MemoryOp::default()
+            });
+        }
+    }
+    if ops.is_empty() {
+        return 0;
+    }
+    let report = memory.apply_ops(&ops, ACTIVE_MAX_ENTRIES);
+    if report.applied > 0 {
+        crate::memory_extract::append_journal(&memory.file_path, &ops);
+    }
+    memory.entries.len().saturating_sub(before)
+}
+
 /// `memory_update` 工具的 Tool specification(JSON schema)。
 ///
 /// 注册到 LLM 的 tool list,让 LLM 主动管理 PersistentMemory(MemGPT 风格):
@@ -1734,6 +1965,142 @@ mod tests {
     }
 
     // --- P2-7: PersistentMemory + Mid-Session Freeze ----------------------
+
+    // --- Q5: 逐轮风格观察通道 ---------------------------------------------
+
+    #[test]
+    fn extract_style_signals_detects_preferences() {
+        let zh = extract_style_signals("请你简洁一点，不要问我，自行决策，参考权威论文");
+        let contents: Vec<&str> = zh.iter().map(|signal| signal.content).collect();
+        assert!(
+            contents.contains(&"user writes in Chinese; reply in Chinese by default"),
+            "contents: {contents:?}"
+        );
+        assert!(
+            contents.contains(&"user prefers concise, to-the-point answers"),
+            "contents: {contents:?}"
+        );
+        assert!(
+            contents.contains(&"user wants autonomous decisions — do not ask, decide and proceed"),
+            "contents: {contents:?}"
+        );
+        assert!(
+            contents.contains(&"user expects authoritative sources/citations for claims"),
+            "contents: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn extract_style_signals_ignores_noise() {
+        assert!(extract_style_signals("ok").is_empty());
+        assert!(extract_style_signals("   ").is_empty());
+        assert!(extract_style_signals("").is_empty());
+    }
+
+    /// 六类信号必须落在**互不相同**的 subject+attribute 上。
+    ///
+    /// `apply_upsert` 按 subject+attribute 覆盖旧条目：若共用一个 attribute，
+    /// 同一批写入的信号会互相顶掉，最终只剩最后一条。这条测试锁住词表与
+    /// 信号表的对齐关系，防止后人「顺手」把 attribute 合并。
+    #[test]
+    fn style_signals_use_distinct_subject_attribute_pairs() {
+        let all = extract_style_signals(
+            "简洁一点，用表格列出，不要问我，第一性原理，引用论文，回复用中文",
+        );
+        assert!(all.len() >= 6, "all: {all:?}");
+        let mut pairs: Vec<(&str, &str)> = all
+            .iter()
+            .map(|signal| (signal.subject, signal.attribute))
+            .collect();
+        let total = pairs.len();
+        pairs.sort_unstable();
+        pairs.dedup();
+        assert_eq!(
+            pairs.len(),
+            total,
+            "同一批信号不得共用 subject+attribute：{pairs:?}"
+        );
+    }
+
+    /// 详略偏好是互斥的：共用 `answer_length` 让后写的顶掉先写的。
+    #[test]
+    fn concise_and_detailed_share_answer_length_attribute() {
+        // 中文发言会同时命中「回复语言」信号，故按 attribute 过滤后再断言。
+        let pick = |text: &str| -> Vec<(&'static str, &'static str)> {
+            extract_style_signals(text)
+                .into_iter()
+                .filter(|signal| signal.attribute == "answer_length")
+                .map(|signal| (signal.subject, signal.content))
+                .collect()
+        };
+        let concise = pick("简洁一点");
+        let detailed = pick("请详细展开");
+        assert_eq!(concise.len(), 1, "concise: {concise:?}");
+        assert_eq!(detailed.len(), 1, "detailed: {detailed:?}");
+        assert_eq!(concise[0].0, detailed[0].0, "subject 应相同");
+        assert_ne!(concise[0].1, detailed[0].1, "内容应不同");
+    }
+
+    #[test]
+    fn observe_user_style_is_idempotent() {
+        let path = temp_path();
+        let mut mem = PersistentMemory::empty(&path);
+        let texts = vec!["请你简洁一点，不要问我，自行决策".to_string()];
+        let first = observe_user_style(&mut mem, &texts);
+        assert!(first > 0, "首次观察应写入条目");
+        let after_first = mem.entries().len();
+        let again = observe_user_style(&mut mem, &texts);
+        assert_eq!(again, 0, "重复观察不得新增条目");
+        assert_eq!(mem.entries().len(), after_first, "条目数不得膨胀");
+        assert!(
+            mem.entries()
+                .iter()
+                .any(|entry| entry.source == "style-observer"),
+            "条目来源应为 style-observer"
+        );
+    }
+
+    /// 注入块（`[Web 计划…]`）不是用户发言，不得被当成表达偏好写进记忆。
+    #[test]
+    fn observe_user_style_strips_injected_prefix() {
+        let path = temp_path();
+        let mut mem = PersistentMemory::empty(&path);
+        let injected = "[Web 计划（用户在 Web 端维护，作为当前执行计划）]\n\
+             任务: 简洁一点\n\n真实发言: 不要问我"
+            .to_string();
+        observe_user_style(&mut mem, &[injected]);
+        // 整块被剥离后只剩「真实发言: 不要问我」→ 只应命中自主性一条。
+        let contents: Vec<&str> = mem
+            .entries()
+            .iter()
+            .map(|entry| entry.content.as_str())
+            .collect();
+        assert!(
+            contents.contains(&"user wants autonomous decisions — do not ask, decide and proceed"),
+            "contents: {contents:?}"
+        );
+        assert!(
+            !contents.contains(&"user prefers concise, to-the-point answers"),
+            "注入块内的「简洁」不应被当作用户偏好：{contents:?}"
+        );
+    }
+
+    /// 风格条目走 `UserProfile` 类别 ⇒ 进入 Human 只读投影（下个会话前缀）。
+    #[test]
+    fn observe_user_style_marks_entries_as_user_profile() {
+        let path = temp_path();
+        let mut mem = PersistentMemory::empty(&path);
+        observe_user_style(&mut mem, &["回复用中文".to_string()]);
+        let entry = mem
+            .entries()
+            .iter()
+            .find(|entry| entry.source == "style-observer")
+            .expect("应有 style-observer 条目");
+        assert_eq!(entry.kind, EntryKind::UserProfile);
+        assert_eq!(entry.subject.as_deref(), Some("language_pref"));
+        assert_eq!(entry.attribute.as_deref(), Some("reply_language"));
+        assert!(!entry.orphan, "受控词表内的条目不得标孤儿");
+    }
 
     #[test]
     fn persistent_memory_load_and_freeze_creates_snapshot() {
@@ -2313,6 +2680,62 @@ mod phase1_tests {
         assert!(orphan.orphan);
         assert_eq!(orphan.legacy_subject.as_deref(), Some("完全未知类目"));
         assert_eq!(orphan.subject.as_deref(), Some("other"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn orphan_entries_are_neither_rendered_nor_recalled() {
+        // 孤儿条目（subject 无法映射到受控词表）的「归哪一类」本身未定，
+        // 因此既不得进入注入前缀，也不得进入语义召回索引。
+        //
+        // 实测污染：`.claw/memory.json` 里 6 条 block-migration 孤儿每轮都
+        // 以 `## 跨任务通用教训…` 的形式出现在 system 前缀，且
+        // `semantic_recall` 持续返回其中一条（score 0.862）——它们既无法
+        // 被 subject+attribute 覆盖语义管理，也不该占用缓存前缀预算。
+        let path = temp_path("orphan-not-rendered");
+        let mut memory = PersistentMemory::empty(&path);
+        memory.add_entry("主数据库是 PostgreSQL", "test");
+        if let Some(entry) = memory.entries.first_mut() {
+            entry.subject = Some("项目数据库".to_string());
+            entry.attribute = Some("主数据库".to_string());
+        }
+        memory.add_entry("某个未归类事实", "test");
+        if let Some(entry) = memory.entries.last_mut() {
+            entry.subject = Some("完全未知类目".to_string());
+        }
+        memory.flush().expect("persist baseline");
+
+        let reloaded = PersistentMemory::load_and_freeze(&path);
+        let orphan = reloaded
+            .entries()
+            .iter()
+            .find(|entry| entry.content.contains("未归类"))
+            .expect("orphan entry");
+        assert!(orphan.orphan, "前置条件：该条目应被标为孤儿");
+
+        let rendered = reloaded.frozen_render();
+        assert!(
+            !rendered.contains("未归类"),
+            "孤儿条目不得进入注入前缀: {rendered}"
+        );
+        assert!(
+            rendered.contains("PostgreSQL"),
+            "受控词表内的条目仍应正常渲染: {rendered}"
+        );
+        assert!(
+            !reloaded
+                .semantic_recall("未归类事实", 5)
+                .iter()
+                .any(|hit| hit.entry.summary.contains("未归类")),
+            "孤儿条目不得进入语义召回索引"
+        );
+        // 仍保留在 entries 里供 `/memory` 面板审阅与人工归位。
+        assert_eq!(
+            reloaded.orphan_entries().len(),
+            1,
+            "孤儿应仍可被 orphan_entries() 列出以便人工归位"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

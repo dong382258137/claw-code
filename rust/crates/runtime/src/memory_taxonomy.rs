@@ -226,7 +226,20 @@ fn default_subjects() -> Vec<SubjectSpec> {
         ),
         spec(
             "work_style",
-            &["rule", "preference", "process"],
+            &[
+                "rule",
+                "preference",
+                "process",
+                // 风格观察通道（`extract_style_signals`）专用的细粒度属性。
+                // 必须**互不相同**：`apply_upsert` 按 subject+attribute 覆盖旧条目，
+                // 若「简洁」「结构化输出」「第一性原理」共用一个 attribute，
+                // 后写入的会逐条顶掉先写入的，最终只剩最后一条。
+                "answer_length",
+                "output_format",
+                "autonomy",
+                "reasoning_style",
+                "sourcing",
+            ],
             &[
                 "工作方式",
                 "工作风格",
