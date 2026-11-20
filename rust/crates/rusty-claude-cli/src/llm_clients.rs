@@ -66,7 +66,7 @@ impl LlmBridge {
     /// 构造桥接。
     ///
     /// # 参数
-    /// - `model`:LLM 模型名(如 "deepseek-v4-pro" / "deepseek-v4-flash")
+    /// - `model`:LLM 模型名(单模型部署统一用 "deepseek-flash")
     /// - `max_tokens`:单次响应上限。`None` 时用 `api::max_tokens_for_model` 默认值
     ///
     /// # 错误
@@ -164,8 +164,8 @@ impl LlmBridge {
 /// use std::sync::Arc;
 /// use runtime::multi_agent::validation::{JudgeClient, LlmJudgeGate};
 ///
-/// let judge: Arc<dyn JudgeClient> = Arc::new(DeepSeekJudgeClient::new("deepseek-v4-pro", None)?);
-/// let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", workspace_root)
+/// let judge: Arc<dyn JudgeClient> = Arc::new(DeepSeekJudgeClient::new("deepseek-flash", None)?);
+/// let gate = LlmJudgeGate::diagnostic_default("deepseek-flash", workspace_root)
 ///     .with_client(judge);
 /// ```
 pub struct DeepSeekJudgeClient {
@@ -176,7 +176,7 @@ impl DeepSeekJudgeClient {
     /// 构造 judge client。
     ///
     /// # 参数
-    /// - `model`:judge 模型名(建议用旗舰模型保证判断质量,如 "deepseek-v4-pro")
+    /// - `model`:judge 模型名(单模型部署统一用 "deepseek-flash")
     /// - `max_tokens`:单次响应上限。`None` 用模型默认值(judge 通常 1024 足够)
     pub fn new(model: &str, max_tokens: Option<u32>) -> Result<Self, String> {
         Ok(Self {
@@ -285,7 +285,7 @@ impl DeepSeekPlanGeneratorClient {
     /// 构造计划生成 client。
     ///
     /// # 参数
-    /// - `model`:计划模型名(建议旗舰模型保证步骤质量,如 "deepseek-v4-pro")
+    /// - `model`:计划模型名(单模型部署统一用 "deepseek-flash")
     /// - `max_tokens`:单次响应上限。`None` 用模型默认值(计划通常 2048 足够)
     pub fn new(model: &str, max_tokens: Option<u32>) -> Result<Self, String> {
         Ok(Self {
@@ -679,7 +679,7 @@ impl DeepSeekHarnessProposer {
     /// 构造 harness 提议器。
     ///
     /// # 参数
-    /// - `model`:提议模型名(建议旗舰模型保证规则质量,如 "deepseek-v4-pro")
+    /// - `model`:提议模型名(单模型部署统一用 "deepseek-flash")
     /// - `max_tokens`:单次响应上限(规则 + 推理,512 足够)
     pub fn new(model: &str, max_tokens: Option<u32>) -> Result<Self, String> {
         Ok(Self {
@@ -779,7 +779,7 @@ mod tests {
         }
 
         // DeepSeek-only build: ProviderClient::from_model 读 DEEPSEEK_API_KEY
-        let result = LlmBridge::new("deepseek-v4-pro", None);
+        let result = LlmBridge::new("deepseek-flash", None);
 
         // 恢复环境变量
         for (k, v) in &saved {

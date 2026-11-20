@@ -119,8 +119,8 @@ mod tests {
 
     #[test]
     fn resolves_deepseek_aliases() {
-        assert_eq!(resolve_model_alias("pro"), "deepseek-v4-pro");
-        assert_eq!(resolve_model_alias("flash"), "deepseek-v4-flash");
+        assert_eq!(resolve_model_alias("pro"), "deepseek-flash");
+        assert_eq!(resolve_model_alias("flash"), "deepseek-flash");
     }
 
     #[test]

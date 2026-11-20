@@ -54,7 +54,7 @@ const DEEPSEEK_ENV_VARS: &[&str] = &["DEEPSEEK_API_KEY"];
 const DEEPSEEK_MAX_REQUEST_BODY_BYTES: usize = 104_857_600; // 100MB
 
 impl OpenAiCompatConfig {
-    /// DeepSeek API (deepseek-v4-pro, deepseek-v4-flash, etc.)
+    /// DeepSeek API (deepseek-flash, deepseek-chat, etc.)
     /// Uses the OpenAI-compatible REST shape at api.deepseek.com/v1.
     /// Auth via DEEPSEEK_API_KEY.
     #[must_use]
@@ -1036,14 +1036,18 @@ fn wire_model_for_base_url<'a>(
     _config: OpenAiCompatConfig,
     _base_url: &str,
 ) -> Cow<'a, str> {
-    let Some(pos) = model.find('/') else {
-        return Cow::Borrowed(model);
+    let bare = match model.split_once('/') {
+        Some((prefix, rest)) if prefix.eq_ignore_ascii_case("deepseek") => rest,
+        _ => model,
     };
-    let prefix = &model[..pos];
-    if prefix.eq_ignore_ascii_case("deepseek") {
-        return Cow::Borrowed(&model[pos + 1..]);
+    // 官方现行 ID 为 deepseek-flash；旧 ID 与已下线的 Pro ID 统一归一化，
+    // 确保实际发送到官方 API 的模型名不会落到 Pro。
+    let canonical = super::resolve_model_alias(bare);
+    if canonical == bare {
+        Cow::Borrowed(bare)
+    } else {
+        Cow::Owned(canonical)
     }
-    Cow::Borrowed(model)
 }
 
 /// Estimate the serialized JSON size of a request payload in bytes.
@@ -2496,7 +2500,7 @@ mod tests {
             OpenAiCompatConfig::deepseek(),
         );
 
-        assert_eq!(payload["model"], json!("deepseek-v4-flash"));
+        assert_eq!(payload["model"], json!("deepseek-flash"));
         assert_eq!(payload["max_tokens"], json!(1024));
         assert_eq!(payload["messages"].as_array().map(Vec::len), Some(1));
         assert_eq!(

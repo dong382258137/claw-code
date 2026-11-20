@@ -96,9 +96,10 @@ pub struct ProviderDiagnostics {
 }
 
 /// DeepSeek model aliases mapped to canonical names.
+/// Pro 已下线：pro 入口统一收敛到 flash，避免产生 Pro 计费。
 const MODEL_REGISTRY: &[(&str, &str)] = &[
-    ("pro", "deepseek-v4-pro"),
-    ("flash", "deepseek-v4-flash"),
+    ("pro", "deepseek-flash"),
+    ("flash", "deepseek-flash"),
     ("chat", "deepseek-chat"),
     ("reasoner", "deepseek-reasoner"),
 ];
@@ -106,12 +107,31 @@ const MODEL_REGISTRY: &[(&str, &str)] = &[
 #[must_use]
 pub fn resolve_model_alias(model: &str) -> String {
     let trimmed = model.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    MODEL_REGISTRY
-        .iter()
-        .find_map(|(alias, canonical)| (*alias == lower).then_some(*canonical))
-        .unwrap_or(trimmed)
-        .to_string()
+    // 兼容带 provider 前缀的模型（如 deepseek/deepseek-v4-pro）：
+    // 只归一化 base 部分，前缀原样保留，避免影响 provider 路由。
+    let (prefix, base) = match trimmed.split_once('/') {
+        Some((prefix, base)) => (Some(prefix), base),
+        None => (None, trimmed),
+    };
+    let lower = base.to_ascii_lowercase();
+    let canonical =
+        if let Some((_, canonical)) = MODEL_REGISTRY.iter().find(|(alias, _)| *alias == lower) {
+            (*canonical).to_string()
+        } else {
+            // 官方现行 ID 为 deepseek-flash；旧名与已下线的 Pro ID
+            // 一律归一化到 flash，保证任何入口都不会再发出 Pro 请求。
+            match lower.as_str() {
+                "deepseek-v4-flash"
+                | "deepseek-v4.1-flash"
+                | "deepseek-v4-pro"
+                | "deepseek-v4.1-pro" => "deepseek-flash".to_string(),
+                _ => base.to_string(),
+            }
+        };
+    match prefix {
+        Some(prefix) => format!("{prefix}/{canonical}"),
+        None => canonical,
+    }
 }
 
 #[must_use]
@@ -265,12 +285,7 @@ fn web_passthrough_diagnostic(
 
 #[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
-    let canonical = resolve_model_alias(model);
-    let heuristic = if canonical.contains("pro") {
-        32_000
-    } else {
-        64_000
-    };
+    let heuristic = 64_000;
 
     model_token_limit(model).map_or(heuristic, |limit| heuristic.min(limit.max_output_tokens))
 }
@@ -287,10 +302,13 @@ pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     let canonical = resolve_model_alias(model);
     let base_model = canonical.rsplit('/').next().unwrap_or(canonical.as_str());
-    match base_model {
-        // DeepSeek V4 系列 — 1M 上下文窗口
+    // 兼容带 provider 前缀的旧 ID（如 deepseek/deepseek-v4-pro）。
+    let base_model = resolve_model_alias(base_model);
+    match base_model.as_str() {
+        // DeepSeek V4.1 Flash — 1M 上下文窗口
+        // 官方 ID: deepseek-flash；旧名 deepseek-v4-flash / deepseek-v4.1-flash 兼容。
         // Source: https://api-docs.deepseek.com/
-        "deepseek-v4-pro" | "deepseek-v4-flash" => Some(ModelTokenLimit {
+        "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4.1-flash" => Some(ModelTokenLimit {
             max_output_tokens: 32_000,
             context_window_tokens: 1_000_000,
         }),
@@ -468,7 +486,7 @@ mod tests {
                 context_window_tokens,
                 ..
             } => {
-                assert_eq!(model, "deepseek-v4-pro");
+                assert_eq!(model, "deepseek-flash");
                 assert_eq!(context_window_tokens, 1_000_000);
             }
             other => panic!("expected context-window preflight failure, got {other:?}"),
@@ -488,12 +506,17 @@ mod tests {
 
     #[test]
     fn resolves_deepseek_aliases() {
-        assert_eq!(resolve_model_alias("pro"), "deepseek-v4-pro");
-        assert_eq!(resolve_model_alias("flash"), "deepseek-v4-flash");
+        // Pro 已下线：pro 入口统一收敛到 flash
+        assert_eq!(resolve_model_alias("pro"), "deepseek-flash");
+        assert_eq!(resolve_model_alias("flash"), "deepseek-flash");
         assert_eq!(resolve_model_alias("chat"), "deepseek-chat");
         assert_eq!(resolve_model_alias("reasoner"), "deepseek-reasoner");
+        // 旧 ID 归一化到官方现行 ID
+        assert_eq!(resolve_model_alias("deepseek-v4-flash"), "deepseek-flash");
+        assert_eq!(resolve_model_alias("deepseek-v4.1-flash"), "deepseek-flash");
+        assert_eq!(resolve_model_alias("deepseek-v4-pro"), "deepseek-flash");
         // Case insensitive
-        assert_eq!(resolve_model_alias("PRO"), "deepseek-v4-pro");
+        assert_eq!(resolve_model_alias("PRO"), "deepseek-flash");
     }
 
     #[test]
@@ -688,7 +711,7 @@ mod tests {
                 estimated_total_tokens,
                 context_window_tokens,
             } => {
-                assert_eq!(model, "deepseek-v4-flash");
+                assert_eq!(model, "deepseek-flash");
                 assert!(estimated_input_tokens > 136_000);
                 assert_eq!(requested_output_tokens, 32_000);
                 assert!(estimated_total_tokens > context_window_tokens);

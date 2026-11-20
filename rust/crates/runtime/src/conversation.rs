@@ -35,8 +35,7 @@ use crate::planner::{
 // 主 agent 通过 dispatch_subagent tool 派发任务给子 agent。
 // 子 agent 走独立 LLM 请求 + 独立 prompt cache,不污染主 agent 缓存(§5.2)。
 use crate::multi_agent::{
-    upgrade_model_for_subagent, CoordinationMode, MultiAgentCoordinator, SpawnRequest,
-    SubagentStatus, TaskComplexity,
+    CoordinationMode, MultiAgentCoordinator, SpawnRequest, SubagentStatus, TaskComplexity,
 };
 // CoordinatorExecutor + SubagentDispatcher + SubagentRunner — 用于 DAG 真实调度
 // (v0.2 TODO 2 生产接入)。with_dag_coordinator 把 CoordinatorExecutor 装到 runtime,
@@ -6618,7 +6617,7 @@ where
                 Vec::new(),
             ));
         let max_attempts = max_attempts.max(1);
-        let mut current_model = model_str.map(String::from);
+        let current_model = model_str.map(String::from);
         // 重试时基于原 task 注入上次 handoff 上下文(避免重复执行已完成操作),
         // 每次失败后重建(以原 task 为基,不累积)。
         let mut effective_task = task.to_string();
@@ -6689,17 +6688,9 @@ where
                 .as_ref()
                 .expect("coordinator checked above");
 
-            // MVP 成本累计:名义值 $0.001/次,旗舰模型(pro)×10
+            // MVP 成本累计:名义值 $0.001/次(单模型 deepseek-flash,无 Pro 溢价)
             // 完整成本计算需 token 用量,v2 由 run_subagent_turn_with_model 回传
-            let nominal_cost = if current_model
-                .as_deref()
-                .map(|m| m.contains("pro"))
-                .unwrap_or(false)
-            {
-                0.01
-            } else {
-                0.001
-            };
+            let nominal_cost = 0.001;
             let _ = coordinator.add_cost(&subagent_id, nominal_cost);
 
             // v3 P1 checkpoint:每轮 turn 后保存(借鉴 LangGraph durable execution)
@@ -6776,41 +6767,17 @@ where
                                 break;
                             }
 
-                            // 升级模型
-                            let upgraded = current_model
-                                .as_deref()
-                                .and_then(upgrade_model_for_subagent);
-                            match upgraded {
-                                Some(upgrade) => {
-                                    // 注入上次尝试的 handoff 上下文,避免重试子智能体
-                                    // 重复执行已完成的工具调用(设计文档 §8.1 约束)。
-                                    if let Some(ctx) = build_subagent_retry_context(
-                                        self.workspace_root.as_deref(),
-                                        workspace_override.as_deref(),
-                                        &subagent_id,
-                                    ) {
-                                        effective_task = format!("{task}{ctx}");
-                                    }
-                                    let _ = coordinator.reset_for_retry(
-                                        &subagent_id,
-                                        Some(upgrade.target_model.clone()),
-                                    );
-                                    let _ = coordinator.start(&subagent_id);
-                                    current_model = Some(upgrade.target_model);
-                                    // continue 下一轮 retry
-                                }
-                                None => {
-                                    // 已是旗舰,无法升级 — 立即失败
-                                    let msg = format!(
-                                        "Subagent `{subagent_id}` failed: model at flagship but validation still fails (attempt {attempt}): {}",
-                                        ve.message
-                                    );
-                                    let _ = coordinator.fail(&subagent_id, &msg);
-                                    final_status = "failed";
-                                    final_result_msg = msg;
-                                    break;
-                                }
+                            // Pro 已下线：不再升级模型，同模型重试并注入 handoff 上下文
+                            if let Some(ctx) = build_subagent_retry_context(
+                                self.workspace_root.as_deref(),
+                                workspace_override.as_deref(),
+                                &subagent_id,
+                            ) {
+                                effective_task = format!("{task}{ctx}");
                             }
+                            let _ = coordinator.reset_for_retry(&subagent_id, None);
+                            let _ = coordinator.start(&subagent_id);
+                            // continue 下一轮 retry
                         }
                         Err(ve) => {
                             // 不可重试 或 达 max_attempts
@@ -6834,7 +6801,7 @@ where
                             crate::diag::DiagLevel::Warn,
                             "subagent_turn_failed",
                             format!(
-                                "subagent {subagent_id} turn failed (attempt {attempt}): {e}, retrying with upgraded model"
+                                "subagent {subagent_id} turn failed (attempt {attempt}): {e}, retrying with same model"
                             ),
                         )
                         .with_field("subagent_id", serde_json::Value::String(subagent_id.clone())),
@@ -6852,36 +6819,17 @@ where
                         break;
                     }
 
-                    let upgraded = current_model
-                        .as_deref()
-                        .and_then(upgrade_model_for_subagent);
-                    match upgraded {
-                        Some(upgrade) => {
-                            // 注入上次尝试的 handoff 上下文(截断等 Err 场景),
-                            // 避免重试子智能体重复执行已完成的工具调用(设计文档 §8.1 约束)。
-                            if let Some(ctx) = build_subagent_retry_context(
-                                self.workspace_root.as_deref(),
-                                workspace_override.as_deref(),
-                                &subagent_id,
-                            ) {
-                                effective_task = format!("{task}{ctx}");
-                            }
-                            let _ = coordinator
-                                .reset_for_retry(&subagent_id, Some(upgrade.target_model.clone()));
-                            let _ = coordinator.start(&subagent_id);
-                            current_model = Some(upgrade.target_model);
-                            // continue 下一轮 retry
-                        }
-                        None => {
-                            // 无升级路径 — 立即失败
-                            let msg = format!(
-                                "Subagent `{subagent_id}` failed after {attempt} attempts (no model upgrade path): {e}"
-                            );
-                            final_status = "failed";
-                            final_result_msg = msg;
-                            break;
-                        }
+                    // Pro 已下线：不升级模型，同模型重试并注入 handoff 上下文
+                    if let Some(ctx) = build_subagent_retry_context(
+                        self.workspace_root.as_deref(),
+                        workspace_override.as_deref(),
+                        &subagent_id,
+                    ) {
+                        effective_task = format!("{task}{ctx}");
                     }
+                    let _ = coordinator.reset_for_retry(&subagent_id, None);
+                    let _ = coordinator.start(&subagent_id);
+                    // continue 下一轮 retry
                 }
                 Err(e) => {
                     // 达 max_attempts — 终态失败
@@ -19732,7 +19680,7 @@ mod tests {
         assert!(ctx.is_none());
     }
 
-    /// 场景 1:简单任务路由到 flash,一次成功(§10.4 端到端流程 P0)
+    /// 场景 1:简单任务使用唯一模型 flash,一次成功(§10.4 端到端流程 P0)
     /// 验收:简单任务 → flash → run → validate 通过 → completed
     #[test]
     fn dispatch_subagent_scenario1_simple_task_flash_succeeds() {
@@ -19750,7 +19698,7 @@ mod tests {
             "name": "fmt-agent",
             "task": unique_task,
             "mode": "fork",
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-flash",
             "complexity": "simple",
             "max_attempts": 1
         })
@@ -19771,11 +19719,11 @@ mod tests {
             .and_then(|s| s.split('`').next())
             .expect("extract subagent_id");
         let agent = coordinator.get(subagent_id).expect("agent exists");
-        // 关键不变量:模型未升级(仍是 flash),attempts=0(无重试)
+        // 关键不变量:单模型架构,模型始终为 flash,attempts=0(无重试)
         assert_eq!(
             agent.model.as_deref(),
-            Some("deepseek-v4-flash"),
-            "scenario 1: model should remain flash (no upgrade needed)"
+            Some("deepseek-flash"),
+            "scenario 1: model should stay deepseek-flash"
         );
         assert_eq!(agent.attempts, 0, "scenario 1: no retry should happen");
         assert!(agent.validated, "scenario 1: should be validated");
@@ -19786,13 +19734,13 @@ mod tests {
         );
     }
 
-    /// 场景 2:诊断任务路由到 pro,一次成功(§10.4 端到端流程 P0)
-    /// 验收:诊断任务 → pro → run → validate 通过 → completed
+    /// 场景 2:诊断任务同样使用唯一模型 flash,一次成功(§10.4 端到端流程 P0)
+    /// 验收:诊断任务 → flash → run → validate 通过 → completed
     #[test]
-    fn dispatch_subagent_scenario2_diagnostic_task_pro_succeeds() {
+    fn dispatch_subagent_scenario2_diagnostic_task_flash_succeeds() {
         let _guard = acquire_lane_event_lock();
         let _ = crate::lane_events::drain_lane_events();
-        let unique_task = "scenario2-diagnostic-pro-uuid-p0-9-s2";
+        let unique_task = "scenario2-diagnostic-flash-uuid-p0-9-s2";
 
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
         let mut runtime = runtime_with_coordinator(coordinator.clone());
@@ -19803,7 +19751,7 @@ mod tests {
             "name": "diag-agent",
             "task": unique_task,
             "mode": "fork",
-            "model": "deepseek-v4-pro",
+            "model": "deepseek-flash",
             "complexity": "diagnostic",
             "max_attempts": 2
         })
@@ -19824,11 +19772,11 @@ mod tests {
             .and_then(|s| s.split('`').next())
             .expect("extract subagent_id");
         let agent = coordinator.get(subagent_id).expect("agent exists");
-        // 关键不变量:模型保持 pro(旗舰,无需升级),attempts=0(一次成功)
+        // 关键不变量:单模型架构,模型保持 flash,attempts=0(一次成功)
         assert_eq!(
             agent.model.as_deref(),
-            Some("deepseek-v4-pro"),
-            "scenario 2: model should remain pro (flagship, no upgrade)"
+            Some("deepseek-flash"),
+            "scenario 2: model should stay deepseek-flash (single-model deployment)"
         );
         assert_eq!(agent.attempts, 0, "scenario 2: no retry should happen");
         assert!(agent.validated, "scenario 2: should be validated");
@@ -19844,21 +19792,20 @@ mod tests {
         );
     }
 
-    /// 场景 3:flash + Simple + max_attempts=2,validate 失败 → 自动路由升级 pro → 重试成功
+    /// 场景 3:flash + Simple + max_attempts=2,validate 失败 → 同模型重试 → 成功
     ///
-    /// 2026-08-13 V4-Pro 0813 正式版上线,自动路由升级链已重新启用,
-    /// retryable 失败时 flash 自动升级到 pro 重试,而非直接 fail。
+    /// Pro 已下线:retryable 失败时保持 flash 重试,不再升级到 pro。
     #[test]
-    fn dispatch_subagent_scenario3_flash_upgrades_to_pro_and_succeeds() {
+    fn dispatch_subagent_scenario3_flash_retries_same_model_and_succeeds() {
         let _guard = acquire_lane_event_lock();
         let _ = crate::lane_events::drain_lane_events();
-        let unique_task = "scenario3-upgrade-uuid-p0-9-s3";
+        let unique_task = "scenario3-retry-uuid-p0-9-s3";
 
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
-        // gate 脚本:第一次 Err(retryable)→ 升级 pro;第二次 validate 通过
+        // gate 脚本:第一次 Err(retryable)→ 同模型重试;第二次 validate 通过
         coordinator.add_validation_gate(Box::new(ScriptedGate::new(vec![
             Some(false), // attempt 1 validate: retryable Err
-            Some(true),  // attempt 2 validate: 通过(pro)
+            Some(true),  // attempt 2 validate: 通过(仍为 flash)
         ])));
 
         let mut runtime = runtime_with_coordinator(coordinator.clone());
@@ -19869,7 +19816,7 @@ mod tests {
             "name": "diag-agent",
             "task": unique_task,
             "mode": "fork",
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-flash",
             "complexity": "simple",
             "max_attempts": 2
         })
@@ -19879,10 +19826,10 @@ mod tests {
             .execute_dispatch_subagent(&input)
             .expect("dispatch should not propagate as hard error");
 
-        // 自动路由:第一次失败后升级 pro,第二次 validate 通过 → completed
+        // 同模型重试:第一次失败后保持 flash,第二次 validate 通过 → completed
         assert!(
             output.contains("Subagent `") && output.contains("completed"),
-            "scenario 3 should complete after upgrade to pro: {output}"
+            "scenario 3 should complete after same-model retry: {output}"
         );
 
         let subagent_id = output
@@ -19891,11 +19838,11 @@ mod tests {
             .and_then(|s| s.split('`').next())
             .expect("extract subagent_id");
         let agent = coordinator.get(subagent_id).expect("agent exists");
-        // 模型已自动升级到 pro
+        // 模型始终为 flash,不存在升级
         assert_eq!(
             agent.model.as_deref(),
-            Some("deepseek-v4-pro"),
-            "model should be upgraded to pro (auto-routing enabled)"
+            Some("deepseek-flash"),
+            "model should stay deepseek-flash (no pro upgrade)"
         );
         assert!(agent.validated, "should be validated");
         assert_eq!(
@@ -19905,20 +19852,20 @@ mod tests {
         );
     }
 
-    /// 场景 4:flash + Simple + max_attempts=2,validate 连续失败 → 升级 pro 后仍失败 → fail
+    /// 场景 4:flash + Simple + max_attempts=2,validate 连续失败 → 同模型重试仍失败 → fail
     ///
-    /// 自动路由已启用:第一次失败升级 pro;pro 已是旗舰,第二次失败无升级路径 → fail。
+    /// Pro 已下线:两次尝试都使用 flash,第二次失败后直接 fail。
     #[test]
-    fn dispatch_subagent_scenario4_pro_cannot_upgrade_so_fails() {
+    fn dispatch_subagent_scenario4_retries_same_model_then_fails() {
         let _guard = acquire_lane_event_lock();
         let _ = crate::lane_events::drain_lane_events();
-        let unique_task = "scenario4-no-upgrade-uuid-p0-9-s4";
+        let unique_task = "scenario4-retry-fail-uuid-p0-9-s4";
 
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
         // gate 脚本:总是 retryable Err
         coordinator.add_validation_gate(Box::new(ScriptedGate::new(vec![
-            Some(false), // attempt 1: retryable Err → 升级 pro
-            Some(false), // attempt 2: retryable Err(pro 已旗舰)→ fail
+            Some(false), // attempt 1: retryable Err → 同模型重试
+            Some(false), // attempt 2: retryable Err → fail
         ])));
 
         let mut runtime = runtime_with_coordinator(coordinator.clone());
@@ -19929,7 +19876,7 @@ mod tests {
             "name": "diag-agent",
             "task": unique_task,
             "mode": "fork",
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-flash",
             "complexity": "simple",
             "max_attempts": 2
         })
@@ -19939,10 +19886,10 @@ mod tests {
             .execute_dispatch_subagent(&input)
             .expect("dispatch should not propagate as hard error");
 
-        // 升级 pro 后仍失败 → fail
+        // 同模型重试后仍失败 → fail
         assert!(
             output.contains("Subagent `") && output.contains("failed"),
-            "scenario 4 should fail after pro retry fails: {output}"
+            "scenario 4 should fail after same-model retry fails: {output}"
         );
 
         let subagent_id = output
@@ -19957,38 +19904,38 @@ mod tests {
             "should be Failed"
         );
         assert!(!agent.validated, "should not be validated");
-        // 模型已升级到 pro(第一次失败后),pro 无升级路径 → fail
+        // 模型始终为 flash,不存在升级
         assert_eq!(
             agent.model.as_deref(),
-            Some("deepseek-v4-pro"),
-            "model should be upgraded to pro before failing"
+            Some("deepseek-flash"),
+            "model should stay deepseek-flash across retries"
         );
     }
 
     /// 场景 5:flash + Simple + max_attempts=2 + cost_limit=0.0005,
-    /// attempt 1 后 accumulated($0.001) > cost_limit($0.0005) → 成本门禁拒绝升级 → fail
+    /// attempt 1 后 accumulated($0.001) > cost_limit($0.0005) → 成本门禁拒绝重试 → fail
     #[test]
-    fn dispatch_subagent_scenario5_cost_limit_blocks_upgrade() {
+    fn dispatch_subagent_scenario5_cost_limit_blocks_retry() {
         let _guard = acquire_lane_event_lock();
         let _ = crate::lane_events::drain_lane_events();
         let unique_task = "scenario5-cost-limit-uuid-p0-9-s5";
 
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
-        // gate 脚本:第一次 retryable Err(触发升级检查)
+        // gate 脚本:第一次 retryable Err(触发重试与成本门禁)
         coordinator.add_validation_gate(Box::new(ScriptedGate::new(vec![
-            Some(false), // attempt 1: retryable Err → 触发升级 + 成本门禁
+            Some(false), // attempt 1: retryable Err → 触发成本门禁
         ])));
 
         let mut runtime = runtime_with_coordinator(coordinator.clone());
         let tempdir = tempfile::tempdir().expect("temp workspace");
         runtime.set_workspace_root(tempdir.path().to_path_buf());
 
-        // cost_limit=0.0005:flash 调用 $0.001 后 accumulated=0.001 > 0.0005 → 拒绝升级
+        // cost_limit=0.0005:flash 调用 $0.001 后 accumulated=0.001 > 0.0005 → 拒绝重试
         let input = serde_json::json!({
             "name": "diag-agent",
             "task": unique_task,
             "mode": "fork",
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-flash",
             "complexity": "simple",
             "max_attempts": 2,
             "cost_limit": 0.0005
@@ -19999,7 +19946,7 @@ mod tests {
             .execute_dispatch_subagent(&input)
             .expect("dispatch should not propagate as hard error");
 
-        // 场景 5:成本超限 → fail(不浪费 pro 调用)
+        // 场景 5:成本超限 → fail(不浪费第二次调用)
         assert!(
             output.contains("Subagent `") && output.contains("failed"),
             "scenario 5 should fail due to cost limit: {output}"
@@ -20020,11 +19967,11 @@ mod tests {
             crate::multi_agent::SubagentStatus::Failed,
             "should be Failed due to cost limit"
         );
-        // 关键不变量:模型未升级(仍是 flash),因为没有调用 pro
+        // 关键不变量:模型未改变(仍是 flash),因为成本门禁阻止了重试
         assert_eq!(
             agent.model.as_deref(),
-            Some("deepseek-v4-flash"),
-            "model should NOT be upgraded — cost gate blocked pro call"
+            Some("deepseek-flash"),
+            "model should stay deepseek-flash — cost gate blocked the retry"
         );
         // 累计成本应只有 flash 的 $0.001(名义值)
         assert!(
@@ -20034,32 +19981,31 @@ mod tests {
         );
     }
 
-    /// 场景 5 补充:cost_limit 足够大 → 升级 pro → 重试成功
+    /// 场景 5 补充:cost_limit 足够大 → 同模型重试 → 成功
     ///
-    /// 自动路由已启用(2026-08-13 Pro 0813),成本上限足够时 flash 升级到 pro,
-    /// 第二次 validate 通过 → completed。
+    /// Pro 已下线:成本上限足够时保持 flash 重试,第二次 validate 通过 → completed。
     #[test]
-    fn dispatch_subagent_scenario5_high_cost_limit_upgrades_to_pro() {
+    fn dispatch_subagent_scenario5_high_cost_limit_retries_same_model() {
         let _guard = acquire_lane_event_lock();
         let _ = crate::lane_events::drain_lane_events();
-        let unique_task = "scenario5-high-limit-upgrade-uuid-p0-9-s5b";
+        let unique_task = "scenario5-high-limit-retry-uuid-p0-9-s5b";
 
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
         coordinator.add_validation_gate(Box::new(ScriptedGate::new(vec![
-            Some(false), // attempt 1: retryable Err → 升级 pro
-            Some(true),  // attempt 2: validate 通过(pro)
+            Some(false), // attempt 1: retryable Err → 同模型重试
+            Some(true),  // attempt 2: validate 通过
         ])));
 
         let mut runtime = runtime_with_coordinator(coordinator.clone());
         let tempdir = tempfile::tempdir().expect("temp workspace");
         runtime.set_workspace_root(tempdir.path().to_path_buf());
 
-        // cost_limit=10.0:足够大,允许升级到 pro
+        // cost_limit=10.0:足够大,允许重试
         let input = serde_json::json!({
             "name": "diag-agent",
             "task": unique_task,
             "mode": "fork",
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-flash",
             "complexity": "simple",
             "max_attempts": 2,
             "cost_limit": 10.0
@@ -20070,10 +20016,10 @@ mod tests {
             .execute_dispatch_subagent(&input)
             .expect("dispatch should not propagate as hard error");
 
-        // 成本上限足够:升级 pro 后重试成功
+        // 成本上限足够:同模型重试成功
         assert!(
             output.contains("Subagent `") && output.contains("completed"),
-            "should complete after upgrade with high cost_limit: {output}"
+            "should complete after same-model retry with high cost_limit: {output}"
         );
 
         let subagent_id = output
@@ -20082,11 +20028,11 @@ mod tests {
             .and_then(|s| s.split('`').next())
             .expect("extract subagent_id");
         let agent = coordinator.get(subagent_id).expect("agent exists");
-        // 模型已升级到 pro
+        // 模型始终为 flash
         assert_eq!(
             agent.model.as_deref(),
-            Some("deepseek-v4-pro"),
-            "model should be upgraded to pro when cost_limit allows"
+            Some("deepseek-flash"),
+            "model should stay deepseek-flash when cost_limit allows retry"
         );
         assert!(agent.validated, "should be validated");
         assert_eq!(

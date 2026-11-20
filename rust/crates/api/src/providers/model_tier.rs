@@ -1,7 +1,7 @@
 //! 模型能力分级 — 用于 subagent 任务路由。
 //! 基于 ProviderCapabilityReport 但聚焦"任务可执行性"而非协议细节。
 //!
-//! 范围：deepseek-v4-pro/flash 双模型路由。
+//! 单模型：仅 deepseek-flash。Pro 已下线，不再参与路由或升级。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,37 +35,27 @@ pub enum TaskComplexity {
 
 impl TaskComplexity {
     /// 返回此复杂度所需的最低 ModelTier。
+    /// Pro 已下线，flash 单模型承担全部复杂度，因此统一要求 Budget。
     #[must_use]
     pub const fn min_tier(self) -> ModelTier {
         match self {
-            Self::Simple => ModelTier::Budget,
-            Self::Diagnostic => ModelTier::Flagship,
-            Self::Architectural => ModelTier::Flagship,
+            Self::Simple | Self::Diagnostic | Self::Architectural => ModelTier::Budget,
         }
     }
 }
 
 /// 按模型名推断能力层级。
 ///
-/// 识别规则（DeepSeek 系列）：
-/// - Flagship: *-pro（deepseek-v4-pro）
-/// - Budget: *-flash（deepseek-v4-flash）
-/// - Standard: 默认（deepseek-chat / deepseek-reasoner 等）
+/// Pro 已下线，历史 Pro ID 会先归一化到 flash，因此只返回 Budget/Standard。
 #[must_use]
 pub fn tier_for_model(model: &str) -> ModelTier {
-    let lower = model.to_ascii_lowercase();
+    let canonical = super::resolve_model_alias(model);
+    let lower = canonical.to_ascii_lowercase();
 
-    // 旗舰：*-pro
-    if lower.ends_with("-pro") {
-        return ModelTier::Flagship;
-    }
-
-    // 轻量：*-flash
     if lower.contains("flash") {
         return ModelTier::Budget;
     }
 
-    // 默认标准
     ModelTier::Standard
 }
 
@@ -96,24 +86,16 @@ impl UpgradeEntry {
 
 /// 内置升级表（配置文件不存在时使用）。
 ///
-/// 2026-07-31 V4-Flash 正式版上线时曾因 Flash 能力超越 Pro 预览版而关闭升级链;
-/// 2026-08-13 DeepSeek V4-Pro 0813 正式版上线,能力大幅提升,
-/// 恢复自动路由升级链(简单任务用 flash,失败/复杂任务升级到 pro)。
-///
-/// cost_multiplier=3.0:按 2026-07 官方定价精确计算
-///   flash ¥1/M in + ¥2/M out;pro ¥3/M in + ¥6/M out(恰好 3 倍)。
-///
-/// 配置文件 `~/.claw/model-upgrades.json` 存在时优先,可自行覆盖。
+/// Pro 已下线：升级链已彻底关闭，flash 不再升级到任何模型。
+/// 配置文件 `~/.claw/model-upgrades.json` 仍可加载，但指向 Pro 的条目会被过滤。
 fn default_upgrades() -> HashMap<String, UpgradeEntry> {
-    let mut map = HashMap::new();
+    HashMap::new()
+}
 
-    // DeepSeek 自动路由链:flash → pro(成本门禁用)
-    map.insert(
-        "deepseek-v4-flash".to_string(),
-        UpgradeEntry::new("deepseek-v4-pro", 3.0),
-    );
-
-    map
+/// 判断目标模型是否为已下线的 Pro。
+fn is_retired_pro_model(model: &str) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    lower == "pro" || lower.ends_with("-pro") || lower.ends_with("/pro")
 }
 
 /// 加载升级表（配置文件优先，回退到内置默认表）。
@@ -161,6 +143,10 @@ fn load_upgrade_config() -> Option<HashMap<String, UpgradeEntry>> {
             }
             _ => continue,
         };
+        // Pro 已下线：即使配置文件里写了 pro，也不允许成为升级目标。
+        if is_retired_pro_model(&entry.target_model) {
+            continue;
+        }
         map.insert(key, entry);
     }
     Some(map)
@@ -181,7 +167,11 @@ pub fn upgrade_model(model: &str) -> Option<String> {
         .or_else(|| upgrade_map().get(&canonical));
 
     match entry {
-        Some(entry) if entry.target_model != model && entry.target_model != canonical => {
+        Some(entry)
+            if entry.target_model != model
+                && entry.target_model != canonical
+                && !is_retired_pro_model(&entry.target_model) =>
+        {
             Some(entry.target_model.clone())
         }
         _ => None,
@@ -205,12 +195,14 @@ mod tests {
 
     #[test]
     fn tiers_deepseek_models_correctly() {
-        assert_eq!(tier_for_model("deepseek-v4-pro"), ModelTier::Flagship);
+        // Pro 已下线：历史 Pro ID 归一化后按 flash 计
+        assert_eq!(tier_for_model("deepseek-v4-pro"), ModelTier::Budget);
         assert_eq!(tier_for_model("deepseek-v4-flash"), ModelTier::Budget);
+        assert_eq!(tier_for_model("deepseek-flash"), ModelTier::Budget);
         // Prefixed forms
         assert_eq!(
             tier_for_model("deepseek/deepseek-v4-pro"),
-            ModelTier::Flagship
+            ModelTier::Budget
         );
         assert_eq!(
             tier_for_model("deepseek/deepseek-v4-flash"),
@@ -223,27 +215,23 @@ mod tests {
 
     #[test]
     fn task_complexity_min_tiers() {
+        // 单模型：所有复杂度统一由 flash 承担
         assert_eq!(TaskComplexity::Simple.min_tier(), ModelTier::Budget);
-        assert_eq!(TaskComplexity::Diagnostic.min_tier(), ModelTier::Flagship);
-        assert_eq!(
-            TaskComplexity::Architectural.min_tier(),
-            ModelTier::Flagship
-        );
+        assert_eq!(TaskComplexity::Diagnostic.min_tier(), ModelTier::Budget);
+        assert_eq!(TaskComplexity::Architectural.min_tier(), ModelTier::Budget);
     }
 
     #[test]
     fn model_meets_complexity_validates_correctly() {
-        // Flagship tasks
+        // flash 单模型满足全部复杂度
         assert!(model_meets_complexity(
-            "deepseek-v4-pro",
+            "deepseek-flash",
             TaskComplexity::Diagnostic
         ));
-        assert!(!model_meets_complexity(
+        assert!(model_meets_complexity(
             "deepseek-v4-flash",
-            TaskComplexity::Diagnostic
+            TaskComplexity::Architectural
         ));
-
-        // Simple task
         assert!(model_meets_complexity(
             "deepseek-v4-flash",
             TaskComplexity::Simple
@@ -255,10 +243,10 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_deepseek_flash_upgrades_to_pro() {
-        // 2026-08-13 V4-Pro 0813 正式版上线,自动路由升级链已重新启用
-        let upgraded = upgrade_model("deepseek-v4-flash");
-        assert_eq!(upgraded.as_deref(), Some("deepseek-v4-pro"));
+    fn upgrade_flash_returns_none_pro_retired() {
+        // Pro 已下线，升级链彻底关闭
+        assert_eq!(upgrade_model("deepseek-v4-flash"), None);
+        assert_eq!(upgrade_model("deepseek-flash"), None);
     }
 
     #[test]
@@ -275,9 +263,9 @@ mod tests {
 
     #[test]
     fn upgrade_cost_multiplier_deepseek() {
-        // 自动路由已启用:flash → pro,按 2026-07 官方定价 3 倍
-        assert_eq!(upgrade_cost_multiplier("deepseek-v4-flash"), 3.0);
-        // pro 已旗舰,无升级路径,倍数 1.0
+        // 升级链已关闭，任何模型倍数都是 1.0
+        assert_eq!(upgrade_cost_multiplier("deepseek-v4-flash"), 1.0);
+        assert_eq!(upgrade_cost_multiplier("deepseek-flash"), 1.0);
         assert_eq!(upgrade_cost_multiplier("deepseek-v4-pro"), 1.0);
         assert_eq!(upgrade_cost_multiplier("unknown-model"), 1.0);
     }

@@ -952,7 +952,7 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
                             },
                             "model": {
                                 "type": "string",
-                                "description": "Model name for the sub-agent (e.g. 'deepseek-v4-flash', 'deepseek-v4-pro'). Required — capability check uses this to gate Budget vs Flagship tasks."
+                                "description": "Model name for the sub-agent. Single-model deployment: use 'deepseek-flash'. Pro is retired and will be normalized to flash."
                             },
                             "mode": {
                                 "type": "string",

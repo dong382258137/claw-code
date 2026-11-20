@@ -95,7 +95,7 @@ async fn send_message_posts_json_and_parses_response() {
         serde_json::from_str(&request.body).expect("request body should be json");
     assert_eq!(
         body.get("model").and_then(serde_json::Value::as_str),
-        Some("deepseek-v4-pro")
+        Some("deepseek-flash")
     );
     // The OpenAI-compat path always serializes the `stream` boolean (unlike the
     // legacy Anthropic client, which omitted it for non-streaming requests).

@@ -305,11 +305,74 @@ fn session_plan_mode_hint(path: &Path) -> Option<bool> {
     None
 }
 
+fn read_web_plan_sidecar(workspace: &Path, id: &str) -> Option<Value> {
+    std::fs::read_to_string(web_plan_path(workspace, id))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+}
+
+/// 从 `create_plan` 的工具输出里取计划 id。
+///
+/// 输出形如 `create_plan: plan created (id=plan-1750...-abcd, 3 step(s))`，
+/// 幂等分支则是 `an active plan already exists (id=plan-...)`，两处都能命中。
+fn plan_id_from_output(output: &str) -> Option<String> {
+    let start = output.find("(id=")? + 4;
+    let rest = &output[start..];
+    let end = rest.find(|ch: char| ch == ',' || ch == ')' || ch.is_whitespace())?;
+    let id = rest[..end].trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// 从已加载的会话里找最后一次成功 `create_plan` 的计划 id。
+///
+/// `plan_update` 的输出不带 id，`PlanArtifact` 也没有 session 归属字段，
+/// 「create_plan 的返回串」是会话与计划之间唯一的可靠绑定。
+fn plan_id_from_session(session: &runtime::Session) -> Option<String> {
+    for message in session.messages.iter().rev() {
+        for block in message.blocks.iter().rev() {
+            let runtime::ContentBlock::ToolResult {
+                tool_name,
+                output,
+                is_error,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            if tool_name == "create_plan" && !*is_error {
+                if let Some(id) = plan_id_from_output(output) {
+                    return Some(id);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn session_active_plan_id(session_path: &Path) -> Option<String> {
+    let session = runtime::Session::load_from_path(session_path).ok()?;
+    plan_id_from_session(&session)
+}
+
+/// PlanArtifact 文件内容 → Web 端计划对象（步骤状态统一成前端枚举）。
+fn plan_from_artifact(artifact: &Value, id: &str) -> Value {
+    json!({
+        "id": id,
+        "task_summary": artifact["task_summary"].as_str().unwrap_or(""),
+        "steps": plan_steps_from_artifact(artifact),
+    })
+}
+
 /// Web 端看到的计划状态。
 ///
-/// 优先级：`.claw/web-plan/<session>.json`（用户在 Web 端改过）→ 最新的
-/// `.claw/plans/*.json`（CLI 规划器写的 PlanArtifact）→ 空。sidecar 缺失时
-/// 返回的是只读草稿（`source: "artifact"`），用户第一次保存才落盘。
+/// 读路径以 PlanArtifact 为唯一事实源，sidecar 只承载两种东西：
+/// 计划模式开关（enabled/approved）与**尚未确认的草稿**（`draft: true`）。
+/// 这样 agent 用 `create_plan` / `plan_update` 推进的步骤能直接反映到面板，
+/// 用户在 Web 端未保存/未确认的编辑也不会被 agent 的进度覆盖。
+///
+/// 计划 id 的判定顺序：本轮工具刚产生的 hint（create_plan 输出）→ sidecar
+/// 记录的 id → 会话里最后一次 create_plan → 会话创建后最新的 artifact。
+/// 只有最后一条兜底路径需要时间谓词。
 ///
 /// **会话归属（artifact 兜底的时间谓词）**：`PlanArtifact` 不含 session 字段，
 /// 工作区级 `plans/` 目录里的历史计划会被任意新会话读到。若不加约束，新会话
@@ -321,69 +384,145 @@ fn session_plan_mode_hint(path: &Path) -> Option<bool> {
 /// 会话创建时间不可得（文件缺失/损坏）时保持旧行为（不设下界），避免因
 /// 会话文件临时不可读而丢失合法的计划展示。
 fn load_web_plan(workspace: &Path, session_path: &Path, id: &str) -> Value {
-    let sidecar = std::fs::read_to_string(web_plan_path(workspace, id))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-    if let Some(mut value) = sidecar {
-        value["source"] = json!("web");
-        value["session"] = json!(id);
-        return value;
+    load_web_plan_with(workspace, session_path, id, None)
+}
+
+/// [`load_web_plan`] 的带提示版本：`active_hint` 是本轮工具刚确认的计划 id，
+/// 优先级最高（此时会话文件可能还没落盘本轮的工具结果）。
+fn load_web_plan_with(
+    workspace: &Path,
+    session_path: &Path,
+    id: &str,
+    active_hint: Option<&str>,
+) -> Value {
+    let sidecar = read_web_plan_sidecar(workspace, id);
+    let sidecar_plan = sidecar
+        .as_ref()
+        .and_then(|value| value["plan"].as_object().cloned());
+    // 草稿判定：显式 draft 字段优先；旧 sidecar 没有该字段时，把「有计划但
+    // 未确认」视为草稿，避免升级后把编辑中的计划误当成已确认。
+    let draft = sidecar.as_ref().is_some_and(|value| {
+        value["draft"].as_bool().unwrap_or_else(|| {
+            value["plan"].is_object() && !value["approved"].as_bool().unwrap_or(false)
+        })
+    });
+    let enabled = sidecar
+        .as_ref()
+        .and_then(|value| value["enabled"].as_bool())
+        .or_else(|| session_plan_mode_hint(session_path))
+        .unwrap_or(false);
+    let approved = sidecar
+        .as_ref()
+        .and_then(|value| value["approved"].as_bool())
+        .unwrap_or(false);
+    let artifacts = read_plan_artifacts(workspace);
+    let target_id = active_hint.map(str::to_string).or_else(|| {
+        sidecar.as_ref().and_then(|value| {
+            value["plan_id"]
+                .as_str()
+                .or_else(|| value["plan"]["id"].as_str())
+                .map(str::to_string)
+        })
+    });
+    let mut plan = None;
+    let mut plan_updated_ms = 0;
+    if let Some(target_id) = target_id
+        .or_else(|| session_active_plan_id(session_path))
+        .as_deref()
+    {
+        if let Some(found) = artifacts
+            .iter()
+            .find(|item| item["id"].as_str() == Some(target_id))
+        {
+            plan_updated_ms = found["updated_ms"].as_u64().unwrap_or(0);
+            plan = Some(plan_from_artifact(&found["plan"], target_id));
+        } else if let Some(web_plan) = &sidecar_plan {
+            // 只有 sidecar 才有的计划（如 Web 端新建的空壳）：直接用它。
+            plan = Some(Value::Object(web_plan.clone()));
+        }
     }
-    let enabled = session_plan_mode_hint(session_path).unwrap_or(false);
-    let session_started_ms = session_created_ms(session_path);
-    let plan = read_plan_artifacts(workspace)
-        .into_iter()
-        .next()
-        .and_then(|artifacts| {
-            let artifact = &artifacts["plan"];
+    if plan.is_none() {
+        let session_started_ms = session_created_ms(session_path);
+        plan = artifacts.iter().find_map(|item| {
+            let artifact = &item["plan"];
             // 早于会话创建的计划属于别的会话 → 不兜底。
             let artifact_created_ms = artifact["created_at_ms"]
                 .as_u64()
-                .or_else(|| artifacts["updated_ms"].as_u64());
+                .or_else(|| item["updated_ms"].as_u64());
             if let (Some(started), Some(created)) = (session_started_ms, artifact_created_ms) {
                 if created < started {
                     return None;
                 }
             }
+            let plan_id = item["id"].as_str()?;
+            // 兜底路径不看空壳计划：空步骤的 artifact 无法确定归属。
             let steps = plan_steps_from_artifact(artifact);
             if steps.is_empty() {
                 return None;
             }
+            plan_updated_ms = item["updated_ms"].as_u64().unwrap_or(0);
             Some(json!({
-                "id": artifacts["id"],
+                "id": plan_id,
                 "task_summary": artifact["task_summary"].as_str().unwrap_or(""),
                 "steps": steps,
             }))
         });
+    }
+    // 草稿以 sidecar 为准：用户正在编辑的版本不能被打断。
+    if draft {
+        if let Some(web_plan) = &sidecar_plan {
+            plan = Some(Value::Object(web_plan.clone()));
+        }
+    }
+    // revision 统一到毫秒并取两者较大值：sidecar 自增序号与 artifact mtime
+    // 混用时，前端只比较大小，毫秒量级更大的一方自然胜出且单调递增。
+    let revision = sidecar
+        .as_ref()
+        .and_then(|value| value["revision"].as_u64())
+        .unwrap_or(0)
+        .max(plan_updated_ms);
     json!({
         "session": id,
         "enabled": enabled,
-        "approved": false,
-        "revision": 0,
-        "source": "artifact",
+        "approved": approved,
+        "revision": revision,
+        "source": if sidecar.is_some() { "web" } else { "artifact" },
+        "draft": draft,
         "plan": plan,
     })
 }
 
 /// 把 Web 编辑写回同 id 的 PlanArtifact 文件（保留 attempts/verify/risk 等字段）。
-/// 失败只返回 false，不影响 sidecar 的保存。
+/// 文件不存在时按新 artifact 创建：Web 端新建的空壳计划也要能落盘，
+/// 否则它永远不会出现在「计划文件」列表里。失败只返回 false，不影响 sidecar。
 fn merge_plan_artifact(workspace: &Path, plan: &Value) -> bool {
-    let Some(plan_id) = plan["id"].as_str() else {
+    let Some(plan_id) = plan["id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
         return false;
     };
-    if plan_id.starts_with("web-") {
-        return false;
-    }
     let path = workspace
         .join(".claw")
         .join("plans")
         .join(format!("{plan_id}.json"));
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let Ok(mut artifact) = serde_json::from_str::<Value>(&text) else {
-        return false;
-    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut artifact = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| {
+            json!({
+                "id": plan_id,
+                "created_at_ms": now_ms(),
+                "task_summary": "",
+                "steps": [],
+                "phase": "Planning",
+                "replan_count": 0,
+            })
+        });
     artifact["task_summary"] = plan["task_summary"].clone();
     let existing = artifact["steps"].as_array().cloned().unwrap_or_default();
     let steps: Vec<Value> = plan["steps"]
@@ -452,7 +591,8 @@ fn sanitize_plan_steps(steps: &[PlanStepBody]) -> Vec<Value> {
         .collect()
 }
 
-/// 保存 Web 计划：sidecar 必写；plan id 指向真实 artifact 时同时回写文件。
+/// 保存 Web 计划：sidecar 必写；只有「确认」或「新建空壳」才回写/创建 PlanArtifact，
+/// 普通草稿保存在 sidecar 里等用户确认。
 fn save_web_plan(
     workspace: &Path,
     session_path: &Path,
@@ -485,37 +625,64 @@ fn save_web_plan(
                 .as_str()
                 .map(str::to_string)
                 .filter(|value| !value.is_empty())
-        })
-        .or_else(|| {
-            (!steps.as_array().is_some_and(Vec::is_empty)).then(|| format!("web-{}", now_ms()))
         });
     let step_values = steps.as_array().cloned().unwrap_or_default();
-    // 只切计划模式（enabled）且当前没有计划时，不要把空对象落成「计划」。
-    let keep_plan =
-        current_plan.is_object() || body.steps.is_some() || !task_summary.trim().is_empty();
-    let plan = if keep_plan {
-        json!({
-            "id": plan_id,
-            "task_summary": truncate_chars(&task_summary, 500),
-            "steps": step_values,
-        })
-    } else {
-        Value::Null
-    };
     let enabled = body
         .enabled
         .unwrap_or_else(|| current["enabled"].as_bool().unwrap_or(false));
-    // 编辑条目后旧的「已确认」不再成立，必须重新确认；显式 approved 优先。
-    let approved = body
-        .approved
-        .unwrap_or_else(|| current["approved"].as_bool().unwrap_or(false) && body.steps.is_none());
-    let revision = current["revision"].as_u64().unwrap_or(0) + 1;
+    // 只切计划模式、当前又没有任何计划时，不再落一个空对象：
+    // 开启计划模式要先给一个可编辑的空壳，关闭时保持无计划。
+    let bare_toggle =
+        !current_plan.is_object() && body.steps.is_none() && task_summary.trim().is_empty();
+    let plan = if bare_toggle {
+        if enabled {
+            json!({
+                "id": format!("web-{}", now_ms()),
+                "task_summary": "待补充计划",
+                "steps": [],
+            })
+        } else {
+            Value::Null
+        }
+    } else {
+        json!({
+            "id": plan_id.unwrap_or_else(|| format!("web-{}", now_ms())),
+            "task_summary": truncate_chars(
+                if task_summary.trim().is_empty() {
+                    "待补充计划"
+                } else {
+                    &task_summary
+                },
+                500,
+            ),
+            "steps": step_values,
+        })
+    };
+    // 草稿与确认：显式 approved 优先；带步骤的保存一律回到草稿态（要重新确认）。
+    let draft = match body.approved {
+        Some(true) => false,
+        _ if body.steps.is_some() => true,
+        _ => current["draft"].as_bool().unwrap_or(false),
+    };
+    let approved = match body.approved {
+        Some(value) => value,
+        None if body.steps.is_some() => false,
+        None => current["approved"].as_bool().unwrap_or(false),
+    };
+    // revision 用毫秒并保证单调：读路径里还会与 artifact mtime 取最大值。
+    let revision = current["revision"]
+        .as_u64()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .max(now_ms());
     let state = json!({
         "session": id,
         "enabled": enabled,
         "approved": approved,
         "revision": revision,
         "source": "web",
+        "draft": draft,
+        "plan_id": plan["id"].clone(),
         "plan": plan,
     });
     let path = web_plan_path(workspace, id);
@@ -524,8 +691,12 @@ fn save_web_plan(
     }
     atomic_write(&path, &state.to_string())
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    // 只有「确认」或「新建空壳」才落 PlanArtifact；普通草稿保存留在 sidecar，
+    // 避免用未确认的编辑覆盖 agent 已推进的步骤状态。
     if let Some(plan) = state["plan"].as_object() {
-        let _ = merge_plan_artifact(workspace, &Value::Object(plan.clone()));
+        if approved || bare_toggle {
+            let _ = merge_plan_artifact(workspace, &Value::Object(plan.clone()));
+        }
     }
     Ok(state)
 }
@@ -1845,6 +2016,11 @@ impl SessionWorker {
         let activity = Arc::clone(&turn.activity);
         let job = &turn.job;
         let sid = self.session_id.clone();
+        // 计划 id 的会话级提示：先按已落盘的会话恢复（上一轮 create_plan 的结果），
+        // 本轮 create_plan 成功后再覆盖。闭包与 turn 收尾共用同一个槽。
+        let plan_id_hint = Arc::new(Mutex::new(session_active_plan_id(&job.session_path)));
+        let plan_workspace = job.workspace.clone();
+        let plan_session_path = job.session_path.clone();
         let cli = self.cli_for_turn(job)?;
         cli.set_external_abort_signal(signal);
         // S3-M2:注入该会话的子进程登记表（跨轮复用，会话级清理时统一终止）。
@@ -1854,6 +2030,7 @@ impl SessionWorker {
         let emit_sid = sid.clone();
         let gate_scheduler = Arc::clone(&scheduler);
         let gate_generation = turn.generation;
+        let emitter_plan_hint = Arc::clone(&plan_id_hint);
         cli.set_status_emitter(Arc::new(move |event: runtime::StatusEvent| {
             // 本轮已被用户「停止」或看门狗回收：迟到事件（含 bash 取消后
             // 的 tool_result）一律不再进入前端流。
@@ -1899,7 +2076,39 @@ impl SessionWorker {
                     name,
                     output,
                     is_error,
-                } => json!({ "session": emit_sid, "kind": "tool_result", "id": id, "name": name, "output": output, "is_error": is_error }),
+                } => {
+                    // create_plan / plan_update 已经在工具内部把 artifact 落盘：
+                    // 这里立刻推一次计划，长任务不必等 turn 结束才看到步骤推进。
+                    if !is_error && (name == "create_plan" || name == "plan_update") {
+                        if name == "create_plan" {
+                            if let Some(plan_id) = plan_id_from_output(&output) {
+                                let mut slot = emitter_plan_hint
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                *slot = Some(plan_id);
+                            }
+                        }
+                        let hint = emitter_plan_hint
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
+                        sender.emit(
+                            &emit_sid,
+                            json!({ "kind": "plans", "plans": read_plan_artifacts(&plan_workspace) }),
+                        );
+                        let state = load_web_plan_with(
+                            &plan_workspace,
+                            &plan_session_path,
+                            &emit_sid,
+                            hint.as_deref(),
+                        );
+                        // 用户在 Web 端的草稿优先，agent 的进度不能覆盖它。
+                        if !state["draft"].as_bool().unwrap_or(false) {
+                            sender.emit(&emit_sid, json!({ "kind": "plan", "state": state }));
+                        }
+                    }
+                    json!({ "session": emit_sid, "kind": "tool_result", "id": id, "name": name, "output": output, "is_error": is_error })
+                }
                 runtime::StatusEvent::Thinking { text, done, .. } => {
                     json!({ "session": emit_sid, "kind": "thinking", "text": text, "done": done })
                 }
@@ -2061,12 +2270,16 @@ fn spawn_session_worker(state: AppState, session_id: String) {
                 if !turn.finished.swap(true, Ordering::SeqCst) {
                     // turn 结束是计划文件/任务工具唯一可靠的落盘点：先推一次
                     // 快照，前端无需在 done 后再轮询任务面板。
-                    if let Ok(snapshot) = tasks_snapshot(&turn.job.session_path, &worker_session)
-                    {
+                    if let Ok(snapshot) = tasks_snapshot(
+                        &turn.job.workspace,
+                        &turn.job.session_path,
+                        &worker_session,
+                    ) {
                         task_state
                             .events
                             .emit(&worker_session, json!({ "kind": "tasks", "tasks": snapshot }));
                     }
+                    // 此时会话已落盘，计划 id 可从 create_plan 的返回串恢复。
                     let plan_state = load_web_plan(
                         &turn.job.workspace,
                         &turn.job.session_path,
@@ -3883,7 +4096,7 @@ async fn api_todos_set(
     }
 }
 
-/// 计划快照：sidecar 优先，缺失时回落到最新的 PlanArtifact 草稿。
+/// 计划快照：以 PlanArtifact 为事实源，sidecar 只提供计划模式开关与未确认草稿。
 async fn api_plan_get(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
@@ -3917,6 +4130,11 @@ async fn api_plan_set(
             state
                 .events
                 .emit(&id, json!({ "kind": "plan", "state": saved.clone() }));
+            // 确认/新建会写 PlanArtifact，计划文件列表同步刷新。
+            state.events.emit(
+                &id,
+                json!({ "kind": "plans", "plans": read_plan_artifacts(&workspace) }),
+            );
             Json(saved).into_response()
         }
         Err((code, message)) => (code, message).into_response(),
@@ -3954,6 +4172,10 @@ async fn api_plan_confirm(
     state
         .events
         .emit(&id, json!({ "kind": "plan", "state": saved.clone() }));
+    state.events.emit(
+        &id,
+        json!({ "kind": "plans", "plans": read_plan_artifacts(&workspace) }),
+    );
     let text = "计划已确认，请按当前计划继续执行。";
     match enqueue_session_prompt(&state, &id, text, "workspace-write", None) {
         Ok(status) => Json(json!({ "session": id, "plan": saved, "turn": status })).into_response(),
@@ -4007,7 +4229,10 @@ fn enqueue_session_prompt(
 ///
 /// 抽成函数是为了让「turn 结束时主动推一次 SSE」与 `GET /tasks` 用同一份逻辑，
 /// 避免两条路径的字段/截断规则漂移。
-fn tasks_snapshot(path: &Path, id: &str) -> Result<Value, String> {
+///
+/// `active_plan_id` 让前端知道该订阅/展示哪份计划：sidecar 记录优先
+/// （用户在 Web 端新建或编辑过），其次会话里最后一次成功 `create_plan`。
+fn tasks_snapshot(workspace: &Path, path: &Path, id: &str) -> Result<Value, String> {
     let session = runtime::Session::load_from_path(path).map_err(|error| error.to_string())?;
     let mut todos: Option<Vec<Value>> = None;
     let mut tasks: Vec<Value> = Vec::new();
@@ -4048,6 +4273,14 @@ fn tasks_snapshot(path: &Path, id: &str) -> Result<Value, String> {
     Ok(json!({
         "session": id,
         "plan_mode": plan_mode,
+        "active_plan_id": read_web_plan_sidecar(workspace, id)
+            .and_then(|value| {
+                value["plan_id"]
+                    .as_str()
+                    .or_else(|| value["plan"]["id"].as_str())
+                    .map(str::to_string)
+            })
+            .or_else(|| plan_id_from_session(&session)),
         "todos": todos.unwrap_or_default(),
         "tasks": tasks,
         "crons": crons,
@@ -4062,11 +4295,11 @@ async fn api_tasks(
     if !authorize(&state, &auth) {
         return unauthorized();
     }
-    let path = match resolve_session(&state, &id) {
-        Ok((path, _workspace)) => path,
+    let (path, workspace) = match resolve_session(&state, &id) {
+        Ok(found) => found,
         Err((code, message)) => return (code, message).into_response(),
     };
-    match tasks_snapshot(&path, &id) {
+    match tasks_snapshot(&workspace, &path, &id) {
         Ok(snapshot) => Json(snapshot).into_response(),
         Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error).into_response(),
     }
@@ -5850,7 +6083,9 @@ mod tests {
             plan_id: None,
         };
         let saved = save_web_plan(dir.path(), &session_path, id, &body).expect("save plan");
-        assert_eq!(saved["revision"], 1);
+        // revision 统一到毫秒，只要求单调递增。
+        assert!(saved["revision"].as_u64().unwrap() > 0);
+        assert_eq!(saved["draft"], true);
         assert_eq!(saved["approved"], false);
         assert_eq!(saved["plan"]["steps"][0]["status"], "done");
         assert!(saved["plan"]["id"].as_str().unwrap().starts_with("web-"));
@@ -5871,9 +6106,171 @@ mod tests {
         };
         let confirmed = save_web_plan(dir.path(), &session_path, id, &confirm).expect("confirm");
         assert_eq!(confirmed["approved"], true);
-        assert_eq!(confirmed["revision"], 2);
+        assert_eq!(confirmed["draft"], false);
+        assert!(confirmed["revision"].as_u64().unwrap() >= saved["revision"].as_u64().unwrap());
         let prompt = prompt_with_web_context(dir.path(), &session_path, id, "继续");
         assert!(prompt.contains("用户已确认该计划"), "prompt: {prompt}");
+    }
+
+    /// 会话与计划通过 create_plan 的输出绑定：即使工作区里还有更新的 artifact，
+    /// 也应优先展示本会话创建的那份（侧栏任务卡的闭环基础）。
+    #[test]
+    fn plan_id_binds_through_create_plan_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let plans_dir = dir.path().join(".claw").join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let artifact = |summary: &str| {
+            json!({
+                "id": "ignored",
+                "created_at_ms": 3_000u64,
+                "task_summary": summary,
+                "steps": [{ "id": "s1", "description": "步骤", "status": "Pending" }],
+            })
+        };
+        atomic_write(
+            &plans_dir.join("plan-right-1.json"),
+            &artifact("本会话的计划").to_string(),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        atomic_write(
+            &plans_dir.join("plan-newer-1.json"),
+            &artifact("别的会话的新计划").to_string(),
+        )
+        .unwrap();
+
+        let session_path = dir.path().join("s.jsonl");
+        let mut session = runtime::Session::new();
+        session
+            .push_message(runtime::ConversationMessage {
+                role: runtime::MessageRole::Tool,
+                blocks: vec![runtime::ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    tool_name: "create_plan".to_string(),
+                    output: "create_plan: plan created (id=plan-right-1, 1 step(s)).".to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+                created_at_ms: 0,
+            })
+            .unwrap();
+        session.save_to_path(&session_path).unwrap();
+
+        let state = load_web_plan(dir.path(), &session_path, "session-plan-bind");
+        assert_eq!(state["plan"]["id"], "plan-right-1");
+        assert_eq!(state["plan"]["task_summary"], "本会话的计划");
+    }
+
+    /// 打开计划模式但没有计划时创建空壳，并落一份空 artifact（侧栏立刻可编辑）。
+    #[test]
+    fn enabling_plan_mode_creates_editable_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_path = dir.path().join("s.jsonl");
+        std::fs::write(&session_path, "").unwrap();
+        let id = "session-shell-0";
+        let saved = save_web_plan(
+            dir.path(),
+            &session_path,
+            id,
+            &PlanUpdateBody {
+                enabled: Some(true),
+                ..PlanUpdateBody::default()
+            },
+        )
+        .expect("toggle");
+        let plan_id = saved["plan"]["id"].as_str().expect("shell id");
+        assert_eq!(saved["plan"]["steps"], json!([]));
+        assert_eq!(saved["plan"]["task_summary"], "待补充计划");
+        assert_eq!(saved["enabled"], true);
+        assert!(
+            dir.path()
+                .join(".claw")
+                .join("plans")
+                .join(format!("{plan_id}.json"))
+                .exists(),
+            "空壳计划也要落 artifact"
+        );
+        // 重新读取（模拟刷新）：id 与空壳保持一致。
+        let reloaded = load_web_plan(dir.path(), &session_path, id);
+        assert_eq!(reloaded["plan"]["id"], plan_id);
+    }
+
+    /// 草稿保存不覆盖 agent 已推进的 artifact；确认后才合并。
+    #[test]
+    fn draft_save_does_not_touch_artifact_until_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let plans_dir = dir.path().join(".claw").join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let artifact_path = plans_dir.join("plan-live-1.json");
+        atomic_write(
+            &artifact_path,
+            &json!({
+                "id": "plan-live-1",
+                "created_at_ms": 3_000u64,
+                "task_summary": "本会话计划",
+                "steps": [{
+                    "id": "s1",
+                    "description": "实现",
+                    "acceptance_criteria": "通过",
+                    "status": "Succeeded"
+                }],
+                "phase": "Executing",
+                "replan_count": 0,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let session_path = dir.path().join("s.jsonl");
+        let mut session = runtime::Session::new();
+        session
+            .push_message(runtime::ConversationMessage {
+                role: runtime::MessageRole::Tool,
+                blocks: vec![runtime::ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    tool_name: "create_plan".to_string(),
+                    output: "create_plan: plan created (id=plan-live-1, 1 step(s)).".to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+                created_at_ms: 0,
+            })
+            .unwrap();
+        session.save_to_path(&session_path).unwrap();
+        let id = "session-draft-0";
+
+        let body = PlanUpdateBody {
+            steps: Some(vec![PlanStepBody {
+                id: Some("s1".to_string()),
+                description: "实现（我改过）".to_string(),
+                acceptance_criteria: "通过".to_string(),
+                status: Some("pending".to_string()),
+            }]),
+            ..PlanUpdateBody::default()
+        };
+        let saved = save_web_plan(dir.path(), &session_path, id, &body).expect("draft save");
+        assert_eq!(saved["draft"], true);
+        assert_eq!(saved["plan"]["id"], "plan-live-1");
+        let artifact: Value =
+            serde_json::from_str(&std::fs::read_to_string(&artifact_path).unwrap()).unwrap();
+        assert_eq!(
+            artifact["steps"][0]["status"], "Succeeded",
+            "草稿不得覆盖 agent 进度"
+        );
+
+        save_web_plan(
+            dir.path(),
+            &session_path,
+            id,
+            &PlanUpdateBody {
+                approved: Some(true),
+                ..PlanUpdateBody::default()
+            },
+        )
+        .expect("confirm");
+        let artifact: Value =
+            serde_json::from_str(&std::fs::read_to_string(&artifact_path).unwrap()).unwrap();
+        assert_eq!(artifact["steps"][0]["status"], "Pending");
+        assert_eq!(artifact["task_summary"], "本会话计划");
     }
 
     /// 新会话不得继承「早于它创建」的 PlanArtifact。

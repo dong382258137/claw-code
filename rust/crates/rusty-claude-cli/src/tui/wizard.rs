@@ -46,9 +46,9 @@ const KNOWN_PROVIDERS: &[ProviderInfo] = &[ProviderInfo {
     label: "DeepSeek",
     env_key: "DEEPSEEK_API_KEY",
     slug: "deepseek",
-    default_model: "deepseek-v4-pro",
+    default_model: "deepseek-flash",
     base_url_env: "DEEPSEEK_BASE_URL",
-    description: "DeepSeek V4 Pro, V4 Flash, Chat, Reasoner",
+    description: "DeepSeek V4.1 Flash (single model)",
 }];
 
 /// Result of scanning environment variables for pre-existing keys.

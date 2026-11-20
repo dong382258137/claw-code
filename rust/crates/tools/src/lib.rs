@@ -5,11 +5,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, model_family_identity_for, model_meets_complexity, resolve_model_alias,
-    tier_for_model, upgrade_model, ApiError, CacheControl, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
-    StreamEvent as ApiStreamEvent, SystemBlock, SystemContent, TaskComplexity, ToolChoice,
-    ToolDefinition, ToolResultContentBlock,
+    max_tokens_for_model, model_family_identity_for, resolve_model_alias, ApiError, CacheControl,
+    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, SystemBlock, SystemContent,
+    ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
@@ -4979,7 +4978,7 @@ struct AgentInput {
     prompt: String,
     subagent_type: Option<String>,
     name: Option<String>,
-    /// Override the model used by the subagent (e.g. "deepseek-v4-flash").
+    /// Override the model used by the subagent (e.g. "deepseek-flash").
     model: Option<String>,
     /// Task complexity hint for model-tier validation.
     /// Accepted values: "simple", "diagnostic", "architectural".
@@ -6889,7 +6888,7 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-const DEFAULT_AGENT_MODEL: &str = "deepseek-v4-pro";
+const DEFAULT_AGENT_MODEL: &str = "deepseek-flash";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
@@ -6920,31 +6919,16 @@ where
     let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
     let model = resolve_agent_model(input.model.as_deref());
 
-    // P1: 模型能力分级 — 根据任务复杂度验证模型是否胜任。
-    // 如果 LLM 声明了任务复杂度但指定了不匹配的模型,自动拒绝并建议升级。
+    // 单模型架构:Pro 已下线,所有任务统一使用 deepseek-flash。
+    // complexity 仅作为任务意图元数据记录,不再触发模型升级/拒绝。
     if let Some(complexity_str) = input.complexity.as_deref() {
-        let complexity = match complexity_str.trim().to_ascii_lowercase().as_str() {
-            "simple" => TaskComplexity::Simple,
-            "diagnostic" => TaskComplexity::Diagnostic,
-            "architectural" => TaskComplexity::Architectural,
+        match complexity_str.trim().to_ascii_lowercase().as_str() {
+            "simple" | "diagnostic" | "architectural" => {}
             other => {
                 return Err(format!(
                     "invalid complexity '{other}': expected simple/diagnostic/architectural"
                 ));
             }
-        };
-        if !model_meets_complexity(&model, complexity) {
-            // If the model doesn't meet complexity requirements, suggest an upgrade.
-            if let Some(upgraded) = upgrade_model(&model) {
-                return Err(format!(
-                    "Model {model} ({:?} tier) does not meet {complexity_str} task complexity. Auto-upgrade to: {upgraded} ({:?} tier).",
-                    tier_for_model(&model),
-                    tier_for_model(&upgraded)
-                ));
-            }
-            return Err(format!(
-                "Model {model} does not meet {complexity_str} task complexity. Consider using a Flagship-tier model."
-            ));
         }
     }
     let agent_name = input
@@ -13390,7 +13374,7 @@ mod tests {
                 prompt: "Do the work".to_string(),
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
-                model: Some("deepseek-v4-pro".to_string()),
+                model: Some("deepseek-flash".to_string()),
                 complexity: None,
             },
             &TurnEnv::for_current_dir(),
@@ -15252,7 +15236,7 @@ printf 'pwsh:%s' "$1"
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
-            "deepseek-v4-pro".to_string(),
+            "deepseek-flash".to_string(),
             BTreeSet::new(),
             &fallback_config,
         )
@@ -15260,7 +15244,7 @@ printf 'pwsh:%s' "$1"
 
         // then
         assert_eq!(client.chain.len(), 1);
-        assert_eq!(client.chain[0].model, "deepseek-v4-pro");
+        assert_eq!(client.chain[0].model, "deepseek-flash");
 
         match original_deepseek {
             Some(value) => std::env::set_var("DEEPSEEK_API_KEY", value),
@@ -15278,12 +15262,12 @@ printf 'pwsh:%s' "$1"
         std::env::set_var("DEEPSEEK_API_KEY", "deepseek-test-key");
         let fallback_config = ProviderFallbackConfig::new(
             None,
-            vec!["deepseek-v4-flash".to_string(), "deepseek-chat".to_string()],
+            vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
         );
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
-            "deepseek-v4-pro".to_string(),
+            "deepseek-flash".to_string(),
             BTreeSet::new(),
             &fallback_config,
         )
@@ -15291,9 +15275,9 @@ printf 'pwsh:%s' "$1"
 
         // then
         assert_eq!(client.chain.len(), 3);
-        assert_eq!(client.chain[0].model, "deepseek-v4-pro");
-        assert_eq!(client.chain[1].model, "deepseek-v4-flash");
-        assert_eq!(client.chain[2].model, "deepseek-chat");
+        assert_eq!(client.chain[0].model, "deepseek-flash");
+        assert_eq!(client.chain[1].model, "deepseek-chat");
+        assert_eq!(client.chain[2].model, "deepseek-reasoner");
 
         match original_deepseek {
             Some(value) => std::env::set_var("DEEPSEEK_API_KEY", value),
@@ -15310,8 +15294,8 @@ printf 'pwsh:%s' "$1"
         let original_deepseek = std::env::var_os("DEEPSEEK_API_KEY");
         std::env::set_var("DEEPSEEK_API_KEY", "deepseek-test-key");
         let fallback_config = ProviderFallbackConfig::new(
-            Some("deepseek-v4-pro".to_string()),
-            vec!["deepseek-v4-flash".to_string()],
+            Some("deepseek-flash".to_string()),
+            vec!["deepseek-chat".to_string()],
         );
 
         // when
@@ -15324,8 +15308,8 @@ printf 'pwsh:%s' "$1"
 
         // then
         assert_eq!(client.chain.len(), 2);
-        assert_eq!(client.chain[0].model, "deepseek-v4-pro");
-        assert_eq!(client.chain[1].model, "deepseek-v4-flash");
+        assert_eq!(client.chain[0].model, "deepseek-flash");
+        assert_eq!(client.chain[1].model, "deepseek-chat");
 
         match original_deepseek {
             Some(value) => std::env::set_var("DEEPSEEK_API_KEY", value),
@@ -15344,12 +15328,12 @@ printf 'pwsh:%s' "$1"
         std::env::remove_var("DEEPSEEK_API_KEY");
         let fallback_config = ProviderFallbackConfig::new(
             None,
-            vec!["deepseek-v4-flash".to_string(), "deepseek-chat".to_string()],
+            vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
         );
 
         // when
         let result = ProviderRuntimeClient::new_with_fallback_config(
-            "deepseek-v4-pro".to_string(),
+            "deepseek-flash".to_string(),
             BTreeSet::new(),
             &fallback_config,
         );

@@ -606,8 +606,8 @@ impl ApiClient for AnthropicRuntimeClient {
 
     /// Multi-Agent Hardening §4.5.3:构造一个绑定到指定模型的子 agent client。
     ///
-    /// 用于 `execute_dispatch_subagent` retry loop 中的模型升级路径:
-    /// - `deepseek-v4-flash` 失败 → `with_model("deepseek-v4-pro")` → 重试
+    /// 单模型架构:所有子 agent 均使用 `deepseek-flash`;失败重试保持同模型,
+    /// 不再存在升级到 Pro 的路径。
     ///
     /// 子 agent client 配置:
     /// - `enable_tools = false`:子 agent 走单轮 LLM 请求,不调用工具

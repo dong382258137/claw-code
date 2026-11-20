@@ -4111,7 +4111,7 @@ fn build_api_client(
     // 49 个被用过。即固定前缀里约 42% 的体积对应零使用工具。
     //
     // 原实现仅对 `trae/` 前缀模型开启,但实跑模型经 alias 解析后是
-    // `deepseek-v4-flash`(见 prompt-cache dumps 的 model 字段),该门恒不成立
+    // `deepseek-flash`(见 prompt-cache dumps 的 model 字段),该门恒不成立
     // ⇒ 渐进式加载对当前 provider 从未生效,85 个工具全额注入。
     //
     // 改为:**默认对主会话开启**,`RUSTY_CLAUDE_PROGRESSIVE_TOOLS=0` 显式关闭。
@@ -4131,15 +4131,8 @@ fn build_api_client(
     Ok(Box::new(client))
 }
 
-/// 解析「质量敏感」辅助 LLM 子件应使用的模型。
-///
-/// 2026-10-11 起改为直接使用主模型(不升级到 pro):
-/// 实测 pro 相对 flash 能力不占优且成本约 10 倍,而 judge / harness
-/// proposer / decision extractor / research / planner 均为有降级兜底的
-/// 辅助性子件,flash 质量已足够(与 CompactionSummarizer / FreshnessAssessor
-/// 的取舍一致)。保留功能、成本降到最低。
-///
-/// 恢复 pro:改回 `api::upgrade_model(main_model).unwrap_or_else(|| main_model.to_string())`
+/// 单模型架构(2026-11):Pro 已下线,辅助子件永远使用主模型(deepseek-flash),
+/// 不存在任何升级到 Pro 的路径。
 #[must_use]
 fn resolve_quality_model(main_model: &str) -> String {
     main_model.to_string()
@@ -4567,12 +4560,12 @@ pub(crate) fn build_runtime_with_plugin_state(
 
     // Phase 1 记忆闭环：注册记忆提取器（flash + 512 tokens，纯增量成本）。
     // 未注册时 worker 直接跳过提取（静默），不影响主流程。
-    match crate::llm_clients::DeepSeekMemoryExtractorClient::new("deepseek-v4-flash", Some(512)) {
+    match crate::llm_clients::DeepSeekMemoryExtractorClient::new("deepseek-flash", Some(512)) {
         Ok(extractor) => {
             let extractor: std::sync::Arc<dyn runtime::memory_extract::MemoryExtractorClient> =
                 std::sync::Arc::new(extractor);
             runtime::memory_extract::set_global_memory_extractor_client(extractor);
-            eprintln!("[startup] LLM memory extractor registered (model: deepseek-v4-flash)");
+            eprintln!("[startup] LLM memory extractor registered (model: deepseek-flash)");
         }
         Err(e) => {
             eprintln!("[startup] MemoryExtractorClient skipped (construction failed): {e}");

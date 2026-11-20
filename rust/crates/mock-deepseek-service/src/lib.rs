@@ -20,7 +20,7 @@ use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 
 pub const SCENARIO_PREFIX: &str = "PARITY_SCENARIO:";
-pub const DEFAULT_MODEL: &str = "deepseek-v4-pro";
+pub const DEFAULT_MODEL: &str = "deepseek-flash";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedRequest {

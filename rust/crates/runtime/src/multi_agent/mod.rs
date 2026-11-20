@@ -59,9 +59,9 @@ use tokio::task::JoinHandle;
 pub enum TaskComplexity {
     /// 简单任务:单文件编辑、已知模式 — Budget 模型可胜任。
     Simple,
-    /// 诊断任务:根因定位、复杂调试 — 需要强推理能力,Flagship 模型。
+    /// 诊断任务:根因定位、复杂调试 — 单模型架构下统一由 flash 承担。
     Diagnostic,
-    /// 架构决策:多方案评估、trade-off 分析 — Flagship 模型。
+    /// 架构决策:多方案评估、trade-off 分析 — 单模型架构下统一由 flash 承担。
     Architectural,
 }
 
@@ -501,12 +501,12 @@ impl MultiAgentCoordinator {
     /// - `name`: 子 agent 名称
     /// - `task`: 任务描述
     /// - `mode`: 编排模式
-    /// - `model`: 模型名(如 "deepseek-v4-flash")
+    /// - `model`: 模型名(如 "deepseek-flash")
     /// - `complexity`: 任务复杂度(Simple/Diagnostic/Architectural)
     ///
     /// # 返回
     /// - `Ok(id)`: 子 agent 创建成功
-    /// - `Err(msg)`: 能力校验失败(如 Budget 模型执行 Diagnostic 任务)
+    /// - `Err(msg)`: 创建失败
     pub fn spawn_with_model(
         &self,
         name: impl Into<String>,
@@ -519,24 +519,8 @@ impl MultiAgentCoordinator {
         let name = name.into();
         let task = task.into();
 
-        // §4.2:能力校验 — Diagnostic/Architectural 任务拒绝 Budget 模型
-        // 注意:这里只做粗粒度前缀检查,不依赖 api crate(避免循环依赖)。
-        // 完整的 tier_for_model 校验在 conversation.rs 调用方执行(那里能访问 api)。
-        let lower = model.to_ascii_lowercase();
-        let is_budget = lower.contains("haiku")
-            || lower.contains("mini")
-            || lower.contains("nano")
-            || lower.contains("flash");
-        if is_budget
-            && matches!(
-                complexity,
-                TaskComplexity::Diagnostic | TaskComplexity::Architectural
-            )
-        {
-            return Err(format!(
-                "model '{model}' (Budget tier) cannot handle {complexity:?} task — use Flagship model"
-            ));
-        }
+        // Pro 已下线:单模型架构不再按复杂度拒绝 Budget 模型。
+        // complexity 仅作为任务意图元数据保留,所有任务统一使用 flash。
 
         // 复用 spawn 创建基础 subagent,然后填充 v3 扩展字段
         let id = self.spawn(name, task, mode);
@@ -544,8 +528,8 @@ impl MultiAgentCoordinator {
         if let Some(agent) = agents.get_mut(&id) {
             agent.model = Some(model);
             agent.complexity = complexity;
-            // Diagnostic/Architectural 任务默认允许 1 次重试(升级到 Flagship)
-            // max_attempts=2 意味着"最多 2 次尝试"(1 次原始 + 1 次升级重试)
+            // Diagnostic/Architectural 任务默认允许 1 次重试(同模型)。
+            // max_attempts=2 意味着"最多 2 次尝试"(1 次原始 + 1 次重试)。
             if matches!(
                 complexity,
                 TaskComplexity::Diagnostic | TaskComplexity::Architectural
@@ -1430,71 +1414,12 @@ pub struct ModelUpgrade {
     pub cost_multiplier: f64,
 }
 
-/// 模型升级路径查询 — Multi-Agent Hardening §4.5 retry loop 调用。
+/// 模型升级路径查询 — Pro 已下线,升级链彻底关闭。
 ///
-/// DeepSeek 自动路由链:`deepseek-v4-flash → deepseek-v4-pro`
-///
-/// 2026-08-13 V4-Pro 0813 正式版上线,能力大幅提升,自动路由升级链已重新启用。
-///
-/// 完整的 `upgrade_map` 配置化在 `api::providers::model_tier`(运行时可访问),
-/// 本函数仅作为 runtime 内部的最小可用回退,避免循环依赖。
-/// 配置文件 `~/.claw/model-upgrades.json` 存在时由 api crate 优先读取。
-///
-/// # 返回
-/// - `Some(ModelUpgrade)`:存在升级路径
-/// - `None`:模型已是最高层级 / 无升级路径
-///
-/// # 升级表
-/// | 当前模型 | 目标模型 | cost_multiplier | 链 |
-/// |---|---|---|---|
-/// | deepseek-v4-flash | deepseek-v4-pro | 3.0 | DeepSeek |
+/// 单模型架构:所有子智能体统一使用 `deepseek-flash`,失败重试时保持同模型,
+/// 不再升级到 Pro。保留本函数签名供调用方兼容,恒返回 `None`。
 #[must_use]
-pub fn upgrade_model_for_subagent(current_model: &str) -> Option<ModelUpgrade> {
-    let lower = current_model.to_ascii_lowercase();
-
-    // 已是旗舰:不再升级
-    // 覆盖所有 Flagship 模式(与 api::model_tier::tier_for_model 保持一致):
-    // - `*-pro` 后缀(deepseek-v4-pro 等)
-    if is_flagship_model(&lower) {
-        return None;
-    }
-
-    // DeepSeek 升级链
-    upgrade_lookup(&lower)
-}
-
-/// 判断模型是否为 Flagship 层级(与 `api::providers::model_tier::tier_for_model` 保持一致)。
-///
-/// runtime crate 不能依赖 api crate,因此本地复制判断逻辑。
-/// 若 api crate 的 `tier_for_model` 修改,本函数需同步更新。
-fn is_flagship_model(lower: &str) -> bool {
-    // 旗舰:*-pro 后缀(DeepSeek 系列旗舰)
-    lower.ends_with("-pro")
-}
-
-/// 升级表查询 — DeepSeek 系列升级路径。
-///
-/// 2026-08-13 V4-Pro 0813 正式版上线,能力大幅提升,自动路由升级链已重新启用。
-///
-/// 返回 `Some(ModelUpgrade)` 若命中升级路径,`None` 若无升级路径或已是旗舰。
-fn upgrade_lookup(lower: &str) -> Option<ModelUpgrade> {
-    // DeepSeek 自动路由链:flash → pro
-    if lower.contains("deepseek") && lower.contains("flash") {
-        return Some(ModelUpgrade {
-            target_model: "deepseek-v4-pro".to_string(),
-            cost_multiplier: 3.0,
-        });
-    }
-    // 通用 flash → pro 升级(兜底:其他含 flash 的模型替换为 pro)
-    if lower.contains("flash") {
-        let target = lower.replace("flash", "pro");
-        return Some(ModelUpgrade {
-            target_model: target,
-            cost_multiplier: 3.0,
-        });
-    }
-
-    // 无升级路径
+pub fn upgrade_model_for_subagent(_current_model: &str) -> Option<ModelUpgrade> {
     None
 }
 
@@ -1678,56 +1603,61 @@ mod tests {
     // ===== Multi-Agent Hardening P0 步骤 9 端到端 MVP 验证 =====
     // 依据 docs/multi-agent-hardening-plan.md §10.4 验收标准
 
-    /// §10.4 spawn_with_model:Budget 模型拒绝 Diagnostic 任务
+    /// §10.4 spawn_with_model:单模型架构接受 flash 执行 Diagnostic 任务
     #[test]
-    fn spawn_with_model_rejects_budget_for_diagnostic() {
-        let coord = MultiAgentCoordinator::new();
-        let err = coord
-            .spawn_with_model(
-                "diag-agent",
-                "root cause analysis",
-                CoordinationMode::Fork,
-                "deepseek-v4-flash",
-                TaskComplexity::Diagnostic,
-            )
-            .expect_err("flash should reject Diagnostic");
-        assert!(
-            err.contains("Budget tier") && err.contains("Diagnostic"),
-            "expected Budget rejection msg, got: {err}"
-        );
-    }
-
-    /// §10.4 spawn_with_model:Budget 模型拒绝 Architectural 任务
-    #[test]
-    fn spawn_with_model_rejects_budget_for_architectural() {
-        let coord = MultiAgentCoordinator::new();
-        let err = coord
-            .spawn_with_model(
-                "arch-agent",
-                "design review",
-                CoordinationMode::Fork,
-                "claude-haiku-4-5",
-                TaskComplexity::Architectural,
-            )
-            .expect_err("haiku should reject Architectural");
-        assert!(err.contains("Budget tier"));
-    }
-
-    /// §10.4 spawn_with_model:Flagship 模型接受 Diagnostic 任务,且 max_attempts 默认 2(1 次原始 + 1 次重试)
-    #[test]
-    fn spawn_with_model_accepts_flagship_for_diagnostic() {
+    fn spawn_with_model_accepts_flash_for_diagnostic() {
         let coord = MultiAgentCoordinator::new();
         let id = coord
             .spawn_with_model(
                 "diag-agent",
                 "root cause analysis",
                 CoordinationMode::Fork,
-                "deepseek-v4-pro",
+                "deepseek-flash",
                 TaskComplexity::Diagnostic,
             )
-            .expect("pro should accept Diagnostic");
+            .expect("flash should accept Diagnostic (single-model deployment)");
         let agent = coord.get(&id).expect("agent should exist");
-        assert_eq!(agent.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(agent.model.as_deref(), Some("deepseek-flash"));
+        assert_eq!(agent.complexity, TaskComplexity::Diagnostic);
+        assert_eq!(
+            agent.max_attempts, 2,
+            "Diagnostic 默认 2 次尝试(1 次原始 + 1 次同模型重试)"
+        );
+    }
+
+    /// §10.4 spawn_with_model:单模型架构接受 flash 执行 Architectural 任务
+    #[test]
+    fn spawn_with_model_accepts_flash_for_architectural() {
+        let coord = MultiAgentCoordinator::new();
+        let id = coord
+            .spawn_with_model(
+                "arch-agent",
+                "design review",
+                CoordinationMode::Fork,
+                "deepseek-flash",
+                TaskComplexity::Architectural,
+            )
+            .expect("flash should accept Architectural (single-model deployment)");
+        let agent = coord.get(&id).expect("agent should exist");
+        assert_eq!(agent.complexity, TaskComplexity::Architectural);
+        assert_eq!(agent.max_attempts, 2);
+    }
+
+    /// §10.4 spawn_with_model:Diagnostic 任务 max_attempts 默认 2(1 次原始 + 1 次重试)
+    #[test]
+    fn spawn_with_model_diagnostic_defaults_max_attempts_two() {
+        let coord = MultiAgentCoordinator::new();
+        let id = coord
+            .spawn_with_model(
+                "diag-agent",
+                "root cause analysis",
+                CoordinationMode::Fork,
+                "deepseek-flash",
+                TaskComplexity::Diagnostic,
+            )
+            .expect("flash should accept Diagnostic");
+        let agent = coord.get(&id).expect("agent should exist");
+        assert_eq!(agent.model.as_deref(), Some("deepseek-flash"));
         assert_eq!(agent.complexity, TaskComplexity::Diagnostic);
         assert_eq!(
             agent.max_attempts, 2,
@@ -1823,24 +1753,23 @@ mod tests {
         assert!(results.is_empty(), "empty input should return empty");
     }
 
-    /// §10.3 P1 步骤 7:spawn_parallel 能力校验失败时返回对应 Err
+    /// §10.3 P1 步骤 7:spawn_parallel 在单模型架构下全部任务使用 flash
     #[test]
-    fn spawn_parallel_propagates_capability_errors() {
+    fn spawn_parallel_runs_all_tasks_single_model() {
         let coord = MultiAgentCoordinator::new();
-        // flash + Diagnostic 应失败(Budget 模型不能处理 Diagnostic 任务)
         let tasks = vec![
             SpawnRequest::new(
-                "ok-agent",
+                "simple-agent",
                 "simple task",
                 CoordinationMode::Fork,
-                "deepseek-v4-flash",
+                "deepseek-flash",
                 TaskComplexity::Simple,
             ),
             SpawnRequest::new(
-                "bad-agent",
+                "diag-agent",
                 "diagnostic task",
                 CoordinationMode::Fork,
-                "deepseek-v4-flash",
+                "deepseek-flash",
                 TaskComplexity::Diagnostic,
             ),
         ];
@@ -1849,15 +1778,8 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results[0].is_ok(), "first task should succeed");
         assert!(
-            results[1].is_err(),
-            "second task should fail (Budget + Diagnostic)"
-        );
-
-        // 验证错误消息含能力校验信息
-        let err = results[1].as_ref().unwrap_err();
-        assert!(
-            err.contains("Budget"),
-            "error should mention Budget tier: {err}"
+            results[1].is_ok(),
+            "second task should succeed (flash handles Diagnostic)"
         );
     }
 
@@ -2579,17 +2501,14 @@ mod tests {
         assert!(!agent.validated);
     }
 
-    /// §10.4 upgrade_model_for_subagent:自动路由链已启用(2026-08-13 Pro 0813),
-    /// flash 升级到 pro
+    /// §10.4 upgrade_model_for_subagent:Pro 已下线,flash 不再升级
     #[test]
     fn upgrade_model_for_subagent_flash_upgrades_to_pro() {
-        let upgrade =
-            upgrade_model_for_subagent("deepseek-v4-flash").expect("flash should upgrade to pro");
-        assert_eq!(upgrade.target_model, "deepseek-v4-pro");
-        assert_eq!(upgrade.cost_multiplier, 3.0);
+        assert!(upgrade_model_for_subagent("deepseek-v4-flash").is_none());
+        assert!(upgrade_model_for_subagent("deepseek-flash").is_none());
     }
 
-    /// §10.4 upgrade_model_for_subagent:pro 已顶级,返回 None
+    /// §10.4 upgrade_model_for_subagent:pro 已下线,同样返回 None
     #[test]
     fn upgrade_model_for_subagent_pro_returns_none() {
         assert!(upgrade_model_for_subagent("deepseek-v4-pro").is_none());

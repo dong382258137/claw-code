@@ -20,10 +20,7 @@ export const QUICK_ACTIONS = [
 export const MODEL_PRESETS = [
   { id: '', label: '默认模型', hint: '跟随工作区配置（当前 Trae）' },
   { id: 'trae/deepseek-v4.1-flash', label: 'Trae · DeepSeek-V4.1-Flash', badge: '0.06', hint: 'Trae 内置额度，推荐' },
-  { id: 'deepseek-v4-flash', label: 'DeepSeek-V4-Flash（官方 API）', hint: '官方 API，需要 DeepSeek 余额' },
-  { id: 'deepseek-v4-pro', label: 'DeepSeek-V4-Pro（官方 API）', hint: '官方 API，质量优先' },
-  { id: 'deepseek-chat', label: 'DeepSeek-Chat（官方 API）', hint: '官方 API，通用对话' },
-  { id: 'deepseek-reasoner', label: 'DeepSeek-Reasoner（官方 API）', hint: '官方 API，深度思考' },
+  { id: 'deepseek-flash', label: 'DeepSeek-V4.1-Flash（官方 API）', hint: '官方 API，需要 DeepSeek 余额' },
 ]
 export const MODEL_LOOKUP = Object.fromEntries(MODEL_PRESETS.filter((item) => item.id).map((item) => [item.id, item]))
 

@@ -170,7 +170,7 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
     // 所以 cache_creation_cost_per_million 必须等于 input_cost_per_million,
     // 否则 miss 部分不计费会导致成本严重低估。
     //
-    // v4-pro (原 deepseek-reasoner, 思考模式):
+    // v4-pro (原 deepseek-reasoner, 思考模式) — 已下线，仅用于历史会话成本回溯:
     //   官方: ¥3/M input miss, ¥0.025/M cache hit, ¥6/M output
     //   换算: $0.417 / $0.00347 / $0.833
     //   缓存命中 = input 价的 1/120
@@ -194,7 +194,9 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
     if normalized.contains("deepseek-chat")
         || normalized.contains("deepseek-v3")
         || normalized.contains("deepseekv3")
+        || normalized.contains("deepseek-flash")
         || normalized.contains("deepseek-v4-flash")
+        || normalized.contains("deepseek-v4.1-flash")
         || normalized.contains("deepseekv4-flash")
     {
         return Some(ModelPricing {

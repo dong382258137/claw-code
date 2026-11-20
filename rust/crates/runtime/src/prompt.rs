@@ -1717,36 +1717,21 @@ fn get_multi_agent_orchestration_section() -> String {
      \n\
      ### Model Selection Guide (模型选择指南)\n\
      \n\
-     When using `spawn_parallel_subagents` or `dispatch_subagent`, you MUST \
-     choose the appropriate model tier for each task based on its complexity. \
-     Each task can have a different model — pick the **lowest tier that can \
-     reliably complete** the task. When complexity is ambiguous, choose one \
-     tier higher: a failed or redo run costs more than the tier difference.\n\
+     This deployment runs a **single model**: `deepseek-flash` \
+     (DeepSeek-V4.1-Flash). Pro is retired — never request, suggest, or \
+     configure a Pro model.\n\
      \n\
-     | complexity | Task Type | Model Tier | Examples |\n\
-     |-----------|-----------|------------|----------|\n\
-     | `simple` | Read-only, search, format, single-file edit | **Budget** (flash) | grep for symbols, read a file, run a test suite, format code |\n\
-     | `diagnostic` | Debugging, root-cause analysis, multi-file reasoning | **Flagship** (pro) | trace a bug across modules, analyze error chains, review a PR |\n\
-     | `architectural` | System design, refactor planning, cross-cutting changes | **Flagship** (pro) | design a new module, refactor error handling, plan migration |\n\
-     \n\
-     **Budget-tier models** (names containing `flash`) \
-     CANNOT handle `diagnostic` or `architectural` tasks — the capability check \
-     will reject them. Use them only for `simple` tasks.\n\
-     \n\
-     **Flagship-tier models** (names containing `pro`) can handle any complexity, \
-     but cost 5-10x more. Avoid them for clearly simple tasks — but cost is \
-     secondary to correctness: a cheap run that fails, needs redo, or yields a \
-     shallow diagnosis costs more than one correct Flagship run.\n\
+     When using `spawn_parallel_subagents` or `dispatch_subagent`, still set \
+     `complexity` (`simple` / `diagnostic` / `architectural`) so the runtime can \
+     record task intent, but every task runs on `deepseek-flash` regardless of \
+     complexity. Do NOT ask the user which model to use — always use the \
+     default.\n\
      \n\
      ### Autonomous Task Decomposition Pattern\n\
      \n\
      When the user gives a high-level request, AUTOMATICALLY decompose it into \
-     sub-tasks with per-task model selection. Do NOT ask the user which model \
-     to use — decide yourself based on the task.\n\
-     \n\
-     **Key principle**: parallelizable simple tasks use Budget models; the \
-     final synthesis/judgment step uses a Flagship model. This cuts cost by \
-     5-10x while keeping quality."
+     sub-tasks for parallel execution. All sub-tasks, including the final \
+     synthesis/judgment step, run on `deepseek-flash`."
         .to_string()
 }
 
@@ -2802,10 +2787,12 @@ mod tests {
         assert!(prompt.contains("「运行时注记」"));
         assert!(prompt.contains("<runtime-note source="));
         assert!(prompt.contains("不是用户指令"));
-        // P1-4/P1-5:篇幅上限只约束答复呈现，不得诱导提前收口；路由以能力优先。
+        // P1-4/P1-5:篇幅上限只约束答复呈现，不得诱导提前收口；单模型统一 flash。
         assert!(prompt.contains("不约束任务执行中的工具调用与验证"));
         assert!(!prompt.contains("询问是否展开"));
-        assert!(prompt.contains("lowest tier that can"));
+        assert!(prompt.contains("single model"));
+        assert!(prompt.contains("deepseek-flash"));
+        assert!(!prompt.contains("Flagship"));
 
         cleanup_temp_dir(&root);
     }

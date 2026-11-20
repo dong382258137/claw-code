@@ -160,10 +160,9 @@ use ultraplan::{
     InternalPromptProgressState, INTERNAL_PROGRESS_HEARTBEAT_INTERVAL,
 };
 
-// V4-Pro 0813 正式版(2026-08-13)已上线,能力大幅提升,自动路由升级链已恢复。
-// 主会话默认仍用 flash(便宜、简单任务够用);复杂/失败子任务由自动路由
-// 升级到 pro(model_tier upgrade 表 flash→pro),兼顾成本与质量。
-pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+// 单模型架构:Pro 已下线,主会话与子任务统一使用 flash(官方 ID deepseek-flash)。
+// 旧 ID deepseek-v4-flash / deepseek-v4.1-flash 仍可被 alias 层归一化。
+pub const DEFAULT_MODEL: &str = "deepseek-flash";
 
 /// 网页版后端模型名:走 chat.deepseek.com 登录态(零 Token),实现见
 /// web-bridge crate(`WebApiClient` + `DeepseekWebClient`)。用
@@ -1335,7 +1334,7 @@ impl CliOutputFormat {
 
 pub fn resolve_model_alias(model: &str) -> &str {
     // DeepSeek-only build: built-in aliases are resolved by the api crate's
-    // `api::resolve_model_alias` (e.g. "pro" -> "deepseek-v4-pro"). The CLI
+    // `api::resolve_model_alias` (e.g. "pro"/旧 ID -> "deepseek-flash"). The CLI
     // layer no longer maintains its own alias table.
     model
 }
@@ -1376,12 +1375,12 @@ pub fn validate_model_syntax(model: &str) -> Result<(), String> {
     if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
         // Bare model names that metadata_for_model can route to a provider
         // are valid without the `provider/` prefix. This includes:
-        //   deepseek-v4-pro, deepseek-v4-flash, deepseek-chat, deepseek-reasoner
+        //   deepseek-flash, deepseek-chat, deepseek-reasoner
         if api::metadata_for_model(trimmed).is_some() {
             return Ok(());
         }
         let err_msg = format!(
-            "invalid model syntax: '{}'. Expected provider/model (e.g., deepseek/deepseek-v4-pro) or a known DeepSeek model name",
+            "invalid model syntax: '{}'. Expected provider/model (e.g., deepseek/deepseek-flash) or a known DeepSeek model name",
             trimmed
         );
         return Err(err_msg);

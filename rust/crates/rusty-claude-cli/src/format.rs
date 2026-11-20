@@ -133,7 +133,7 @@ pub(crate) fn format_permissions_switch_report(previous: &str, next: &str) -> St
 ///
 /// 支持格式:
 /// - `heuristic` → `DetectionStrategy::Heuristic`
-/// - `llm` → `DetectionStrategy::LlmExtract { model: "deepseek-v4-flash" }`(默认 flash)
+/// - `llm` → `DetectionStrategy::LlmExtract { model: "deepseek-flash" }`(默认 flash)
 /// - `llm:<model>` → `DetectionStrategy::LlmExtract { model }`
 pub(crate) fn parse_detection_strategy(arg: &str) -> Option<DetectionStrategy> {
     let trimmed = arg.trim();
@@ -152,7 +152,7 @@ pub(crate) fn parse_detection_strategy(arg: &str) -> Option<DetectionStrategy> {
     }
     if lower == "llm" {
         return Some(DetectionStrategy::LlmExtract {
-            model: "deepseek-v4-flash".to_string(),
+            model: "deepseek-flash".to_string(),
         });
     }
     None
@@ -2293,10 +2293,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  Use /session list in the REPL to browse managed sessions"
     )?;
     writeln!(out, "Examples:")?;
-    writeln!(
-        out,
-        "  claw --model deepseek-v4-pro \"summarize this repo\""
-    )?;
+    writeln!(out, "  claw --model deepseek-flash \"summarize this repo\"")?;
     writeln!(
         out,
         "  claw --output-format json prompt \"explain src/main.rs\""
@@ -2483,7 +2480,7 @@ mod tests {
         assert_eq!(
             result,
             Some(DetectionStrategy::LlmExtract {
-                model: "deepseek-v4-flash".to_string()
+                model: "deepseek-flash".to_string()
             })
         );
     }

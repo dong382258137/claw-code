@@ -60,7 +60,7 @@ fn main() {
 async fn run_bridge(config: &ImBridgeConfig) -> Result<(), String> {
     let model = std::env::var("DEEPSEEK_MODEL")
         .or_else(|_| std::env::var("CLAW_MODEL"))
-        .unwrap_or_else(|_| "deepseek-v4-pro".to_string());
+        .unwrap_or_else(|_| "deepseek-flash".to_string());
 
     tracing::info!("starting IM bridge with model: {model}");
 

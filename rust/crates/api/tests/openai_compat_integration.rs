@@ -65,7 +65,7 @@ async fn send_message_uses_openai_compatible_endpoint_and_auth() {
         Some("Bearer deepseek-test-key")
     );
     let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
-    assert_eq!(body["model"], json!("deepseek-v4-pro"));
+    assert_eq!(body["model"], json!("deepseek-flash"));
     assert_eq!(body["messages"][0]["role"], json!("system"));
     assert_eq!(body["tools"][0]["type"], json!("function"));
 }
