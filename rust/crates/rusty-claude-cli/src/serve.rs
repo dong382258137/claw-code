@@ -276,6 +276,17 @@ fn plan_steps_from_artifact(value: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// 从会话首条记录读取会话创建时间（毫秒）。会话文件缺失/损坏返回 None。
+///
+/// 用途见 [`load_web_plan`]：`PlanArtifact` 无 session 归属字段，只能靠
+/// 「计划创建时间是否晚于会话创建时间」这一时间谓词判定归属。
+fn session_created_ms(path: &Path) -> Option<u64> {
+    runtime::Session::load_from_path(path)
+        .ok()
+        .map(|session| session.created_at_ms)
+        .filter(|ms| *ms > 0)
+}
+
 /// 没有 sidecar 时，从会话里最后一次 EnterPlanMode/ExitPlanMode 推断计划模式。
 fn session_plan_mode_hint(path: &Path) -> Option<bool> {
     let session = runtime::Session::load_from_path(path).ok()?;
@@ -299,6 +310,16 @@ fn session_plan_mode_hint(path: &Path) -> Option<bool> {
 /// 优先级：`.claw/web-plan/<session>.json`（用户在 Web 端改过）→ 最新的
 /// `.claw/plans/*.json`（CLI 规划器写的 PlanArtifact）→ 空。sidecar 缺失时
 /// 返回的是只读草稿（`source: "artifact"`），用户第一次保存才落盘。
+///
+/// **会话归属（artifact 兜底的时间谓词）**：`PlanArtifact` 不含 session 字段，
+/// 工作区级 `plans/` 目录里的历史计划会被任意新会话读到。若不加约束，新会话
+/// 首轮就被注入上一个任务的 `task_summary` + 步骤，并被 goal 提取固化成
+/// 「当前任务」（2026-11-19 实证：新会话 `session-1795017862696-0` 的首条
+/// user 文本即旧计划的 `[Web 计划…]` 块）。判据：**早于会话创建时刻的计划
+/// 不可能属于该会话** —— 纯时间谓词，无需改 `PlanArtifact` 契约。
+///
+/// 会话创建时间不可得（文件缺失/损坏）时保持旧行为（不设下界），避免因
+/// 会话文件临时不可读而丢失合法的计划展示。
 fn load_web_plan(workspace: &Path, session_path: &Path, id: &str) -> Value {
     let sidecar = std::fs::read_to_string(web_plan_path(workspace, id))
         .ok()
@@ -309,11 +330,21 @@ fn load_web_plan(workspace: &Path, session_path: &Path, id: &str) -> Value {
         return value;
     }
     let enabled = session_plan_mode_hint(session_path).unwrap_or(false);
+    let session_started_ms = session_created_ms(session_path);
     let plan = read_plan_artifacts(workspace)
         .into_iter()
         .next()
         .and_then(|artifacts| {
             let artifact = &artifacts["plan"];
+            // 早于会话创建的计划属于别的会话 → 不兜底。
+            let artifact_created_ms = artifact["created_at_ms"]
+                .as_u64()
+                .or_else(|| artifacts["updated_ms"].as_u64());
+            if let (Some(started), Some(created)) = (session_started_ms, artifact_created_ms) {
+                if created < started {
+                    return None;
+                }
+            }
             let steps = plan_steps_from_artifact(artifact);
             if steps.is_empty() {
                 return None;
@@ -1421,6 +1452,8 @@ fn remove_session(state: &AppState, id: &str) -> Result<(), (StatusCode, String)
     }
     std::fs::remove_file(&path)
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    // 轮转快照属于同一会话：删除会话时一并清掉，别让旧副本永远留在磁盘上。
+    remove_rotated_backups(&path);
     state.scheduler.forget(id);
     state.events.forget(id);
     remove_session_title(&workspace, id);
@@ -5151,6 +5184,39 @@ fn is_header_only_session(path: &Path, size: u64) -> bool {
     }
 }
 
+/// 会话文件超过轮转阈值后，运行时会把它改名为 `<id>.rot-<ts>.jsonl` 留作旧快照
+/// （`session_id` 不变、首行同样是 `session_meta`）。它属于同一个会话的历史副本，
+/// 不是独立会话；列进来侧栏就会把一段对话显示成两三条。
+fn is_rotated_session_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains(".rot-"))
+}
+
+/// 删除某个会话时，连同它的 `<id>.rot-<ts>.jsonl` 轮转快照一起清理。
+fn remove_rotated_backups(path: &Path) {
+    let (Some(parent), Some(stem)) = (
+        path.parent(),
+        path.file_stem().and_then(|value| value.to_str()),
+    ) else {
+        return;
+    };
+    let prefix = format!("{stem}.rot-");
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(&prefix)
+            && Path::new(name).extension().and_then(|ext| ext.to_str())
+                == Some(PRIMARY_SESSION_EXTENSION)
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn collect_session_files(dir: &Path, depth: usize, files: &mut Vec<PathBuf>) {
     const MAX_DEPTH: usize = 3;
     if depth > MAX_DEPTH {
@@ -5164,6 +5230,7 @@ fn collect_session_files(dir: &Path, depth: usize, files: &mut Vec<PathBuf>) {
         if path.is_dir() {
             collect_session_files(&path, depth + 1, files);
         } else if path.extension().and_then(|ext| ext.to_str()) == Some(PRIMARY_SESSION_EXTENSION)
+            && !is_rotated_session_file(&path)
             && is_session_file(&path)
         {
             files.push(path);
@@ -5557,6 +5624,37 @@ mod tests {
         );
     }
 
+    /// 轮转快照（`<id>.rot-<ts>.jsonl`）是同一个会话的旧副本：首行同样是
+    /// `session_meta`、标题也一样，列入侧栏会让一段对话显示成两三条。
+    #[test]
+    fn session_listing_skips_rotated_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("fingerprint");
+        std::fs::create_dir_all(&nested).unwrap();
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "version": 1,
+            "session_id": "session-1-0",
+            "workspace_root": dir.path().display().to_string(),
+        });
+        let message = serde_json::json!({
+            "type": "message",
+            "message": { "role": "user", "blocks": [{ "text": "同一个会话" }] },
+        });
+        let body = format!("{meta}\n{message}\n");
+        std::fs::write(nested.join("session-1-0.jsonl"), &body).unwrap();
+        for stamp in [11, 12] {
+            std::fs::write(nested.join(format!("session-1-0.rot-{stamp}.jsonl")), &body).unwrap();
+        }
+
+        assert_eq!(session_files(dir.path()).len(), 1, "轮转快照不是独立会话");
+        let value = list_sessions(&nested, dir.path(), 0, 10).unwrap();
+        assert_eq!(value["total"].as_u64(), Some(1), "total 不应计入快照");
+        let sessions = value["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["id"], "session-1-0");
+    }
+
     /// 会话归属必须以“文件所在的 store”为准：`session_meta` 里的
     /// `workspace_root` 是创建时写下的字符串，可能大小写/写法不同（Windows
     /// 盘符 `d:` 与 `D:`）。回读它会让前端按字符串分组时把一个工作区拆成
@@ -5776,6 +5874,99 @@ mod tests {
         assert_eq!(confirmed["revision"], 2);
         let prompt = prompt_with_web_context(dir.path(), &session_path, id, "继续");
         assert!(prompt.contains("用户已确认该计划"), "prompt: {prompt}");
+    }
+
+    /// 新会话不得继承「早于它创建」的 PlanArtifact。
+    ///
+    /// 现场复现（2026-11-19）：新会话 `session-1795017862696-0` 创建于
+    /// 2026-11-19 00:04，而 `.claw/plans/` 里最新 artifact 的 mtime 是
+    /// 2026-11-16 02:26。`load_web_plan` 的 artifact 兜底取「全局最新」且
+    /// `PlanArtifact` 无 session 字段 ⇒ 新会话首轮被注入旧任务的
+    /// `task_summary` + 冒烟步骤。时间谓词修复后应判定为「无计划」。
+    #[test]
+    fn new_session_ignores_older_plan_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let plans_dir = dir.path().join(".claw").join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        // 旧 artifact：created_at_ms 早于会话创建时间。
+        atomic_write(
+            &plans_dir.join("plan-old-1.json"),
+            &json!({
+                "id": "plan-old-1",
+                "created_at_ms": 1_000u64,
+                "task_summary": "上一轮的旧任务",
+                "steps": [{ "id": "s1", "description": "旧步骤", "status": "pending" }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // 会话创建于 2000ms —— 晚于 artifact。
+        let session_path = dir.path().join("s.jsonl");
+        atomic_write(
+            &session_path,
+            &json!({
+                "version": 1,
+                "session_id": "session-new-0",
+                "created_at_ms": 2_000u64,
+                "updated_at_ms": 2_000u64,
+                "messages": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let state = load_web_plan(dir.path(), &session_path, "session-new-0");
+        assert!(
+            state["plan"].is_null(),
+            "早于会话创建的 artifact 不应兜底, got {}",
+            state["plan"]
+        );
+
+        let prompt = prompt_with_web_context(dir.path(), &session_path, "session-new-0", "你好");
+        assert!(
+            !prompt.contains("上一轮的旧任务"),
+            "旧任务不得注入新会话 prompt: {prompt}"
+        );
+        assert_eq!(prompt, "你好");
+    }
+
+    /// 会话内新建的计划仍应正常兜底（时间谓词不能把合法场景一并挡掉）。
+    #[test]
+    fn session_keeps_plan_artifact_created_after_it_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let plans_dir = dir.path().join(".claw").join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        atomic_write(
+            &plans_dir.join("plan-new-1.json"),
+            &json!({
+                "id": "plan-new-1",
+                "created_at_ms": 3_000u64,
+                "task_summary": "本会话的任务",
+                "steps": [{ "id": "s1", "description": "本会话步骤", "status": "pending" }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let session_path = dir.path().join("s.jsonl");
+        atomic_write(
+            &session_path,
+            &json!({
+                "version": 1,
+                "session_id": "session-live-0",
+                "created_at_ms": 2_000u64,
+                "updated_at_ms": 2_000u64,
+                "messages": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let state = load_web_plan(dir.path(), &session_path, "session-live-0");
+        assert_eq!(state["plan"]["task_summary"], "本会话的任务");
+        let prompt = prompt_with_web_context(dir.path(), &session_path, "session-live-0", "继续");
+        assert!(prompt.contains("本会话的任务"), "prompt: {prompt}");
     }
 
     #[test]
