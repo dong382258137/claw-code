@@ -31,15 +31,34 @@ export function useSessionEvents({
   useEffect(() => {
     if (!currentId) return undefined
     let closed = false
+    // 切会话必须把所有「本轮实时状态」清零：live/liveThinking/liveTools/running
+    // 在 App 里都是全局单份，不清理就会把上一个会话的工具卡、思考过程、
+    // 「运行中」标记带进新会话界面——看起来像两个会话在串台。
     // 无会话时输入会自动新建会话并立刻发消息：这条待发消息带着目标 sessionId，
     // 不能因为 currentId 刚切换到它就被清掉，否则用户刚打的字会闪一下消失。
     setOptimistic((pending) => (pending && pending.sessionId === currentId ? pending : null))
     setLive('')
+    setLiveThinking('')
+    setLiveTools([])
+    setApprovals([])
     setMessages([])
     setLoadingSession(true)
     // 任务面板与对话共用这一条事件流：切会话时先清掉上一个会话的尾事件，
     // 避免新面板挂载时把旧会话的待办/计划又应用一次。
     setTaskEvent(null)
+
+    // 「运行中」属于哪个会话只有服务端知道：立刻对齐一次，否则切到空闲会话后
+    // 仍会显示上一个会话在执行（状态轮询要 1.2s 才纠正）。
+    // 若这次对齐返回前已经收到本会话的流式事件，就以事件为准，避免旧状态覆盖新状态。
+    let sawStreamEvent = false
+    api(`/api/session/${encodeURIComponent(currentId)}/status`)
+      .then((status) => {
+        if (closed || sawStreamEvent) return
+        setRunning(Boolean(status?.running))
+      })
+      .catch(() => {
+        if (!closed && !sawStreamEvent) setRunning(false)
+      })
 
     // 与旧 /stream snapshot 完全一致的落地方式，保证终态渲染行为不变。
     const applySnapshot = (view) => {
@@ -109,6 +128,8 @@ export function useSessionEvents({
     }
     events.addEventListener('stream', (event) => {
       if (closed) return
+      // 收到本会话的任何流式事件后，以事件为准，不再用切换时那次状态对齐覆盖。
+      sawStreamEvent = true
       try {
         const data = JSON.parse(event.data)
         if (data.kind === 'delta') setLive((previous) => previous + data.text)

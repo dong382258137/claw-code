@@ -358,7 +358,11 @@ export default function App() {
   const selectSession = useCallback((session) => {
     setCurrent({ id: session.id, title: session.title, modified: session.modified, workspace: session.workspace })
     setMessages([])
+    // 实时状态是全局单份：切会话必须立刻清空，否则上一个会话的正文/思考/工具卡
+    // 会在新会话界面上残留一帧甚至更久（看起来像两个会话串台）。
     setLive('')
+    setLiveThinking('')
+    setLiveTools([])
     setOptimistic(null)
     setApprovals([])
     setQueue({ state: 'idle', position: 0, queued: 0, mine: 0 })
