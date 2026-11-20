@@ -217,6 +217,15 @@ pub fn dedupe_decisions_section(content: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n\n");
 
+    // 5.5) 空行折叠:连续空行压成 1 行。
+    //
+    // 动机:decisions 段用 [`DECISIONS_MAX_CHARS`] 做字符预算,而空行也计入
+    // 预算。实测 `.claw/NOTEBOOK.md` 的 decisions 段 6094 字符里有 1541 行是
+    // 空行(56 个空行块,最长连续 55 行),有效内容仅 57 行 —— 预算被空白吃掉
+    // 约 25%,导致新决策一写入就从头部裁掉旧决策(静默丢数据)。折叠是纯字符
+    // 回收,不改变任何决策文本。
+    let joined = collapse_blank_lines(&joined);
+
     // 6) 上限裁剪:从头部裁剪保留最新(尾部)
     if joined.chars().count() <= DECISIONS_MAX_CHARS {
         return joined;
@@ -228,6 +237,28 @@ pub fn dedupe_decisions_section(content: &str) -> String {
     } else {
         skipped
     }
+}
+
+/// 把连续空行折叠为单行空行,并去掉首尾空白行。
+///
+/// 与 `compact.rs` / `prompt.rs` 的同名工具语义一致(那两处是私有实现,本处
+/// 因需要在本模块内复用而独立实现;逻辑相同,便于各自演进)。
+fn collapse_blank_lines(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut blank_run = 0usize;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            blank_run += 1;
+            continue;
+        }
+        if blank_run > 0 && !out.is_empty() {
+            out.push('\n');
+        }
+        blank_run = 0;
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.trim_end().to_string()
 }
 
 /// 前缀冻结区稳定段快照持久化文件名(位于 `.claw/` 下)。
@@ -407,12 +438,18 @@ pub const SECTION_TAGS: &[&str] = &[
 /// 注入 messages 前缀后字节稳定,热窗内存续命中;与实时段分离的核心依据
 /// 是「变化频次 × 变化后长度」—— 稳定段每轮重建的代价远高于实时段,
 /// 因此归入可命中的长命区,实时段留在尾部新建区。
-pub const STABLE_SECTION_TAGS: &[&str] = &["decisions", "evidence"];
+///
+/// `key_files` 于 2026-11-20 从实时段迁入(实测 `key_files` 占尾部
+/// `Runtime Context` 的 3467/4158 字符 = 83%,其余实时段合计仅 691)。
+/// 它是「已确认的文件/位置锚点」—— 条目只增不减、单条写入即长期有效,
+/// 属低频段;放在逐轮重发的尾部块里等于每轮重付 ≈1.7K tokens,
+/// 而它对当轮决策的影响并不随迭代刷新。迁入后:首轮进前缀一次,
+/// 后续新增走 `split_delta` 尾部增量通道,「冻结不失忆」语义不变。
+pub const STABLE_SECTION_TAGS: &[&str] = &["decisions", "evidence", "key_files"];
 
 /// 尾部冻结槽位块段:高频/实时变化(计划进度、失败记录、子智能体注册)。
 /// 留在 messages 末尾,变化只影响尾块不破坏前缀。
-pub const VOLATILE_SECTION_TAGS: &[&str] =
-    &["plan", "subagents", "attempted", "preferences", "key_files"];
+pub const VOLATILE_SECTION_TAGS: &[&str] = &["plan", "subagents", "attempted", "preferences"];
 
 /// 会话级段:绑定单一会话,跨会话不注入。
 ///
@@ -2128,16 +2165,20 @@ bash
     // ---- 分段双轨:稳定段(decisions/evidence) vs 实时段(plan/attempted 等) ----
 
     #[test]
-    fn render_stable_sections_only_includes_decisions_and_evidence() {
+    fn render_stable_sections_includes_decisions_evidence_and_key_files() {
         let mut nb = Notebook::new();
         nb.set_section("decisions", "- [d1] 选 SQLite");
         nb.set_section("evidence", "[Bash] 基准: 100 req/s");
+        nb.set_section("key_files", "- rust/crates/runtime/src/notebook.rs");
         nb.set_section("plan", "任务计划");
         nb.set_section("attempted", "- 方案A 失败");
         let stable = nb.render_stable_sections();
         assert!(stable.contains("<decisions>"), "稳定段应含 decisions");
         assert!(stable.contains("选 SQLite"));
         assert!(stable.contains("<evidence>"), "稳定段应含 evidence");
+        // 2026-11-20:key_files 占尾部逐轮重发块 83%,迁入稳定段(只注入一次)。
+        assert!(stable.contains("<key_files>"), "稳定段应含 key_files");
+        assert!(stable.contains("notebook.rs"));
         assert!(!stable.contains("任务计划"), "稳定段不应含 plan");
         assert!(!stable.contains("方案A"), "稳定段不应含 attempted");
     }
@@ -2147,6 +2188,7 @@ bash
         let mut nb = Notebook::new();
         nb.set_section("decisions", "- [d1] 选 SQLite");
         nb.set_section("evidence", "[Bash] 基准: 100 req/s");
+        nb.set_section("key_files", "- rust/crates/runtime/src/notebook.rs");
         nb.set_section("plan", "任务计划");
         nb.set_section("attempted", "- 方案A 失败");
         let volatile = nb.render_volatile_sections();
@@ -2154,6 +2196,12 @@ bash
         assert!(volatile.contains("方案A"), "实时段应含 attempted");
         assert!(!volatile.contains("选 SQLite"), "实时段不应含 decisions");
         assert!(!volatile.contains("基准: 100"), "实时段不应含 evidence");
+        // 回归护栏:key_files 若回到实时段,会逐轮重付 ≈1.7K tokens。
+        assert!(!volatile.contains("<key_files>"), "实时段不应含 key_files");
+        assert!(
+            !volatile.contains("notebook.rs"),
+            "实时段不应含 key_files 内容"
+        );
     }
 
     #[test]
