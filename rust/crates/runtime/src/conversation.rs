@@ -6060,6 +6060,51 @@ where
             &summary.tool_results,
         );
 
+        // Q5：逐轮用户风格观察（纯确定性、零 LLM、零延迟）。
+        //
+        // 与上面的 LLM 提取器互补：提取器按**内容**标准稀疏抽取（默认 NOOP），
+        // 本通道按**表达形式**每轮运行，覆盖「简洁/详尽、结构化、自主性、
+        // 第一性原理、权威来源、回复语言」六类风格信号。
+        //
+        // 前缀缓存安全：写入走 `apply_ops`（纯内存）+ journal，不动
+        // `frozen_snapshot`；全量落盘由会话边界 `flush` 统一执行。因此本通道
+        // 每轮运行既不会每轮写盘，也不会扰动 system 前缀字节。
+        // 穷鬼模式下跳过：用户明确要求最小化副作用。
+        if !crate::poor_mode::is_active() {
+            let style_texts: Vec<String> = {
+                let mut picked: Vec<String> = Vec::new();
+                for message in self.session.messages.iter().rev() {
+                    if message.role != MessageRole::User {
+                        continue;
+                    }
+                    let text = message
+                        .blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.trim().is_empty() {
+                        picked.push(text);
+                    }
+                    if picked.len() >= 3 {
+                        break;
+                    }
+                }
+                picked
+            };
+            if let Some(memory) = self.persistent_memory.as_mut() {
+                let added = crate::memory::observe_user_style(memory, &style_texts);
+                if added > 0 {
+                    self.emit_diag(format!(
+                        "[memory] style-observer added {added} new signal(s)"
+                    ));
+                }
+            }
+        }
+
         // Phase 3(self-evolving harness):自进化触发(同步限频)。
         // 规则式路径零 LLM 调用;只在 trace_analyzer + harness_archive 同时
         // 存在时生效。evolve 失败只打 diag 并清零计数(避免 db 抖动导致
@@ -17547,6 +17592,66 @@ mod tests {
         // Block persisted to disk — next session sees it in the frozen prefix.
         let reloaded = PersistentMemory::load_and_freeze(&memory_path);
         assert!(reloaded.frozen_render().contains("完成 P2 工具"));
+        let _ = std::fs::remove_file(&memory_path);
+    }
+
+    /// Q5 接线：`run_turn` 收尾必须真的调用风格观察通道。
+    ///
+    /// 只测 `observe_user_style` 本身不够 —— 它可能根本没被 `run_turn` 调用
+    /// （这正是 f470cee3 的实现被 76f2f4da 删掉后无人察觉的原因）。
+    /// 本测试从 `run_turn` 入口进，断言用户发言的风格信号落进了记忆。
+    #[test]
+    fn run_turn_observes_user_style_and_writes_memory() {
+        let memory_path = temp_session_path("style-observer-wired");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_persistent_memory(PersistentMemory::empty(&memory_path));
+
+        runtime
+            .run_turn("请简洁一点，用表格列出，不要问我，参考权威论文", None)
+            .expect("turn should complete");
+
+        let memory = runtime.persistent_memory().expect("memory attached");
+        let contents: Vec<&str> = memory
+            .entries()
+            .iter()
+            .filter(|entry| entry.source == "style-observer")
+            .map(|entry| entry.content.as_str())
+            .collect();
+        assert!(
+            contents.contains(&"user prefers concise, to-the-point answers"),
+            "简洁偏好未落记忆: {contents:?}"
+        );
+        assert!(
+            contents.contains(&"user likes structured output (tables/lists)"),
+            "结构化输出偏好未落记忆: {contents:?}"
+        );
+        assert!(
+            contents.contains(&"user wants autonomous decisions — do not ask, decide and proceed"),
+            "自主性偏好未落记忆: {contents:?}"
+        );
+        assert!(
+            contents.contains(&"user expects authoritative sources/citations for claims"),
+            "权威来源要求未落记忆: {contents:?}"
+        );
+
+        // 第二条同义发言不得让记忆膨胀（幂等性在真实 turn 路径上成立）。
+        let before = memory.entries().len();
+        runtime
+            .run_turn("再简洁一点，还是不要问我", None)
+            .expect("second turn should complete");
+        let after = runtime
+            .persistent_memory()
+            .expect("memory attached")
+            .entries()
+            .len();
+        assert_eq!(after, before, "重复风格发言不得新增条目");
+
         let _ = std::fs::remove_file(&memory_path);
     }
 
