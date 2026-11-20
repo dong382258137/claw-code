@@ -4104,15 +4104,27 @@ fn build_api_client(
         tool_registry,
         progress_reporter,
     )?;
-    // P0-2:Trae 上游不返回 prompt cache(实测相同 947-token 前缀两次请求
-    // cache_read 均为 0),全量 85 个工具 schema(~63k 字符)会在每次迭代
-    // 重复 prefill。主 client 默认启用渐进式工具加载:只注入核心集 +
-    // ToolSearch/WebSearch/WebFetch,其余工具经 ToolSearch 发现后激活
-    // (激活链路见 runtime `ApiClient::activate_tool`)。
-    // 显式设置 RUSTY_CLAUDE_PROGRESSIVE_TOOLS 时尊重环境变量,不再自动开启。
+    // P0-2:上游不返回 prompt cache 时,全量工具 schema 会在每次迭代重复
+    // prefill。实测(2026-11-20):主会话静态前缀 = 85 个工具 / 58 667 字符,
+    // 而 `.claw/telemetry.jsonl` 的 7 779 次 tool_execution_finished 中,
+    // **36 个工具从未被调用过**(Config/Cron*/Worker*/Team*/Mcp* 等),
+    // 49 个被用过。即固定前缀里约 42% 的体积对应零使用工具。
+    //
+    // 原实现仅对 `trae/` 前缀模型开启,但实跑模型经 alias 解析后是
+    // `deepseek-v4-flash`(见 prompt-cache dumps 的 model 字段),该门恒不成立
+    // ⇒ 渐进式加载对当前 provider 从未生效,85 个工具全额注入。
+    //
+    // 改为:**默认对主会话开启**,`RUSTY_CLAUDE_PROGRESSIVE_TOOLS=0` 显式关闭。
+    // 安全性由两点保证:
+    //  1. `progressive_always_injected_tool_names()` 已包含 prompt 明文要求的
+    //     记忆/计划类工具与 ToolSearch,不存在"看到指引却调不到工具";
+    //  2. ToolSearch 是常驻出口,长尾工具可按需发现后激活(见
+    //     conversation.rs 的 activate_tool 链路)。
+    // 子智能体不受影响:其 client 以 `enable_tools=false` 构造,本门不进入。
     if enable_tools
-        && model.trim().starts_with("trae/")
-        && std::env::var_os("RUSTY_CLAUDE_PROGRESSIVE_TOOLS").is_none()
+        && std::env::var("RUSTY_CLAUDE_PROGRESSIVE_TOOLS").map_or(true, |value| {
+            !(value == "0" || value.eq_ignore_ascii_case("false"))
+        })
     {
         client.set_progressive_tools(true);
     }

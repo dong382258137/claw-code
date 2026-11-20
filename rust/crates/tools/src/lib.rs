@@ -851,7 +851,13 @@ impl GlobalToolRegistry {
         let builtin_active =
             |name: &str| overlay.is_none_or(|set| is_core(name) || set.contains(name));
         // runtime/plugin 无"核心"概念:渐进模式下只有已激活工具注入。
-        let tail_active = |name: &str| overlay.is_none_or(|set| set.contains(name));
+        // 2026-11-20 修:`log_decision`/`notebook_update` 等记忆与计划类工具
+        // 由 prompt 明文点名要求调用,但它们注册为 **runtime 工具**
+        // (见 plugin_state.rs),不受 `builtin_active` 的核心集保护。若此处
+        // 只认激活集合,模型会「看到指引却调不到工具」—— 比不裁剪更糟。
+        // 故核心集对三路来源(builtin/runtime/plugin)一致生效。
+        let tail_active =
+            |name: &str| overlay.is_none_or(|set| is_core(name) || set.contains(name));
 
         let builtin = mvp_tool_specs()
             .into_iter()
@@ -8919,6 +8925,7 @@ pub fn core_tool_names() -> [&'static str; 6] {
 #[must_use]
 pub fn progressive_always_injected_tool_names() -> &'static [&'static str] {
     &[
+        // ---- 文件/检索原语(编码任务刚需,注入即用) ----
         "bash",
         "read_file",
         "write_file",
@@ -8928,9 +8935,63 @@ pub fn progressive_always_injected_tool_names() -> &'static [&'static str] {
         // LSP 必须常驻:system prompt 要求"改完代码必须看 LSP 诊断",
         // 渐进模式下若被延迟,模型只能看到指引却调不到工具。
         "LSP",
+        // ---- 发现通道(ToolSearch 是渐进模式唯一出口,必须常驻) ----
         "ToolSearch",
         "WebSearch",
         "WebFetch",
+        // ---- system prompt 明文点名要求调用的工具(2026-11-20 补) ----
+        // 依据:prompt 的「记忆写入路由」与「工作记忆」段直接指示模型调用
+        // `log_decision`/`notebook_update`/`search_past_decisions`/`recall_full`/
+        // `plan_update`/`create_plan`/`set_current_task`,并反复要求
+        // `memory_update` 固化画像。这些工具若被渐进模式延迟,模型会看到
+        // 「请调用 X」却调不到 X —— 比不裁更糟。故它们无条件常驻。
+        "notebook_update",
+        "log_decision",
+        "verify_decision",
+        "search_past_decisions",
+        "recall_full",
+        "session_search",
+        "plan_update",
+        "create_plan",
+        "set_current_task",
+        "TodoWrite",
+        "memory_update",
+        // 澄清出口:收敛契约允许「询问用户方向」,工具不可见会让模型
+        // 只能自行猜测或空转。
+        "AskUserQuestion",
+        // ---- prompt 中以反引号**明确点名**的工具(2026-11-20 实测补齐) ----
+        // 依据:对最新主会话请求体(system 33536 字符 + 尾部 6 条注入消息)
+        // 统计"反引号点名的工具",以下 25 个被点名 1~7 次却不在旧核心集内。
+        // 点名即指令:模型读到"调用 `dispatch_subagent`"却发现该工具不在
+        // tools 数组,只能要么忽略指引、要么空转重试 —— 比不裁剪更糟。
+        // 故凡 prompt 明文点名的工具一律常驻;未点名的长尾(Config/Cron*/
+        // Worker*/Team*/Mcp* 等 38 个)仍走 ToolSearch 按需发现。
+        // 收益仍显著:85 tools/58497 chars → 47 tools/32858 chars(-43.8%)。
+        "replace_lines",
+        "dispatch_subagent",
+        "check_subagent",
+        "spawn_parallel_subagents",
+        "Agent",
+        "bus_list",
+        "bus_send",
+        "bus_watch",
+        "dag_define",
+        "dag_run",
+        "dag_status",
+        "Skill",
+        "SkillSearch",
+        "SendUserMessage",
+        "StructuredOutput",
+        "TaskCreate",
+        "TaskUpdate",
+        "TaskGet",
+        "TaskList",
+        "TaskStop",
+        "TaskOutput",
+        "RunTaskPacket",
+        "TeamCreate",
+        "rollback_transaction",
+        "transaction_status",
     ]
 }
 
@@ -10842,6 +10903,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
     }
+    use super::{deferred_tool_specs, progressive_always_injected_tool_names};
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
     use std::fs;
@@ -10931,26 +10993,38 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name)
             .collect();
+        // 断言不变式而非硬编码全表:核心集是常驻清单的投影,
+        // 新增常驻工具不应让本测试失败(2026-11-20 扩充记忆/计划类工具后,
+        // 旧硬编码期望曾在此处报错)。
+        //
+        // 注意:`builtin()` 只含 mvp 工具,而 `log_decision`/`notebook_update`
+        // 等注册为 **runtime 工具**(见 plugin_state.rs)。故期望集取
+        // 「常驻清单 ∩ 本注册表实际可用工具」—— 断言"凡可用且属常驻清单者
+        // 必须注入",而非"注入集恰好等于整张清单"。
+        let available: BTreeSet<String> = mvp_tool_specs()
+            .into_iter()
+            .map(|spec| spec.name.to_string())
+            .collect();
+        let expected: BTreeSet<String> = progressive_always_injected_tool_names()
+            .iter()
+            .map(|name| (*name).to_string())
+            .filter(|name| available.contains(name))
+            .collect();
+        let actual: BTreeSet<String> = names.iter().cloned().collect();
         assert_eq!(
-            names,
-            vec![
-                "bash",
-                "read_file",
-                "write_file",
-                "edit_file",
-                "glob_search",
-                "grep_search",
-                "WebFetch",
-                "WebSearch",
-                "ToolSearch",
-                "LSP"
-            ],
-            "渐进模式应注入核心集 + ToolSearch/WebSearch/WebFetch/LSP: {:?}",
-            names
+            actual, expected,
+            "渐进模式注入集必须等于「常驻清单 ∩ 可用工具」: {names:?}"
         );
         assert!(
             names.contains(&"ToolSearch".to_string()),
             "ToolSearch 必须常驻,否则模型无法发现其余工具"
+        );
+        // 记忆/计划类工具在 builtin 里不注册(它们是 runtime 工具),
+        // 故此处只断言"凡本注册表可用的常驻项必须注入"。runtime 工具的
+        // 核心集保护由 `progressive_core_protects_runtime_tools` 覆盖。
+        assert!(
+            names.contains(&"plan_update".to_string()) || !available.contains("plan_update"),
+            "plan_update 若可用则必须常驻: {names:?}"
         );
     }
 
@@ -10958,9 +11032,18 @@ mod tests {
     #[test]
     fn progressive_definitions_activate_adds_tool() {
         let mut registry = GlobalToolRegistry::builtin().with_progressive_tools();
+        let core_len = registry.definitions(None).len();
+        // 动态挑选"本注册表可用但仍在延迟集"的工具:硬编码具体名字会在
+        // 该工具被提升进核心集后失效(2026-11-20 补 prompt 点名工具时,
+        // replace_lines 从延迟集升入核心集,旧断言随即失败)。
+        let deferred = deferred_tool_specs()
+            .into_iter()
+            .map(|spec| spec.name.to_string())
+            .next()
+            .expect("builtin 已注册工具应至少有一个处于延迟集");
         assert!(
-            registry.activate_tool("replace_lines"),
-            "replace_lines 是 mvp 工具,激活应成功"
+            registry.activate_tool(&deferred),
+            "{deferred} 是 mvp 工具,激活应成功"
         );
         let names: Vec<String> = registry
             .definitions(None)
@@ -10968,11 +11051,12 @@ mod tests {
             .map(|tool| tool.name)
             .collect();
         assert!(
-            names.contains(&"replace_lines".to_string()),
-            "激活后应注入 replace_lines: {:?}",
+            names.contains(&deferred),
+            "激活后应注入 {deferred}: {:?}",
             names
         );
-        assert_eq!(names.len(), 11, "10 常驻 + 1 激活");
+        // 激活一个工具 = 基数 +1,与核心集具体规模解耦。
+        assert_eq!(names.len(), core_len + 1, "常驻集 + 1 激活");
     }
 
     /// 渐进模式对 runtime(MCP)工具同样生效:默认延迟,激活后注入。
