@@ -129,6 +129,50 @@ fn should_update_goal(new_goal: &str) -> bool {
     true
 }
 
+/// 外部注入上下文块的起始标记 —— 这些块由外壳层（Web 端
+/// `prompt_with_web_context`）前置拼进 user 文本，**不是用户发言**。
+///
+/// 与 `rusty-claude-cli/src/serve.rs::prompt_with_web_context` 的三类块一一对应；
+/// 新增注入块时必须同步此处，否则该块会被当成用户任务描述。
+const INJECTED_PREFIX_HEADERS: &[&str] = &["[计划模式]", "[Web 计划", "[Web 待办状态"];
+
+/// 剥离消息开头由外壳层注入的上下文块，返回真实用户发言。
+///
+/// # 动机
+///
+/// Web 端把「计划模式指令 / Web 计划 / Web 待办」三类块前置拼进 user 文本再
+/// 入库（`prompt_with_web_context`）。规则式 goal 提取拿到的 `user_input`
+/// 因此以注入块开头，会被当作任务描述写进会话级 `task_state.goal`，再经
+/// Current Task 槽位**每轮注入** —— 一次注入即永久固化，且新会话不复位
+/// （2026-11-19 实证：新会话 `session-1795017862696-0` 的 goal 首行即
+/// `[Web 计划（用户在 Web 端维护…）]`，导致「新开会话却带着旧任务」）。
+///
+/// # 规则
+///
+/// 从首行起，命中 [`INJECTED_PREFIX_HEADERS`] 即吞掉该块直到空行为止（块内
+/// 不含空行，与注入端 `\n\n` 分隔一致）；遇到非注入行即停止。全部被吞掉时
+/// 返回空串 —— [`should_update_goal`] 对空串返回 false，goal 保持原值。
+///
+/// 只剥离**开头**的连续块，不做全文替换：用户正文里出现的同形文本（如引用
+/// 一段日志）不受影响。
+#[must_use]
+pub fn strip_injected_prefix(text: &str) -> &str {
+    let mut rest = text.trim_start();
+    loop {
+        let is_injected = INJECTED_PREFIX_HEADERS
+            .iter()
+            .any(|header| rest.starts_with(header));
+        if !is_injected {
+            return rest.trim_end();
+        }
+        // 块以空行结束（注入端用 `\n\n` 分隔块与正文）。
+        match rest.find("\n\n") {
+            Some(index) => rest = rest[index + 2..].trim_start(),
+            None => return "",
+        }
+    }
+}
+
 /// 过程性/行动性开头词 —— 以这些开头的行描述的是"正在做什么/计划做什么"
 /// (如"开始调查根因"),不是已确认的结论,不应进入 findings。
 /// 防过程噪声污染 findings(小写匹配,英文带尾空格)。
@@ -193,12 +237,16 @@ const FINDING_KEYWORDS: &[&str] = &[
 /// 结论陈述强标记 —— 无冒号的陈述若含以下任一,也视为已确认结论
 /// (如"根因是缓存失效""测试 PASS")。仅命中关键词但既无冒号也无强标记
 /// 的行(如"正在讨论根因的可能性")不进入 findings,防止状态被噪声污染。
+///
+/// 注意这里**不得出现裸 `结论`**:它会把"## 结论""本节结论待定"这类结构性
+/// 行/未定陈述一并放行。只收"结论是/结论为"这种主谓完整的判断句。
 const FINDING_STRONG_MARKERS: &[&str] = &[
     "根因是",
     "原因是",
     "确认",
     "已验证",
-    "结论",
+    "结论是",
+    "结论为",
     "已修复",
     "修复了",
     "PASS",
@@ -206,6 +254,63 @@ const FINDING_STRONG_MARKERS: &[&str] = &[
     "found that",
     "verified",
 ];
+
+/// 结构化标记行判定:Markdown 标题/表格行/引用块/代码围栏/分隔线。
+///
+/// 这类行是**排版结构**而非结论陈述。它们命中关键词纯属偶然——`## 结论`
+/// 命中"结论"、`| 文献 | 结论 | 影响 |` 命中"结论"——若放进 findings,
+/// 会让"已完成项"槽位被表格表头与章节标题占满,把真正的结论挤掉
+/// (实测:简报里出现过 `| 文献 | 结论 | 对本实现的影响 |` 这类条目)。
+fn is_structural_markup(line: &str) -> bool {
+    let raw = line.trim();
+    if raw.is_empty() {
+        return false;
+    }
+    // 分隔线 `---` / `===` / `|---|---|` / `***`:只由标点组成。
+    //
+    // 必须在剥离项目符号**之前**判定:下面 `trim_start_matches('-')` 会把
+    // `---` 整行剥成空串,而空串会被后续的 `!trimmed.is_empty()` 短路放行,
+    // 导致分隔线漏判(2026-11-19 实测:`---` 与 `|---|---|` 混入 findings)。
+    if raw
+        .chars()
+        .all(|c| matches!(c, '-' | '=' | '|' | ':' | '*' | '_' | '+' | ' ' | '\t'))
+    {
+        return true;
+    }
+    let trimmed = raw.trim_start_matches(['·', '-', '*', '+', ' ']);
+    if trimmed.starts_with('#')
+        || trimmed.starts_with('|')
+        || trimmed.starts_with('>')
+        || trimmed.starts_with("```")
+        || trimmed.starts_with("~~~")
+    {
+        return true;
+    }
+    false
+}
+
+/// 条目级噪声判定 —— 已落盘条目是否该在加载时剔除。
+///
+/// 与 [`is_structural_markup`] 的区别:后者只认 Markdown 结构前缀(以 `#`/`|`
+/// 开头等),漏掉了**纯标签行** —— 以冒号结尾、冒号后没有任何陈述的行,如
+/// `conclusions:`、`## 结论:`、`**修复**(最小改动,两文件):`。这类行是章节
+/// 标题或"即将展开"的引子,不是结论本身,却因含关键词/含冒号而通过了提取
+/// 门槛(2026-11-19 实测:122 个会话状态文件中 13 条结构性行 + 25 条纯标签行
+/// 占据了「已完成项」槽位,把真正的结论挤了出去)。
+///
+/// 判定顺序:空 → 结构前缀 → 纯标签(以冒号结尾且无后续内容)。
+fn is_noise_entry(entry: &str) -> bool {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if is_structural_markup(trimmed) {
+        return true;
+    }
+    // 纯标签行:以半角/全角冒号结尾 ⇒ 冒号后无陈述内容。
+    // 注意不能放宽成"含冒号" —— `根因:缓存失效` 正是要保留的结论形态。
+    trimmed.ends_with(':') || trimmed.ends_with('：')
+}
 
 /// 任务状态:当前目标 + 已确认的关键发现 + 已收尾任务。
 ///
@@ -228,15 +333,52 @@ pub struct TaskState {
 
 impl TaskState {
     /// 从 `<workspace>/.claw/task_state.json` 加载,失败/不存在返回 None。
+    ///
+    /// 加载时执行 [`sanitize`](Self::sanitize) —— **存量污染自愈**。提取端的
+    /// 修复(见 [`is_noise_entry`])只能阻断新增污染,已落盘的噪声条目会随
+    /// 会话 resume 从磁盘原样复活,并经 Current Task 槽位每轮注入。改磁盘
+    /// 文件不可行(进程退出时会被内存态覆写),因此在读取路径上过滤。
     #[must_use]
     pub fn load(path: &Path) -> Option<Self> {
         let content = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&content).ok()
+        let mut state: Self = serde_json::from_str(&content).ok()?;
+        state.sanitize();
+        Some(state)
+    }
+
+    /// 剔除三个条目列表中的噪声条目(结构性标记行 / 纯标签行)。
+    ///
+    /// 幂等:对已净化状态再调用不产生变化。不清空 `updated_at_ms` ——
+    /// 净化是读取期视图修正,不代表任务状态本身有新进展。
+    pub fn sanitize(&mut self) {
+        let is_clean = |items: &mut Vec<String>| {
+            items.retain(|item| !is_noise_entry(item));
+        };
+        is_clean(&mut self.findings);
+        is_clean(&mut self.completed_subgoals);
+        is_clean(&mut self.closed_tasks);
+        // goal 同样可能被注入块或标题行污染(实测:`[Web 计划…]` 首行)。
+        // 剥离后为空说明原值是纯注入块 —— 此时清空,避免空目标经
+        // `render_for_prompt` 产生 "- 目标: " 空壳行。
+        let stripped = strip_injected_prefix(&self.goal).trim().to_string();
+        if stripped.is_empty() || is_noise_entry(&stripped) {
+            self.goal.clear();
+        } else if stripped != self.goal {
+            self.goal = truncate(&stripped, TASK_GOAL_MAX_CHARS);
+        }
     }
 
     /// 持久化到磁盘。失败返回错误信息(不 panic,不阻断主流程)。
+    ///
+    /// 写盘前先 [`sanitize`](Self::sanitize) —— **写路径自愈**。只读路径的
+    /// 净化(`load`)挡不住这一条:`conversation.rs` 更新任务状态时优先用
+    /// 内存态 `self.task_state.clone()`,不经过 `load`,内存里的存量噪声
+    /// 会被原样序列化回磁盘,形成"净化→复写→再污染"的循环。
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let content = serde_json::to_string_pretty(self).map_err(|e| format!("serialize: {e}"))?;
+        let mut clean = self.clone();
+        clean.sanitize();
+        let content =
+            serde_json::to_string_pretty(&clean).map_err(|e| format!("serialize: {e}"))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
         }
@@ -251,7 +393,9 @@ impl TaskState {
     /// - `assistant_texts`:本 turn 的 assistant 文本块。逐行扫描含
     ///   [`FINDING_KEYWORDS`] 信号词的行,去重后追加为新发现(保留最新 N 条)。
     pub fn update_from_turn(&mut self, user_input: &str, assistant_texts: &[String]) {
-        let trimmed = user_input.trim();
+        // 外壳层注入的上下文块不是用户发言，先剥离再判定，否则注入块会被
+        // 固化成 goal 并经 Current Task 槽位每轮注入（见 strip_injected_prefix）。
+        let trimmed = strip_injected_prefix(user_input).trim();
         let goal = truncate(trimmed, TASK_GOAL_MAX_CHARS);
         if should_update_goal(&goal) {
             if !is_same_task(&self.goal, &goal) {
@@ -264,6 +408,10 @@ impl TaskState {
             for line in text.lines() {
                 let line = line.trim();
                 if line.is_empty() {
+                    continue;
+                }
+                // 排版结构行不是结论陈述（见 `is_structural_markup`）。
+                if is_structural_markup(line) {
                     continue;
                 }
                 // 排除过程性/行动性行("开始调查根因"),只保留结论陈述
@@ -577,6 +725,58 @@ mod tests {
     }
 
     #[test]
+    fn strip_injected_prefix_removes_web_plan_block() {
+        // 现场复现:新会话首条 user 文本 = 注入块 + 用户真实提问。
+        let input = "[Web 计划（用户在 Web 端维护，作为当前执行计划）]\n\
+                     任务: 第一性原理回答 5 项\n\
+                     1. [done] 冒烟\n\n\
+                     你好，我想了解一下记忆机制";
+        assert_eq!(strip_injected_prefix(input), "你好，我想了解一下记忆机制");
+    }
+
+    #[test]
+    fn strip_injected_prefix_handles_all_three_blocks() {
+        let input = "[计划模式] 当前会话处于计划模式：先用计划形式回应。\n\n\
+                     [Web 待办状态（用户在 Web 端维护，可作为当前任务清单）]\n\
+                     - [ ] 写测试\n\n\
+                     真实提问";
+        assert_eq!(strip_injected_prefix(input), "真实提问");
+    }
+
+    #[test]
+    fn strip_injected_prefix_keeps_plain_user_text() {
+        // 无注入块时原样返回（仅去首尾空白）。
+        assert_eq!(strip_injected_prefix("  修复缓存缺陷  "), "修复缓存缺陷");
+        // 正文中出现的同形文本不受影响（只剥离开头连续块）。
+        let mid = "看这段日志\n[Web 计划] 是注入的";
+        assert_eq!(strip_injected_prefix(mid), mid);
+    }
+
+    #[test]
+    fn injected_prefix_does_not_pollute_goal() {
+        // 端到端:注入块不得进入 goal，且原有 goal 不被覆盖。
+        let mut state = ts();
+        state.update_from_turn("调查缓存命中率下降", &[]);
+        let goal_before = state.goal.clone();
+        let injected = "[Web 计划（用户在 Web 端维护，作为当前执行计划）]\n\
+                        任务: 实施 5 项\n\n";
+        state.update_from_turn(injected, &[]);
+        assert_eq!(state.goal, goal_before, "纯注入块不应改动 goal");
+
+        // 注入块 + 真实提问 → goal 取真实提问部分。
+        let injected_with_text = "[Web 计划（用户在 Web 端维护，作为当前执行计划）]\n\
+                                  任务: 实施 5 项\n\n\
+                                  帮我检查记忆机制是否完善";
+        state.update_from_turn(injected_with_text, &[]);
+        assert!(
+            !state.goal.contains("Web 计划"),
+            "goal 不应含注入块: {}",
+            state.goal
+        );
+        assert!(state.goal.contains("记忆机制"), "{}", state.goal);
+    }
+
+    #[test]
     fn update_captures_goal_and_findings() {
         let mut state = ts();
         state.update_from_turn(
@@ -710,6 +910,64 @@ mod tests {
         );
         assert!(state.findings.iter().any(|f| f.contains("缓存过期")));
         assert!(state.findings.iter().any(|f| f.contains("PASS")));
+    }
+
+    #[test]
+    fn structural_markup_never_becomes_finding() {
+        // 实测污染:固定记忆的「已完成项」被 Markdown 表格表头与章节标题占满
+        // (`| 文献 | 结论 | 对本实现的影响 |`、`## 结论`)。它们是排版结构,
+        // 命中"结论"纯属偶然,进入 findings 会把真结论挤掉。
+        let mut state = ts();
+        state.update_from_turn(
+            "排查渲染层污染",
+            &[
+                "| 文献 | 结论 | 对本实现的影响 |".to_string(),
+                "|---|---|---|".to_string(),
+                "## 结论".to_string(),
+                "### 三、遗留污染清理".to_string(),
+                "> 结论:引用块不是结论陈述".to_string(),
+                "- 结论:列表项里的才是真结论".to_string(),
+            ],
+        );
+        assert!(
+            !state
+                .findings
+                .iter()
+                .any(|f| f.contains('|') || f.starts_with('#') || f.starts_with('>')),
+            "结构性行不得进入 findings: {:?}",
+            state.findings
+        );
+        assert!(
+            state.findings.iter().any(|f| f.contains("列表项里")),
+            "真正的列表结论应保留: {:?}",
+            state.findings
+        );
+    }
+
+    #[test]
+    fn bare_conclusion_marker_does_not_admit_headings() {
+        // `FINDING_STRONG_MARKERS` 曾含裸 "结论",使任何含该词的行(含
+        // `## 结论`)都过 is_conclusion。改为"结论是/结论为"后,未定陈述
+        // 与结构性行都挡得住,而完整判断句仍进得来。
+        let mut state = ts();
+        state.update_from_turn(
+            "验证标记收紧",
+            &[
+                "结论待定".to_string(),
+                "本节结论将在下轮补充".to_string(),
+                "结论是缓存层失效".to_string(),
+            ],
+        );
+        assert!(
+            !state.findings.iter().any(|f| f.contains("待定")),
+            "未定陈述不得进入 findings: {:?}",
+            state.findings
+        );
+        assert!(
+            state.findings.iter().any(|f| f.contains("缓存层失效")),
+            "完整判断句应保留: {:?}",
+            state.findings
+        );
     }
 
     #[test]
@@ -866,5 +1124,89 @@ mod tests {
         let loaded = TaskState::load(&path).expect("load");
         assert_eq!(loaded.completed_subgoals, state.completed_subgoals);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn is_noise_entry_rejects_markup_and_label_only_lines() {
+        // 结构性行:标题 / 表格 / 引用 / 围栏 / 分隔线
+        for line in [
+            "## 结论",
+            "### 复核结论",
+            "| 文献 | 结论 | 对本实现的影响 |",
+            "| Q | 结论 | 提交 | 证据 |",
+            "> 引用块里的结论",
+            "```",
+            "|---|---|",
+            "---",
+        ] {
+            assert!(is_noise_entry(line), "should be noise: {line}");
+        }
+        // 纯标签行:冒号后无陈述(半角/全角)
+        for line in ["conclusions:", "**修复**(最小改动,两文件):", "本轮收尾："] {
+            assert!(is_noise_entry(line), "should be noise: {line}");
+        }
+        // 真正的结论形态必须保留 —— 含冒号但有陈述内容
+        for line in [
+            "根因:缓存失效",
+            "根因是缓存失效",
+            "测试 PASS",
+            "修复了注入块未剥离的问题",
+        ] {
+            assert!(!is_noise_entry(line), "should be kept: {line}");
+        }
+    }
+
+    #[test]
+    fn load_sanitizes_legacy_polluted_entries() {
+        // 模拟磁盘上的存量污染:渲染层此前把标题/表格行写进了三个列表。
+        let path = std::env::temp_dir().join(format!(
+            "claw-task-state-sanitize-{}-{}.json",
+            std::process::id(),
+            now_ms()
+        ));
+        let polluted = serde_json::json!({
+            "goal": "[Web 计划（用户在 Web 端维护，作为当前执行计划）]\n任务: 旧任务\n\n真实目标",
+            "findings": [
+                "## 结论:机制没有被破坏",
+                "| 文献 | 结论 | 对本实现的影响 |",
+                "conclusions:",
+                "根因:缓存失效",          // 应保留
+            ],
+            "completed_subgoals": ["## 已保存（本轮实测确认）", "拆分 token 校验"],
+            "closed_tasks": ["Newly compacted context:", "旧任务已完成"],
+            "updated_at_ms": 1_700_000_000_000i64,
+        });
+        std::fs::write(&path, serde_json::to_string(&polluted).unwrap()).expect("write");
+
+        let loaded = TaskState::load(&path).expect("load");
+        assert_eq!(loaded.findings, vec!["根因:缓存失效".to_string()]);
+        assert_eq!(
+            loaded.completed_subgoals,
+            vec!["拆分 token 校验".to_string()]
+        );
+        assert_eq!(loaded.closed_tasks, vec!["旧任务已完成".to_string()]);
+        // goal 剥离注入块后保留真实部分,而非整体清空。
+        assert!(!loaded.goal.starts_with("[Web 计划"));
+        assert!(loaded.goal.contains("真实目标"));
+
+        // 幂等:再次净化不改变结果。
+        let mut again = loaded.clone();
+        again.sanitize();
+        assert_eq!(again, loaded);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sanitize_clears_goal_that_is_pure_injected_block() {
+        let mut state = ts();
+        state.goal =
+            "[Web 待办状态（用户在 Web 端维护，可作为当前任务清单）]\n- [ ] 某待办".to_string();
+        state.sanitize();
+        assert!(
+            state.goal.is_empty(),
+            "纯注入块应清空 goal, got {:?}",
+            state.goal
+        );
     }
 }
