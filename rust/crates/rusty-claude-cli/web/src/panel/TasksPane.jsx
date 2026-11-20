@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { api, postJson, withWorkspace } from '../api'
 
-const EMPTY_TASKS = { todos: [], tasks: [], crons: [], plan_mode: null }
+const EMPTY_TASKS = { todos: [], tasks: [], crons: [], plan_mode: null, active_plan_id: null }
 const EMPTY_PLAN = { enabled: false, approved: false, revision: 0, source: 'none', plan: null }
 
 const STATUS_OPTIONS = [
@@ -33,6 +33,9 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError 
   const [data, setData] = useState(EMPTY_TASKS)
   const [goal, setGoal] = useState(null)
   const [plans, setPlans] = useState([])
+  // 当前计划 id：由 /tasks 快照与 tasks 事件维护，用于在只读列表里标出
+  // 面板正在展示的那份计划（计划事件本身按会话推送，不按 id 过滤）。
+  const [activePlanId, setActivePlanId] = useState(null)
   const [webTodos, setWebTodos] = useState([])
   const [planState, setPlanState] = useState(EMPTY_PLAN)
   const [draft, setDraft] = useState({ task_summary: '', steps: [] })
@@ -85,6 +88,7 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError 
       api(sessionPath('/plan')).catch(() => null),
     ]).then(([tasks, goalBody, planBody, todoBody, planBody2]) => {
       setData(tasks)
+      setActivePlanId(tasks.active_plan_id || null)
       setGoal(goalBody.goal)
       setPlans(planBody.plans || [])
       const revision = Number(todoBody.revision || 0)
@@ -106,6 +110,7 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError 
     firstConnectedRun.current = true
     prevConnected.current = connected
     setData(EMPTY_TASKS)
+    setActivePlanId(null)
     setWebTodos([])
     setPlans([])
     setGoal(null)
@@ -138,6 +143,7 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError 
         break
       case 'plan':
         applyPlan(payload.state)
+        setActivePlanId((payload.state && payload.state.plan && payload.state.plan.id) || null)
         break
       case 'plan_mode':
         setData((prev) => ({ ...prev, plan_mode: Boolean(payload.enabled) }))
@@ -145,7 +151,10 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError 
         setPlanState((prev) => (prev.source === 'web' ? prev : { ...prev, enabled: Boolean(payload.enabled) }))
         break
       case 'tasks':
-        if (payload.tasks) setData(payload.tasks)
+        if (payload.tasks) {
+          setData(payload.tasks)
+          setActivePlanId(payload.tasks.active_plan_id || null)
+        }
         break
       case 'plans':
         setPlans(payload.plans || [])
@@ -349,6 +358,7 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError 
             <details key={item.id} className="plan">
               <summary>
                 <span>▤ {(item.plan && item.plan.task_summary) || item.plan?.title || item.id}</span>
+                {item.id === activePlanId && <span className="chip">当前</span>}
                 <span className="muted">{status ? `${status} · ` : ''}{steps.length ? `${done}/${steps.length} 步` : ''}</span>
               </summary>
               {steps.length > 0
