@@ -444,6 +444,22 @@ fn hit_rate_pct(read_tokens: u64, creation_tokens: u64) -> u64 {
     }
 }
 
+/// 命中率的**展示**形式:无数据时明确标注 `n/a`,而非 `0%`。
+///
+/// 动机(2026-11-20 实测):provider 不回传 usage 缓存字段时,该 session 的
+/// `read`/`creation` 均为 0。旧渲染把它印成 `hit=0%`,与「命中率真的为 0%」
+/// 无法区分 —— 实测最近 15 个主会话中有 12 个是 `read=0 creation=0`,把这
+/// 12 个当 0% 计入分母会让整体指标凭空偏低,并诱发错误归因(把「没数据」
+/// 读成「缓存全失效」)。这与 dl-97/98 的口径问题是两码事:那是口径混用,
+/// 这是**缺失被当成零**。
+fn hit_rate_display(read_tokens: u64, creation_tokens: u64) -> String {
+    if read_tokens + creation_tokens == 0 {
+        "n/a".to_string()
+    } else {
+        format!("{}%", hit_rate_pct(read_tokens, creation_tokens))
+    }
+}
+
 /// DeepSeek 官方口径:**单请求** `hit / (hit + miss)`,即一次请求内命中 token 占
 /// 该次请求全部 prompt token 的比例。
 ///
@@ -628,8 +644,14 @@ fn render_token_lines(agg: &CacheStatsAggregate) -> Vec<String> {
             agg.creation_tokens
         ),
         format!(
-            "  累计命中率:{}%  (claw 自加口径:read/(read+creation),非 DeepSeek 官方)",
-            agg.hit_rate_pct()
+            "  累计命中率:{}  (claw 自加口径:read/(read+creation),非 DeepSeek 官方)",
+            // 聚合 read+creation==0(全部分会话都无 usage 数据)时印 n/a,
+            // 而不是 0% —— 「没有数据」与「命中率为零」是两件事。
+            if agg.read_tokens + agg.creation_tokens == 0 {
+                "n/a".to_string()
+            } else {
+                format!("{}%", agg.hit_rate_pct())
+            }
         ),
     ]
 }
@@ -660,11 +682,11 @@ fn render_anomaly_lines(
             session.stats.last_cache_creation_input_tokens,
         ) {
             lines.push(format!(
-                "  last_response             : [{}] read={} creation={} hit_rate={}%",
+                "  last_response             : [{}] read={} creation={} hit_rate={}",
                 session.name,
                 read,
                 creation,
-                hit_rate_pct(u64::from(read), u64::from(creation))
+                hit_rate_display(u64::from(read), u64::from(creation))
             ));
         }
     }
@@ -684,8 +706,13 @@ fn render_subagent_lines(
             agg.creation_tokens
         ),
         format!(
-            "  累计命中率:{}%  (claw 自加口径:read/(read+creation),非 DeepSeek 官方)",
-            agg.hit_rate_pct()
+            "  累计命中率:{}  (claw 自加口径:read/(read+creation),非 DeepSeek 官方)",
+            // 无 usage 数据时印 n/a,不得印 0%(同 render_token_lines)。
+            if agg.read_tokens + agg.creation_tokens == 0 {
+                "n/a".to_string()
+            } else {
+                format!("{}%", agg.hit_rate_pct())
+            }
         ),
         format!("  总 break 事件             : {}", agg.breaks.total()),
     ];
@@ -695,11 +722,11 @@ fn render_subagent_lines(
             session.stats.last_cache_creation_input_tokens,
         ) {
             lines.push(format!(
-                "  last_response             : [{}] read={} creation={} hit_rate={}%",
+                "  last_response             : [{}] read={} creation={} hit_rate={}",
                 session.name,
                 read,
                 creation,
-                hit_rate_pct(u64::from(read), u64::from(creation))
+                hit_rate_display(u64::from(read), u64::from(creation))
             ));
         }
     }
@@ -709,12 +736,13 @@ fn render_subagent_lines(
 fn render_session_line(session: &SessionCacheStatsSnapshot) -> String {
     let kind = if session.is_subagent { "子" } else { "主" };
     let mut line = format!(
-        "  [{kind}] {:48} : tracked={} read={} creation={} hit={}% unexpected={} expected={} last_break={}",
+        "  [{kind}] {:48} : tracked={} read={} creation={} hit={} unexpected={} expected={} last_break={}",
         session.name,
         session.stats.tracked_requests,
         session.stats.total_cache_read_input_tokens,
         session.stats.total_cache_creation_input_tokens,
-        hit_rate_pct(
+        // 无数据时印 n/a 而非 0%,避免「缺失」被误读成「全部未命中」。
+        hit_rate_display(
             session.stats.total_cache_read_input_tokens,
             session.stats.total_cache_creation_input_tokens,
         ),
@@ -2601,9 +2629,9 @@ mod cache_stats_tests {
     use serde_json::Value;
 
     use super::{
-        collect_session_cache_stats, hit_rate_pct, newest_session, official_hit_rate_pct,
-        render_cache_stats_json, render_cache_stats_text, CacheBreakStats, CacheStatsAggregate,
-        SessionCacheStatsSnapshot,
+        collect_session_cache_stats, hit_rate_display, hit_rate_pct, newest_session,
+        official_hit_rate_pct, render_cache_stats_json, render_cache_stats_text, CacheBreakStats,
+        CacheStatsAggregate, SessionCacheStatsSnapshot,
     };
 
     fn temp_root(prefix: &str) -> PathBuf {
@@ -2797,6 +2825,21 @@ mod cache_stats_tests {
         assert_eq!(hit_rate_pct(1_000, 0), 100);
         assert_eq!(hit_rate_pct(0, 1_696), 0);
         assert_eq!(hit_rate_pct(9, 1), 90);
+    }
+
+    /// 展示层:无 usage 数据(read+creation==0)必须印 `n/a`,不得印 `0%`。
+    ///
+    /// 实测依据(2026-11-20):最近 15 个主会话中 12 个是 read=0/creation=0
+    /// (provider 未回传 usage 缓存字段)。旧渲染把它们印成 hit=0%,与「命中率
+    /// 真的为零」无法区分,足以让整体指标凭空偏低并诱发错误归因。
+    #[test]
+    fn hit_rate_display_marks_missing_data_as_na() {
+        assert_eq!(hit_rate_display(0, 0), "n/a", "无数据不得印 0%");
+        assert_eq!(hit_rate_display(0, 1_696), "0%", "真有全部未命中时印 0%");
+        assert_eq!(hit_rate_display(1_000, 0), "100%");
+        assert_eq!(hit_rate_display(9, 1), "90%");
+        // 有任意一侧非零即为「有数据」,必须给出百分比而非 n/a。
+        assert_ne!(hit_rate_display(1, 0), "n/a");
     }
 
     /// 官方口径 = 单请求 hit/(hit+miss),取最新一条 session 的 last_response 快照;
