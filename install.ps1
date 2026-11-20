@@ -1,4 +1,4 @@
-# Claw Plus Windows one-click installer
+﻿# Claw Plus Windows one-click installer
 #
 # Mirrors install.sh (Unix): detect environment -> check Rust toolchain ->
 # build claw binaries -> deploy to ~/.cargo/bin (already on PATH) -> verify ->
@@ -152,17 +152,82 @@ $BIN_SRC = Join-Path $RUST_DIR "target\$BUILD_PROFILE"
 # claw.exe / claw-plus.exe 是 cargo 产物；claw-web.exe 是 claw.exe 的入口副本，
 # 桌面快捷方式「CLAW Web UI」直接启动它，必须同步更新，否则快捷方式仍是旧版。
 $BINARIES = @('claw.exe', 'claw-plus.exe')
+
+# 部署前停止占用目标文件的进程。
+# Windows 会锁定正在运行的 exe，直接覆盖可能失败或留下旧版本 —— 必须先停进程，
+# 复制后校验哈希，最后恢复此前在运行的 Web UI。
+$PROCESS_NAMES = @('claw', 'claw-plus', 'claw-web')
+$RESTART_WEB = $false
+$running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $PROCESS_NAMES -contains $_.ProcessName })
+if ($running.Count -gt 0) {
+    $RESTART_WEB = [bool]($running | Where-Object { $_.ProcessName -eq 'claw-web' })
+    foreach ($proc in $running) {
+        Info "Stopping $($proc.ProcessName) (PID $($proc.Id)) to release file lock"
+        try {
+            Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+        } catch {
+            Error2 "Failed to stop $($proc.ProcessName) (PID $($proc.Id)): $($_.Exception.Message)"
+            exit 1
+        }
+    }
+    # 等待文件句柄释放
+    for ($i = 0; $i -lt 20; $i++) {
+        $still = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $PROCESS_NAMES -contains $_.ProcessName })
+        if ($still.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    $still = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $PROCESS_NAMES -contains $_.ProcessName })
+    if ($still.Count -gt 0) {
+        Error2 "Processes still running after stop: $(($still | ForEach-Object { $_.ProcessName }) -join ', ')"
+        exit 1
+    }
+    Ok "Released file locks"
+}
+
 foreach ($bin in $BINARIES) {
     $src = Join-Path $BIN_SRC $bin
     if (-not (Test-Path $src)) {
         Error2 "Build artifact not found: $src"
         exit 1
     }
-    Copy-Item -Path $src -Destination (Join-Path $DEPLOY_DIR $bin) -Force
+    $dst = Join-Path $DEPLOY_DIR $bin
+    try {
+        Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop
+    } catch {
+        Error2 "Failed to deploy ${bin}: $($_.Exception.Message)"
+        exit 1
+    }
+    $srcHash = (Get-FileHash -LiteralPath $src -Algorithm SHA256).Hash
+    $dstHash = (Get-FileHash -LiteralPath $dst -Algorithm SHA256).Hash
+    if ($srcHash -ne $dstHash) {
+        Error2 "Deployed $bin hash mismatch (src=$srcHash dst=$dstHash)"
+        exit 1
+    }
     Ok "Deployed $bin -> $DEPLOY_DIR"
     if ($bin -eq 'claw.exe') {
-        Copy-Item -Path $src -Destination (Join-Path $DEPLOY_DIR 'claw-web.exe') -Force
+        $webDst = Join-Path $DEPLOY_DIR 'claw-web.exe'
+        try {
+            Copy-Item -LiteralPath $src -Destination $webDst -Force -ErrorAction Stop
+        } catch {
+            Error2 "Failed to deploy claw-web.exe: $($_.Exception.Message)"
+            exit 1
+        }
+        $webHash = (Get-FileHash -LiteralPath $webDst -Algorithm SHA256).Hash
+        if ($srcHash -ne $webHash) {
+            Error2 "Deployed claw-web.exe hash mismatch (src=$srcHash dst=$webHash)"
+            exit 1
+        }
         Ok "Deployed claw-web.exe -> $DEPLOY_DIR"
+    }
+}
+
+if ($RESTART_WEB) {
+    try {
+        Start-Process -FilePath (Join-Path $DEPLOY_DIR 'claw-web.exe') -WorkingDirectory $HOME -ErrorAction Stop
+        Ok "Restarted claw-web.exe"
+    } catch {
+        Error2 "Failed to restart claw-web.exe: $($_.Exception.Message)"
+        exit 1
     }
 }
 Write-Host ""
