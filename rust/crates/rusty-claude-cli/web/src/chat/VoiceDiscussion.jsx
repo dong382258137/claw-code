@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react'
 import { withToken } from '../api'
 import { Icon } from '../shared/icons.jsx'
 import { VOICE_BAR_COUNT, VOICE_FLAT_BARS } from '../shared/constants.js'
-import { speechText, voiceClock } from '../shared/utils.js'
+import { createDictation, speechText, voiceClock } from '../shared/utils.js'
 
 // 语音讨论 = 纯对话，不是 agent 任务。
 // 后端 /api/voice/chat 不走 LiveCli、不带工具、不写会话文件，
@@ -20,11 +20,7 @@ export function VoiceDiscussion({ model, onClose, onError, onDraft }) {
   const bodyRef = useRef(null)
   const openRef = useRef(true)
   const listeningRef = useRef(false)
-  const recognitionRef = useRef(null)
-  const finalRef = useRef('')
-  const interimRef = useRef('')
-  const sessionBaseRef = useRef('')
-  const restartTimerRef = useRef(0)
+  const dictationRef = useRef(null)
   const startedRef = useRef(Date.now())
   const elapsedTimerRef = useRef(0)
   const waveTimerRef = useRef(0)
@@ -104,11 +100,9 @@ export function VoiceDiscussion({ model, onClose, onError, onDraft }) {
   // 只停采集（麦克风 + 波形 + 朗读），不关闭面板、不中止在途请求。
   const stopCapture = () => {
     listeningRef.current = false
-    clearTimeout(restartTimerRef.current)
-    restartTimerRef.current = 0
-    const recognition = recognitionRef.current
-    recognitionRef.current = null
-    if (recognition) { try { recognition.stop() } catch (_) {} }
+    const dictation = dictationRef.current
+    dictationRef.current = null
+    dictation?.stop()
     stopWaveform()
     try { window.speechSynthesis?.cancel() } catch (_) {}
   }
@@ -174,11 +168,8 @@ export function VoiceDiscussion({ model, onClose, onError, onDraft }) {
 
   const submitUtterance = () => {
     if (busy) return
-    const text = (finalRef.current + interimRef.current).trim()
+    const text = (dictationRef.current?.text() || '').trim()
     if (!text) return
-    finalRef.current = ''
-    interimRef.current = ''
-    sessionBaseRef.current = ''
     sendUtterance(text)
   }
 
@@ -212,74 +203,31 @@ export function VoiceDiscussion({ model, onClose, onError, onDraft }) {
 
   const startListening = () => {
     if (!openRef.current || listeningRef.current) return
-    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition
-    if (!Recognition) {
+    // 识别会话由 createDictation 自动续接：浏览器单次会话约 60 秒会断，
+    // 长讨论靠断了就换新实例重开，不再依赖单次 start() 无限延续。
+    const dictation = createDictation({
+      lang: navigator.language || 'zh-CN',
+      onText: (text) => {
+        // 刻意不自动提交：停顿时长不能代表「说完了」，由用户点「发送这句」显式提交。
+        if (listeningRef.current) setInterim(text)
+      },
+      onFail: (message) => {
+        onError?.(message)
+        stopAll()
+        onClose()
+      },
+    })
+    if (!dictation) {
       onError?.('当前浏览器不支持语音讨论，请使用 Chrome / Edge')
       stopAll()
       onClose()
       return
     }
     listeningRef.current = true
-    finalRef.current = ''
-    interimRef.current = ''
-    sessionBaseRef.current = ''
+    dictationRef.current = dictation
     setInterim('')
     startWaveform()
-    const recognition = new Recognition()
-    recognition.lang = navigator.language || 'zh-CN'
-    recognition.continuous = true
-    recognition.interimResults = true
-    recognition.onresult = (event) => {
-      if (!listeningRef.current) return
-      let finalText = ''
-      let interimText = ''
-      for (let index = 0; index < event.results.length; index += 1) {
-        const result = event.results[index]
-        const transcript = result?.[0]?.transcript || ''
-        if (result.isFinal) finalText += transcript
-        else interimText += transcript
-      }
-      finalRef.current = sessionBaseRef.current + finalText
-      interimRef.current = interimText
-      const total = (finalRef.current + interimText).trim()
-      setInterim(total)
-      // 刻意不自动提交：停顿时长不能代表「说完了」，由用户点「发送这句」显式提交。
-    }
-    recognition.onerror = (event) => {
-      const code = event.error
-      if (code === 'aborted' || code === 'no-speech') return
-      const map = {
-        'not-allowed': '麦克风权限被拒绝，无法语音讨论',
-        'service-not-allowed': '麦克风权限被拒绝，无法语音讨论',
-        'audio-capture': '没有检测到可用的麦克风',
-        network: '语音识别服务不可用（需要联网）',
-      }
-      if (map[code]) {
-        onError?.(map[code])
-        stopAll()
-        onClose()
-      }
-    }
-    recognition.onend = () => {
-      if (!listeningRef.current) return
-      if (interimRef.current) {
-        finalRef.current += interimRef.current
-        interimRef.current = ''
-      }
-      sessionBaseRef.current = finalRef.current
-      restartTimerRef.current = window.setTimeout(() => {
-        if (!listeningRef.current) return
-        try { recognition.start() } catch (_) {}
-      }, 200)
-    }
-    recognitionRef.current = recognition
-    try {
-      recognition.start()
-    } catch (error) {
-      onError?.(`语音讨论启动失败：${error.message}`)
-      stopAll()
-      onClose()
-    }
+    dictation.start()
   }
 
   const pauseListening = () => {
@@ -314,14 +262,12 @@ export function VoiceDiscussion({ model, onClose, onError, onDraft }) {
   // 绝不直接发送——总结与语音转写都可能失真，用户必须保留最后决定权。
   const finishDiscussion = () => {
     if (busy) return
+    // 先把还没定稿的转写收下来，再停采集（stop 之后 dictation 内文本仍可取，但这里更直观）。
+    const tail = (dictationRef.current?.text() || '').trim()
     stopCapture()
     const items = [...logRef.current]
-    const tail = interimRef.current.trim()
     if (tail) items.push({ role: 'user', text: tail })
     setInterim('')
-    finalRef.current = ''
-    interimRef.current = ''
-    sessionBaseRef.current = ''
     if (!items.length) { onClose(); return }
     setBusy(true)
     changePhase('thinking')

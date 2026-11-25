@@ -1,26 +1,73 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { api, postJson, withWorkspace } from '../api'
+import { fmtTime } from '../shared/utils.js'
 
 const EMPTY_TASKS = { todos: [], tasks: [], crons: [], plan_mode: null, active_plan_id: null }
 const EMPTY_PLAN = { enabled: false, approved: false, revision: 0, source: 'none', plan: null }
 
-const STATUS_OPTIONS = [
-  ['pending', '待办'],
-  ['executing', '进行中'],
-  ['done', '完成'],
-  ['failed', '失败'],
-  ['skipped', '跳过'],
-]
+// 计划状态统一成后端 normalize 后的五种值：历史计划文件里还留着
+// `Succeeded`/`completed`/`in_progress` 等旧写法，前端读的时候再兜一次底。
+const normalizeStatus = (raw) => {
+  const value = String(raw || '').toLowerCase()
+  if (value === 'executing' || value === 'in_progress' || value === 'running') return 'executing'
+  if (value === 'succeeded' || value === 'completed' || value === 'done') return 'done'
+  if (value === 'failed') return 'failed'
+  if (value === 'skipped') return 'skipped'
+  return 'pending'
+}
 
-const statusLabel = (status) => STATUS_OPTIONS.find(([value]) => value === status)?.[1] || status
+const STATUS_LABEL = {
+  pending: '待办',
+  executing: '进行中',
+  done: '完成',
+  failed: '失败',
+  skipped: '跳过',
+}
 
-const stepsToDraft = (plan) =>
-  (plan && Array.isArray(plan.steps) ? plan.steps : []).map((step) => ({
-    id: step.id || '',
-    description: step.description || '',
-    acceptance_criteria: step.acceptance_criteria || '',
-    status: step.status || 'pending',
+const readSteps = (plan) =>
+  (plan && Array.isArray(plan.steps) ? plan.steps : []).map((step, index) => ({
+    id: step.id || `s${index + 1}`,
+    index: index + 1,
+    description: String(step.description || step.title || '').trim() || `第 ${index + 1} 步`,
+    acceptance: String(step.acceptance_criteria || '').trim(),
+    status: normalizeStatus(step.status),
   }))
+
+// 进度统计：完成率按全部步骤算，跳过计入「已处理」但不虚报完成率。
+const summarize = (steps) => {
+  const total = steps.length
+  const done = steps.filter((step) => step.status === 'done').length
+  const failed = steps.filter((step) => step.status === 'failed').length
+  const skipped = steps.filter((step) => step.status === 'skipped').length
+  const executing = steps.findIndex((step) => step.status === 'executing')
+  const pct = total ? Math.round((done / total) * 100) : 0
+  const tone = failed > 0
+    ? 'failed'
+    : executing >= 0
+      ? 'running'
+      : total > 0 && done + skipped === total
+        ? 'done'
+        : 'idle'
+  return { total, done, failed, skipped, executing, pct, tone }
+}
+
+const TONE_LABEL = { running: '执行中', done: '已完成', failed: '有失败', idle: '待执行' }
+
+const GOAL_STATE_LABEL = {
+  active: '进行中',
+  paused: '已暂停',
+  blocked: '受阻',
+  done: '已达成',
+  completed: '已达成',
+  failed: '未达成',
+}
+
+const goalTone = (state) => {
+  if (state === 'done' || state === 'completed') return 'done'
+  if (state === 'blocked' || state === 'failed') return 'failed'
+  if (state === 'active') return 'running'
+  return 'idle'
+}
 
 const putJson = (path, body) =>
   api(path, {
@@ -28,6 +75,16 @@ const putJson = (path, body) =>
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
+
+// 空态里的小图标：三条计划线 + 一点「待生成」的星芒。
+function PlanGlyph() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M4 6h10M4 12h7M4 18h9" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      <path d="M18 10.5v5M15.5 13h5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  )
+}
 
 export function TasksPane({ currentId, workspace, taskEvent, connected, onError }) {
   const [data, setData] = useState(EMPTY_TASKS)
@@ -38,26 +95,16 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError 
   const [activePlanId, setActivePlanId] = useState(null)
   const [webTodos, setWebTodos] = useState([])
   const [planState, setPlanState] = useState(EMPTY_PLAN)
-  const [draft, setDraft] = useState({ task_summary: '', steps: [] })
-  const [dirty, setDirty] = useState(false)
   const [newTodo, setNewTodo] = useState('')
-  const [saving, setSaving] = useState(false)
-  const [notice, setNotice] = useState('')
+  const [busy, setBusy] = useState(false)
 
   // 版本号用于丢弃乱序/重复事件：SSE 事件与 GET 快照都带 revision，
   // 只有更大的才覆盖，重连后旧快照不会把新状态冲掉。
   const todoRev = useRef(-1)
   const planRev = useRef(-1)
-  // 用户正在编辑时不让后台事件覆盖草稿。
-  const dirtyRef = useRef(false)
   // 断线重连（connected 由 App 的唯一事件流透传）后补一次快照。
   const prevConnected = useRef(connected)
   const firstConnectedRun = useRef(true)
-
-  const markDirty = useCallback((value) => {
-    dirtyRef.current = value
-    setDirty(value)
-  }, [])
 
   const applyPlan = useCallback((next) => {
     if (!next) return
@@ -65,12 +112,6 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError 
     if (revision < planRev.current) return
     planRev.current = revision
     setPlanState(next)
-    if (!dirtyRef.current) {
-      setDraft({
-        task_summary: (next.plan && next.plan.task_summary) || '',
-        steps: stepsToDraft(next.plan),
-      })
-    }
   }, [])
 
   const sessionPath = useCallback(
@@ -86,17 +127,17 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError 
       api(withWorkspace('/api/workspace/plans', workspace)).catch(() => ({ plans: [] })),
       api(sessionPath('/todos')).catch(() => ({ items: [], revision: 0 })),
       api(sessionPath('/plan')).catch(() => null),
-    ]).then(([tasks, goalBody, planBody, todoBody, planBody2]) => {
+    ]).then(([tasks, goalBody, plansBody, todoBody, planBody]) => {
       setData(tasks)
       setActivePlanId(tasks.active_plan_id || null)
       setGoal(goalBody.goal)
-      setPlans(planBody.plans || [])
+      setPlans(plansBody.plans || [])
       const revision = Number(todoBody.revision || 0)
       if (revision >= todoRev.current) {
         todoRev.current = revision
         setWebTodos(todoBody.items || [])
       }
-      if (planBody2) applyPlan(planBody2)
+      if (planBody) applyPlan(planBody)
     }).catch((error) => onError?.(`任务加载失败：${error.message}`))
   }, [applyPlan, currentId, onError, sessionPath, workspace])
 
@@ -106,7 +147,6 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError 
     if (!currentId) return undefined
     todoRev.current = -1
     planRev.current = -1
-    dirtyRef.current = false
     firstConnectedRun.current = true
     prevConnected.current = connected
     setData(EMPTY_TASKS)
@@ -115,10 +155,8 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError 
     setPlans([])
     setGoal(null)
     setPlanState(EMPTY_PLAN)
-    setDraft({ task_summary: '', steps: [] })
-    setDirty(false)
-    setNotice('')
-    setSaving(false)
+    setNewTodo('')
+    setBusy(false)
     loadAll()
     return undefined
     // connected 只在切换会话时取初始值，断线重连由下面的 effect 处理。
@@ -188,244 +226,309 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError 
     }
   }, [onError, sessionPath])
 
-  const editStep = (index, patch) => {
-    markDirty(true)
-    setDraft((prev) => ({
-      ...prev,
-      steps: prev.steps.map((step, i) => (i === index ? { ...step, ...patch } : step)),
-    }))
+  const addTodo = () => {
+    const text = newTodo.trim()
+    if (!text) return
+    saveTodos([...webTodos, { text, done: false }])
+    setNewTodo('')
   }
 
-  const addStep = () => {
-    markDirty(true)
-    setDraft((prev) => ({
-      ...prev,
-      steps: [...prev.steps, { id: '', description: '', acceptance_criteria: '', status: 'pending' }],
-    }))
-  }
-
-  const removeStep = (index) => {
-    markDirty(true)
-    setDraft((prev) => ({ ...prev, steps: prev.steps.filter((_, i) => i !== index) }))
-  }
-
-  const planBody = (extra = {}) => ({
-    plan_id: (planState.plan && planState.plan.id) || null,
-    task_summary: draft.task_summary,
-    steps: draft.steps.map((step) => ({
-      id: step.id || null,
-      description: step.description,
-      acceptance_criteria: step.acceptance_criteria,
-      status: step.status,
-    })),
-    ...extra,
-  })
-
-  const savePlan = async (extra = {}) => {
-    if (!currentId || saving) return null
-    setSaving(true)
-    try {
-      const next = await putJson(sessionPath('/plan'), planBody(extra))
-      markDirty(false)
-      applyPlan(next)
-      setNotice('计划已保存')
-      return next
-    } catch (error) {
-      onError?.(`计划保存失败：${error.message}`)
-      return null
-    } finally {
-      setSaving(false)
-    }
-  }
-
+  // 计划模式开关是唯一的写入口：计划内容本身全部由模型通过 create_plan /
+  // plan_update 维护，面板只负责只读展示。
   const togglePlanMode = async () => {
-    if (!currentId || saving) return
-    setSaving(true)
+    if (!currentId || busy) return
+    setBusy(true)
     try {
       const next = await putJson(sessionPath('/plan'), { enabled: !planState.enabled })
       applyPlan(next)
     } catch (error) {
       onError?.(`计划模式切换失败：${error.message}`)
     } finally {
-      setSaving(false)
-    }
-  }
-
-  const confirmPlan = async () => {
-    if (!currentId || saving) return
-    setSaving(true)
-    try {
-      // confirm 会把 approved 置真、计划模式置假，并按正常 prompt 通道入队一轮。
-      const next = await postJson(sessionPath('/plan/confirm'), planBody())
-      markDirty(false)
-      if (next.plan) applyPlan(next.plan)
-      setNotice('计划已确认，已提交给 agent 继续执行')
-    } catch (error) {
-      onError?.(`计划确认失败：${error.message}`)
-    } finally {
-      setSaving(false)
+      setBusy(false)
     }
   }
 
   if (!currentId) return <div className="empty">先选择会话</div>
-  const goalHtml = goal && (goal.text || goal.state) && (
-    <div className="goal">
-      <b>目标</b> {goal.text}
-      <div className="muted">状态 {goal.state || '—'} · tokens {goal.tokens_used || 0}{goal.token_budget ? ` / ${goal.token_budget}` : ''} · 阻塞 {goal.blocked_count || 0} 次</div>
-    </div>
-  )
+
   const plan = planState.plan
+  const steps = readSteps(plan)
+  const stats = summarize(steps)
+  const heroId = plan?.id || activePlanId
+  const heroUpdatedMs = planUpdatedMs(plans, heroId)
+  const archive = plans.filter((item) => item.id !== heroId && item.plan && typeof item.plan === 'object')
+  const agentTodos = data.todos || []
+  const openTodos = webTodos.filter((todo) => !todo.done).length
+  const activities = [
+    ...(data.tasks || []).map((task) => ({ tone: 'task', tool: task.tool, detail: task.detail })),
+    ...(data.crons || []).map((cron) => ({ tone: 'cron', tool: cron.tool, detail: cron.detail })),
+  ]
+  const goalText = goal && (goal.text || goal.state)
+  const hasGoal = Boolean(goalText)
+  const modeHint = planState.enabled
+    ? '计划模式已开启 · 模型会先规划再执行'
+    : '计划模式关闭 · 模型仍可自行创建计划'
+
   return (
-    <div className="pane">
-      <div className="pane-toolbar">
-        <button onClick={loadAll}>刷新</button>
-        <button className={planState.enabled ? 'active' : ''} disabled={saving} onClick={togglePlanMode}>
-          {planState.enabled ? '计划模式：开' : '计划模式：关'}
-        </button>
-        {planState.approved && <span className="chip">已确认</span>}
-        <span className={`task-conn ${connected ? 'on' : ''}`} title={connected ? '事件流已连接' : '事件流断开，正在重连'} />
+    <div className="pane tasks-pane">
+      <div className="tp-head">
+        <div className="tp-head-text">
+          <div className="tp-title">
+            任务与计划
+            <span className={`task-conn ${connected ? 'on' : ''}`} title={connected ? '事件流已连接' : '事件流断开，正在重连'} />
+          </div>
+          <div className="tp-sub">计划由模型在执行过程中自动维护</div>
+        </div>
+        <div className="tp-head-actions">
+          <button className="tp-icon-btn" onClick={loadAll} title="刷新" aria-label="刷新">
+            ↻
+          </button>
+          <button
+            className={`tp-mode ${planState.enabled ? 'on' : ''}`}
+            disabled={busy}
+            onClick={togglePlanMode}
+            title={modeHint}
+          >
+            <span className="tp-mode-track"><span className="tp-mode-thumb" /></span>
+            计划模式
+          </button>
+        </div>
       </div>
-      <div className="pane-body scroll">
-        {goalHtml}
-        <div className="group">计划（可编辑 · 保存后注入后续轮次）</div>
-        <div className="plan-edit">
-          {plan ? (
-            <>
-              <input
-                className="plan-summary"
-                value={draft.task_summary}
-                placeholder="任务摘要"
-                onChange={(event) => {
-                  markDirty(true)
-                  setDraft((prev) => ({ ...prev, task_summary: event.target.value }))
-                }}
-              />
-              {draft.steps.map((step, index) => (
-                <div className="plan-step" key={step.id || `new-${index}`}>
-                  <span className="plan-step-no">{index + 1}</span>
-                  <div className="plan-step-fields">
-                    <input
-                      value={step.description}
-                      placeholder="步骤描述"
-                      onChange={(event) => editStep(index, { description: event.target.value })}
-                    />
-                    <input
-                      className="plan-step-acceptance"
-                      value={step.acceptance_criteria}
-                      placeholder="验收标准（可选）"
-                      onChange={(event) => editStep(index, { acceptance_criteria: event.target.value })}
-                    />
-                  </div>
-                  <select value={step.status} onChange={(event) => editStep(index, { status: event.target.value })}>
-                    {STATUS_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-                  </select>
-                  <button className="ghost" title="删除该步骤" onClick={() => removeStep(index)}>×</button>
-                </div>
-              ))}
-              <div className="plan-actions">
-                <button onClick={addStep}>添加步骤</button>
-                <button disabled={saving || !dirty} onClick={() => savePlan()}>保存计划</button>
-                <button
-                  className="primary"
-                  disabled={saving || draft.steps.filter((step) => step.description.trim()).length === 0}
-                  onClick={confirmPlan}
-                >
-                  确认并继续
-                </button>
-                {dirty && <span className="muted">有未保存的修改</span>}
-                {notice && <span className="muted">{notice}</span>}
+
+      <div className="pane-body tp-body">
+        {plan ? (
+          <section className={`tp-card tp-plan ${stats.tone}`}>
+            <header className="tp-plan-head">
+              <div className="tp-ring" style={{ '--pct': stats.pct }} aria-label={`完成 ${stats.pct}%`}>
+                <span>{stats.pct}<i>%</i></span>
               </div>
-            </>
-          ) : (
-            <div className="plan-actions">
-              <button
-                disabled={saving}
-                onClick={() => savePlan({ steps: [{ description: '第一步', acceptance_criteria: '', status: 'pending' }] })}
-              >
-                新建计划
-              </button>
-              <span className="muted">还没有计划；也可以让 agent 处于计划模式后先生成</span>
+              <div className="tp-plan-head-main">
+                <div className="tp-eyebrow">
+                  当前计划
+                  <span className={`tp-pill ${stats.tone}`}>
+                    {stats.total ? TONE_LABEL[stats.tone] : '待补充'}
+                  </span>
+                  {planState.approved && <span className="tp-pill idle">已确认</span>}
+                </div>
+                <h3 className="tp-summary">{plan.task_summary || plan.title || '未命名计划'}</h3>
+                <div className="tp-plan-meta">
+                  <span>{stats.total ? `${stats.done}/${stats.total} 步完成` : '暂无步骤'}</span>
+                  {stats.executing >= 0 && (
+                    <span className="tp-live">正在执行第 {stats.executing + 1} 步</span>
+                  )}
+                  {stats.failed > 0 && <span className="tp-bad">{stats.failed} 步失败</span>}
+                  {heroUpdatedMs > 0 && <span>{fmtTime(heroUpdatedMs)} 更新</span>}
+                  {plan.id && <code>{plan.id}</code>}
+                </div>
+              </div>
+            </header>
+
+            <div className="tp-progress" role="progressbar" aria-valuenow={stats.pct} aria-valuemin={0} aria-valuemax={100}>
+              <i style={{ width: `${stats.pct}%` }} />
+            </div>
+
+            {steps.length > 0 ? (
+              <ol className="tp-steps">
+                {steps.map((step) => (
+                  <li key={step.id} className={`tp-step ${step.status}`}>
+                    <span className="tp-node" aria-hidden="true">
+                      {step.status === 'done' ? '✓' : step.status === 'failed' ? '✕' : step.status === 'skipped' ? '–' : ''}
+                    </span>
+                    <div className="tp-step-main">
+                      <div className="tp-step-text">
+                        <span className="tp-step-index">{step.index}</span>
+                        {step.description}
+                      </div>
+                      {step.acceptance && <div className="tp-accept">验收：{step.acceptance}</div>}
+                    </div>
+                    {(step.status === 'executing' || step.status === 'failed' || step.status === 'skipped') && (
+                      <span className={`tp-step-state ${step.status}`}>{STATUS_LABEL[step.status]}</span>
+                    )}
+                  </li>
+                ))}
+              </ol>
+            ) : (
+              <div className="tp-plan-empty">计划已创建，等待模型补充步骤。</div>
+            )}
+
+            <footer className="tp-foot">
+              <span>{modeHint}</span>
+              <span className="tp-foot-live">{connected ? '实时同步' : '连接中断'}</span>
+            </footer>
+          </section>
+        ) : (
+          <section className="tp-card tp-empty">
+            <div className="tp-empty-glyph"><PlanGlyph /></div>
+            <h3>还没有执行计划</h3>
+            <p>
+              发送任务后，模型会先调用 <code>create_plan</code> 拆出步骤，执行中用
+              <code>plan_update</code> 推进状态。这里只做只读展示，无需手动维护。
+            </p>
+            <div className="tp-empty-hint">
+              <span className={`tp-dot ${planState.enabled ? 'on' : ''}`} />
+              {modeHint}
+            </div>
+          </section>
+        )}
+
+        {hasGoal && (
+          <section className="tp-card tp-goal">
+            <div className="tp-goal-head">
+              <span className="tp-eyebrow">目标</span>
+              <span className={`tp-pill ${goalTone(goal.state)}`}>
+                {GOAL_STATE_LABEL[goal.state] || goal.state || '未设置'}
+              </span>
+            </div>
+            {goal.text && <p>{goal.text}</p>}
+            <div className="tp-goal-stats">
+              <span className="tp-stat"><b>{Number(goal.tokens_used || 0).toLocaleString()}</b> tokens</span>
+              {goal.token_budget ? <span className="tp-stat">预算 <b>{Number(goal.token_budget).toLocaleString()}</b></span> : null}
+              <span className="tp-stat">阻塞 <b>{goal.blocked_count || 0}</b> 次</span>
+            </div>
+            {goal.token_budget ? (
+              <div className="tp-progress slim">
+                <i style={{ width: `${Math.min(100, Math.round((Number(goal.tokens_used || 0) / Number(goal.token_budget)) * 100))}%` }} />
+              </div>
+            ) : null}
+          </section>
+        )}
+
+        {agentTodos.length > 0 && (
+          <section className="tp-section">
+            <div className="tp-section-head">
+              模型待办
+              <span className="tp-count">{agentTodos.length}</span>
+            </div>
+            <div className="tp-list">
+              {agentTodos.map((todo, index) => {
+                const done = ['completed', 'done'].includes(todo.status)
+                const running = ['in_progress', 'running'].includes(todo.status)
+                return (
+                  <div key={`${index}-${todo.content || ''}`} className={`tp-todo ${done ? 'done' : ''} ${running ? 'running' : ''}`}>
+                    <span className={`tp-node ${done ? 'done' : running ? 'executing' : 'pending'}`} aria-hidden="true">
+                      {done ? '✓' : ''}
+                    </span>
+                    <span className="tp-todo-text">{todo.content}</span>
+                    {todo.status && <span className="tp-todo-state">{running ? '进行中' : done ? '完成' : '待办'}</span>}
+                  </div>
+                )
+              })}
+            </div>
+          </section>
+        )}
+
+        {archive.length > 0 && (
+          <details className="tp-archive-group">
+            <summary>
+              计划档案
+              <span className="tp-count">{archive.length}</span>
+            </summary>
+            <div className="tp-archive">
+              {archive.map((item) => {
+                const itemSteps = readSteps(item.plan)
+                const itemStats = summarize(itemSteps)
+                return (
+                  <details key={item.id} className="tp-archive-item">
+                    <summary>
+                      <span className={`tp-dot ${itemStats.tone === 'done' ? 'on' : ''}`} />
+                      <span className="tp-archive-title">{item.plan.task_summary || item.plan.title || item.id}</span>
+                      <span className="tp-archive-pct">{itemStats.total ? `${itemStats.done}/${itemStats.total}` : '—'}</span>
+                    </summary>
+                    <div className="tp-archive-body">
+                      <div className="tp-progress slim"><i style={{ width: `${itemStats.pct}%` }} /></div>
+                      {itemSteps.length > 0 && (
+                        <ul className="tp-archive-steps">
+                          {itemSteps.map((step) => (
+                            <li key={step.id} className={step.status}>
+                              <span className={`tp-node ${step.status}`} aria-hidden="true">
+                                {step.status === 'done' ? '✓' : step.status === 'failed' ? '✕' : step.status === 'skipped' ? '–' : ''}
+                              </span>
+                              <span className="tp-archive-step-text">{step.description}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      <div className="tp-archive-meta">
+                        {item.updated_ms ? `${fmtTime(item.updated_ms)} 更新` : '时间未知'}
+                        {item.plan.status ? ` · ${item.plan.status}` : ''}
+                      </div>
+                    </div>
+                  </details>
+                )
+              })}
+            </div>
+          </details>
+        )}
+
+        <section className="tp-section">
+          <div className="tp-section-head">
+            我的待办
+            <span className="tp-count">{openTodos}/{webTodos.length}</span>
+          </div>
+          {webTodos.length > 0 && (
+            <div className="tp-list">
+              {webTodos.map((todo, index) => (
+                <label key={`${index}-${todo.text}`} className={`tp-todo ${todo.done ? 'done' : ''}`}>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(todo.done)}
+                    onChange={() => saveTodos(webTodos.map((item, i) => (i === index ? { ...item, done: !item.done } : item)))}
+                  />
+                  <span className="tp-todo-text">{todo.text}</span>
+                  <button
+                    className="ghost tp-todo-del"
+                    title="删除"
+                    onClick={(event) => {
+                      event.preventDefault()
+                      saveTodos(webTodos.filter((_, i) => i !== index))
+                    }}
+                  >
+                    ×
+                  </button>
+                </label>
+              ))}
             </div>
           )}
-        </div>
-
-        {plans.length > 0 && <div className="group">计划文件（只读）</div>}
-        {plans.map((item) => {
-          const steps = item.plan && Array.isArray(item.plan.steps) ? item.plan.steps : []
-          const done = steps.filter((step) => ['completed', 'done', 'Succeeded'].includes(step.status)).length
-          const status = (item.plan && item.plan.status) || ''
-          return (
-            <details key={item.id} className="plan">
-              <summary>
-                <span>▤ {(item.plan && item.plan.task_summary) || item.plan?.title || item.id}</span>
-                {item.id === activePlanId && <span className="chip">当前</span>}
-                <span className="muted">{status ? `${status} · ` : ''}{steps.length ? `${done}/${steps.length} 步` : ''}</span>
-              </summary>
-              {steps.length > 0
-                ? steps.map((step, index) => {
-                    const stepStatus = step.status || ''
-                    const finished = ['completed', 'done', 'Succeeded'].includes(stepStatus)
-                    const running = ['in_progress', 'running', 'Executing'].includes(stepStatus)
-                    return (
-                      <div key={index} className={`row todo ${finished ? 'done' : ''}`}>
-                        <span>{finished ? '✔' : running ? '▶' : '○'} {step.description || step.title || step.id || `第 ${index + 1} 步`}</span>
-                        <span className="muted">{statusLabel(stepStatus)}</span>
-                      </div>
-                    )
-                  })
-                : <div className="muted" style={{ padding: '4px 8px' }}>该计划没有步骤明细</div>}
-            </details>
-          )
-        })}
-
-        <div className="group">当前待办（可编辑 · 下一条消息会带给 agent）</div>
-        {webTodos.map((todo, index) => (
-          <div key={`${index}-${todo.text}`} className={`row todo ${todo.done ? 'done' : ''}`}>
-            <label className="todo-check">
-              <input
-                type="checkbox"
-                checked={Boolean(todo.done)}
-                onChange={() => saveTodos(webTodos.map((item, i) => (i === index ? { ...item, done: !item.done } : item)))}
-              />
-              <span>{todo.text}</span>
-            </label>
-            <button className="ghost" title="删除" onClick={() => saveTodos(webTodos.filter((_, i) => i !== index))}>×</button>
+          {webTodos.length === 0 && <div className="tp-empty-line">还没有待办，添加一条试试</div>}
+          <div className="tp-todo-add">
+            <input
+              value={newTodo}
+              placeholder="添加待办，Enter 保存"
+              onChange={(event) => setNewTodo(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== 'Enter') return
+                event.preventDefault()
+                addTodo()
+              }}
+            />
+            <button onClick={addTodo}>添加</button>
           </div>
-        ))}
-        {webTodos.length === 0 && <div className="muted" style={{ padding: '2px 8px 6px' }}>还没有待办，添加一条试试</div>}
-        <div className="todo-add">
-          <input
-            value={newTodo}
-            placeholder="添加待办，Enter 保存"
-            onChange={(event) => setNewTodo(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key !== 'Enter') return
-              event.preventDefault()
-              const text = newTodo.trim()
-              if (!text) return
-              saveTodos([...webTodos, { text, done: false }])
-              setNewTodo('')
-            }}
-          />
-          <button onClick={() => {
-            const text = newTodo.trim()
-            if (!text) return
-            saveTodos([...webTodos, { text, done: false }])
-            setNewTodo('')
-          }}>添加</button>
-        </div>
+        </section>
 
-        {data.todos.length > 0 && <div className="group">历史 TodoWrite（实时）</div>}
-        {data.todos.map((todo, index) => (
-          <div key={`${index}-${todo.content || ''}`} className={`row todo ${['completed', 'done'].includes(todo.status) ? 'done' : ''}`}>
-            <span>{['completed', 'done'].includes(todo.status) ? '✔' : todo.status === 'in_progress' ? '▶' : '○'} {todo.content}</span>
-          </div>
-        ))}
-        {data.tasks.length > 0 && <div className="group">任务工具</div>}
-        {data.tasks.map((task, index) => <div key={index} className="row"><span>◆ {task.tool}</span><span className="muted">{task.detail}</span></div>)}
-        {data.crons.length > 0 && <div className="group">定时记录</div>}
-        {data.crons.map((cron, index) => <div key={index} className="row"><span>⏱ {cron.tool}</span><span className="muted">{cron.detail}</span></div>)}
+        {activities.length > 0 && (
+          <details className="tp-activity">
+            <summary>
+              执行记录
+              <span className="tp-count">{activities.length}</span>
+            </summary>
+            <div className="tp-activity-body">
+              {activities.map((item, index) => (
+                <div key={index} className="tp-activity-row">
+                  <span className="tp-activity-tool">{item.tone === 'cron' ? '⏱' : '◆'} {item.tool}</span>
+                  <span className="tp-activity-detail">{item.detail}</span>
+                </div>
+              ))}
+            </div>
+          </details>
+        )}
       </div>
     </div>
   )
+}
+
+// 当前计划对应的文件更新时间：/plan 只带 revision（可能是 sidecar 计数器），
+// 真实的毫秒时间在计划文件列表里，按 id 取。
+function planUpdatedMs(plans, id) {
+  if (!id) return 0
+  const found = plans.find((item) => item.id === id)
+  return Number(found?.updated_ms || 0)
 }

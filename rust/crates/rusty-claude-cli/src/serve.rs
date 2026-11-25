@@ -416,20 +416,38 @@ fn load_web_plan_with(
         .and_then(|value| value["approved"].as_bool())
         .unwrap_or(false);
     let artifacts = read_plan_artifacts(workspace);
+    let sidecar_id = sidecar.as_ref().and_then(|value| {
+        value["plan_id"]
+            .as_str()
+            .or_else(|| value["plan"]["id"].as_str())
+            .map(str::to_string)
+    });
+    // 空壳（点开计划模式时自动创建、用户没动过）不能长期占住优先级：
+    // 否则 agent 之后 create_plan 出的真实计划永远被压在下面，面板停在
+    // 「待补充计划」。用户真正编辑过（draft）的计划仍优先于会话计划。
+    let sidecar_is_shell = sidecar_plan.as_ref().is_some_and(|plan| {
+        !draft
+            && plan["steps"]
+                .as_array()
+                .map_or(true, |steps| steps.is_empty())
+    });
+    // 只有 hint/sidecar 都给不出目标时才需要扫会话（会话文件可能很大）。
+    let need_session_id = active_hint.is_none() && (sidecar_is_shell || sidecar_id.is_none());
+    let session_plan_id = if need_session_id {
+        session_active_plan_id(session_path)
+    } else {
+        None
+    };
     let target_id = active_hint.map(str::to_string).or_else(|| {
-        sidecar.as_ref().and_then(|value| {
-            value["plan_id"]
-                .as_str()
-                .or_else(|| value["plan"]["id"].as_str())
-                .map(str::to_string)
-        })
+        if sidecar_is_shell {
+            session_plan_id.or(sidecar_id)
+        } else {
+            sidecar_id.or(session_plan_id)
+        }
     });
     let mut plan = None;
     let mut plan_updated_ms = 0;
-    if let Some(target_id) = target_id
-        .or_else(|| session_active_plan_id(session_path))
-        .as_deref()
-    {
+    if let Some(target_id) = target_id.as_deref() {
         if let Some(found) = artifacts
             .iter()
             .find(|item| item["id"].as_str() == Some(target_id))
@@ -706,25 +724,33 @@ fn prompt_with_web_context(workspace: &Path, session_path: &Path, id: &str, text
     let mut prefix = String::new();
     let plan_state = load_web_plan(workspace, session_path, id);
     if plan_state["enabled"].as_bool().unwrap_or(false) {
+        // 只提示"用计划形式回应"时模型会只写文字计划（实测 2026-11-21：连续多轮
+        // 用 TodoWrite 或纯文本代替），侧栏因此永远没有卡片。这里明确要求走工具。
         prefix.push_str(
-            "[计划模式] 当前会话处于计划模式：先用计划形式回应（任务理解、步骤、验收标准），\
-             暂不直接修改代码；用户确认计划后再执行。\n\n",
+            "[计划模式] 当前会话处于计划模式：计划必须用工具登记，不能只在回复里写。\n\
+             - 尚无计划：先调用 create_plan 建立计划（任务理解、步骤、每步验收标准），\
+               工具返回的 id 就是计划 id；不要用 TodoWrite 代替。\n\
+             - 已有计划：按步骤执行，每完成或失败一步立即调用 plan_update 更新状态，\
+               例如 {\"update\":\"done: step_1\"}；步骤 id 见下方计划。\n\
+             - 用户确认计划前不要直接修改代码。\n\n",
         );
     }
     if let Some(plan) = plan_state["plan"].as_object() {
         let summary = plan["task_summary"].as_str().unwrap_or("").trim();
         let steps = plan["steps"].as_array().cloned().unwrap_or_default();
         if !summary.is_empty() || !steps.is_empty() {
-            let mut block = String::from("[Web 计划（用户在 Web 端维护，作为当前执行计划）]\n");
+            let mut block =
+                String::from("[Web 计划（当前执行计划，步骤状态请用 plan_update 同步）]\n");
             if !summary.is_empty() {
                 block.push_str(&format!("任务: {summary}\n"));
             }
             for (index, step) in steps.iter().enumerate() {
                 block.push_str(&format!(
-                    "{}. [{}] {}",
+                    "{}. [{}] {}（id: {}）",
                     index + 1,
                     step["status"].as_str().unwrap_or("pending"),
-                    step["description"].as_str().unwrap_or("")
+                    step["description"].as_str().unwrap_or(""),
+                    step["id"].as_str().unwrap_or("")
                 ));
                 let acceptance = step["acceptance_criteria"].as_str().unwrap_or("");
                 if !acceptance.is_empty() {
@@ -6159,6 +6185,61 @@ mod tests {
         let state = load_web_plan(dir.path(), &session_path, "session-plan-bind");
         assert_eq!(state["plan"]["id"], "plan-right-1");
         assert_eq!(state["plan"]["task_summary"], "本会话的计划");
+    }
+
+    /// 计划模式自动创建的空壳不能盖住 agent 之后 create_plan 的真实计划。
+    #[test]
+    fn shell_plan_does_not_mask_agent_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let plans_dir = dir.path().join(".claw").join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        atomic_write(
+            &plans_dir.join("plan-agent-1.json"),
+            &json!({
+                "id": "plan-agent-1",
+                "created_at_ms": 3_000u64,
+                "task_summary": "agent 计划",
+                "steps": [{ "id": "s1", "description": "实现", "status": "Pending" }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let session_path = dir.path().join("s.jsonl");
+        // 先落一个合法会话文件：读取路径要靠它的 created_at_ms 过滤旧计划。
+        let mut session = runtime::Session::new();
+        session.save_to_path(&session_path).unwrap();
+        let id = "session-shell-mask";
+        // 模拟用户点开计划模式：生成空壳 + sidecar。
+        save_web_plan(
+            dir.path(),
+            &session_path,
+            id,
+            &PlanUpdateBody {
+                enabled: Some(true),
+                ..PlanUpdateBody::default()
+            },
+        )
+        .expect("shell");
+
+        // 之后 agent 才 create_plan：会话里的返回串应压过空壳。
+        session
+            .push_message(runtime::ConversationMessage {
+                role: runtime::MessageRole::Tool,
+                blocks: vec![runtime::ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    tool_name: "create_plan".to_string(),
+                    output: "create_plan: plan created (id=plan-agent-1, 1 step(s)).".to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+                created_at_ms: 0,
+            })
+            .unwrap();
+        session.save_to_path(&session_path).unwrap();
+
+        let state = load_web_plan(dir.path(), &session_path, id);
+        assert_eq!(state["plan"]["id"], "plan-agent-1");
+        assert_eq!(state["plan"]["steps"][0]["description"], "实现");
     }
 
     /// 打开计划模式但没有计划时创建空壳，并落一份空 artifact（侧栏立刻可编辑）。

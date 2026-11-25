@@ -10,7 +10,7 @@ import {
   VOICE_BAR_COUNT,
   VOICE_FLAT_BARS,
 } from '../shared/constants.js'
-import { basename, formatTokens, resolveModelLabel, voiceClock } from '../shared/utils.js'
+import { basename, createDictation, formatTokens, resolveModelLabel, voiceClock } from '../shared/utils.js'
 
 export function Composer({ running, queue, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission, model, onModel, workspace, workspaces = [], sessionModel = '', onVoiceDiscussion, onNewInWorkspace, onPickWorkspace, onOpenWorkspacePicker, stats, pendingRef, onRefUsed, pendingDraft, onDraftUsed }) {
   const [value, setValue] = useState('')
@@ -31,16 +31,12 @@ export function Composer({ running, queue, onSend, onStop, onQuickAction, onErro
   const uploadRef = useRef(null)
   const rootRef = useRef(null)
   const filesLoading = useRef(false)
-  const speechRef = useRef(null)
+  const dictationRef = useRef(null)
   const voiceActiveRef = useRef(false)
   const voiceBaseRef = useRef('')
-  const voiceFinalRef = useRef('')
-  const voiceInterimRef = useRef('')
-  const sessionFinalBaseRef = useRef('')
   const voiceStartedRef = useRef(0)
   const waveTimerRef = useRef(0)
   const elapsedTimerRef = useRef(0)
-  const restartTimerRef = useRef(0)
   const mediaStreamRef = useRef(null)
   const audioCtxRef = useRef(null)
   const analyserRef = useRef(null)
@@ -130,10 +126,10 @@ export function Composer({ running, queue, onSend, onStop, onQuickAction, onErro
 
   useEffect(() => () => {
     voiceActiveRef.current = false
-    if (restartTimerRef.current) clearTimeout(restartTimerRef.current)
     if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current)
     if (waveTimerRef.current) clearInterval(waveTimerRef.current)
-    try { speechRef.current?.stop?.() } catch (_) {}
+    dictationRef.current?.stop()
+    dictationRef.current = null
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((track) => track.stop())
       mediaStreamRef.current = null
@@ -351,93 +347,49 @@ export function Composer({ running, queue, onSend, onStop, onQuickAction, onErro
     if (!voiceActiveRef.current) return
     voiceActiveRef.current = false
     setVoiceActive(false)
-    if (restartTimerRef.current) { clearTimeout(restartTimerRef.current); restartTimerRef.current = 0 }
-    try { speechRef.current?.stop() } catch (_) {}
-    speechRef.current = null
+    const dictation = dictationRef.current
+    dictationRef.current = null
+    const spoken = (dictation?.text() || '').trim()
+    dictation?.stop()
     stopVoiceTimer()
     stopWaveform()
     const base = voiceBaseRef.current
-    const spoken = (voiceFinalRef.current + voiceInterimRef.current).trim()
     if (restore) {
       setValue(base)
     } else {
       setValue(base && spoken ? base.replace(/\s*$/, '') + ' ' + spoken : base || spoken)
       requestAnimationFrame(focusEnd)
     }
-    voiceFinalRef.current = ''
-    voiceInterimRef.current = ''
-    sessionFinalBaseRef.current = ''
   }
 
   // 实时语音输入：转写显示在输入框，底栏切换为取消 / 声波 / 计时 / 确认。
+  // 识别会话由 createDictation 自动续接，长时间说话不会因浏览器单次会话上限而中断。
   const startVoice = () => {
     if (voiceActiveRef.current) return
-    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition
-    if (!Recognition) { onError?.('当前浏览器不支持实时语音输入，请使用 Chrome / Edge'); return }
+    const dictation = createDictation({
+      lang: navigator.language || 'zh-CN',
+      onText: (spoken) => {
+        if (!voiceActiveRef.current) return
+        const base = voiceBaseRef.current
+        setValue(base && spoken ? base.replace(/\s*$/, '') + ' ' + spoken : base || spoken)
+      },
+      onFail: (message) => {
+        // 重试耗尽才走到这里：保留已识别内容再结束，避免长段语音白说。
+        onError?.(message)
+        finishVoice(false)
+      },
+    })
+    if (!dictation) { onError?.('当前浏览器不支持实时语音输入，请使用 Chrome / Edge'); return }
     voiceActiveRef.current = true
     voiceBaseRef.current = value
-    voiceFinalRef.current = ''
-    voiceInterimRef.current = ''
-    sessionFinalBaseRef.current = ''
+    dictationRef.current = dictation
     setSuggest(null)
     setOpenMenu(null)
     setFooterMenu(null)
     setVoiceActive(true)
     startVoiceTimer()
     startWaveform()
-    const recognition = new Recognition()
-    recognition.lang = navigator.language || 'zh-CN'
-    recognition.continuous = true
-    recognition.interimResults = true
-    recognition.onresult = (event) => {
-      let finalText = ''
-      let interimText = ''
-      for (let index = 0; index < event.results.length; index += 1) {
-        const result = event.results[index]
-        const transcript = result?.[0]?.transcript || ''
-        if (result.isFinal) finalText += transcript
-        else interimText += transcript
-      }
-      voiceFinalRef.current = sessionFinalBaseRef.current + finalText
-      voiceInterimRef.current = interimText
-      const base = voiceBaseRef.current
-      const spoken = (voiceFinalRef.current + voiceInterimRef.current).trim()
-      setValue(base && spoken ? base.replace(/\s*$/, '') + ' ' + spoken : base || spoken)
-    }
-    recognition.onerror = (event) => {
-      const code = event.error
-      if (code === 'aborted' || code === 'no-speech') return
-      const messages = {
-        'not-allowed': '麦克风权限被拒绝，无法语音输入',
-        'service-not-allowed': '麦克风权限被拒绝，无法语音输入',
-        'audio-capture': '没有检测到可用的麦克风',
-        network: '语音识别服务不可用（需要联网）',
-      }
-      if (messages[code]) {
-        onError?.(messages[code])
-        finishVoice(true)
-      }
-    }
-    recognition.onend = () => {
-      if (!voiceActiveRef.current) return
-      // Chrome 静音后会结束当前识别周期；自动续接，保留已识别文本。
-      if (voiceInterimRef.current) {
-        voiceFinalRef.current += voiceInterimRef.current
-        voiceInterimRef.current = ''
-      }
-      sessionFinalBaseRef.current = voiceFinalRef.current
-      restartTimerRef.current = window.setTimeout(() => {
-        if (!voiceActiveRef.current) return
-        try { recognition.start() } catch (_) {}
-      }, 250)
-    }
-    speechRef.current = recognition
-    try {
-      recognition.start()
-    } catch (error) {
-      onError?.(`语音输入启动失败：${error.message}`)
-      finishVoice(true)
-    }
+    dictation.start()
   }
 
   const perm = PERMISSION_LOOKUP[permission] || PERMISSION_PRESETS[1]
@@ -728,13 +680,14 @@ export function Composer({ running, queue, onSend, onStop, onQuickAction, onErro
             </Popover>
           )}
         </div>
+        {/* 统计信息与工作区控件同行：左侧是本地/工作区，右侧是轮次与 token 用量，省出一整行高度。 */}
+        {(stats?.turns > 0 || stats?.total_tokens > 0) && (
+          <div className="composer-metrics">
+            <span>↻ {stats.turns || 0} 轮 {stats.steps || 0} 步{stats.duration_ms > 0 && stats.output_tokens > 0 ? ` · ${Math.max(1, Math.round((stats.output_tokens || 0) / (stats.duration_ms / 1000)))} tok/s` : ''}</span>
+            <span>💾 {formatTokens(stats.total_tokens || 0)} tok · 缓存命中 {stats.cache_hit_pct || 0}%</span>
+          </div>
+        )}
       </div>
-      {(stats?.turns > 0 || stats?.total_tokens > 0) && (
-        <div className="composer-metrics">
-          <span>↻ {stats.turns || 0} 轮 {stats.steps || 0} 步{stats.duration_ms > 0 && stats.output_tokens > 0 ? ` · ${Math.max(1, Math.round((stats.output_tokens || 0) / (stats.duration_ms / 1000)))} tok/s` : ''}</span>
-          <span>💾 {formatTokens(stats.total_tokens || 0)} tok · 缓存命中 {stats.cache_hit_pct || 0}%</span>
-        </div>
-      )}
     </form>
   )
 }

@@ -7,6 +7,7 @@ import { Sidebar } from './shell/Sidebar.jsx'
 import { WorkspacePicker } from './shell/WorkspacePicker.jsx'
 import { TopBar } from './shell/TopBar.jsx'
 import { Toasts } from './shell/Toasts.jsx'
+import { AmbientField } from './shell/AmbientField.jsx'
 import { Conversation } from './chat/Conversation.jsx'
 import { Composer } from './chat/Composer.jsx'
 import { VoiceDiscussion } from './chat/VoiceDiscussion.jsx'
@@ -632,6 +633,7 @@ export default function App() {
 
   const chatMain = (
     <main>
+      <AmbientField />
       <TopBar
         title={current?.title || current?.id || '未选择会话'}
         chips={[
@@ -683,6 +685,7 @@ export default function App() {
 
   const marketMain = (
     <main>
+      <AmbientField />
       <MarketPage kind={route} />
       {settings}
     </main>
