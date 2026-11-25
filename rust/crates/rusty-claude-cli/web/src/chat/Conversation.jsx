@@ -103,9 +103,16 @@ export function Conversation({ messages, optimistic, live, liveThinking, liveToo
           </div>
         )}
         {!loading && visible.length === 0 && !optimistic && !streaming && (
-          <div className="empty">
-            <div>直接输入即可发送 —— 未选会话时会在当前工作区新建任务。</div>
-            <div className="empty-hint">Enter 发送 · Shift+Enter 换行 · / 快捷操作 · @ 引用文件</div>
+          <div className="chat-empty">
+            <div className="chat-empty-mark" aria-hidden="true"><span /></div>
+            <div className="chat-empty-title">直接输入即可发送</div>
+            <div className="chat-empty-sub">未选会话时，会在当前工作区新建任务</div>
+            <div className="chat-empty-keys">
+              <span><kbd>Enter</kbd>发送</span>
+              <span><kbd>Shift</kbd><kbd>Enter</kbd>换行</span>
+              <span><kbd>/</kbd>快捷操作</span>
+              <span><kbd>@</kbd>引用文件</span>
+            </div>
           </div>
         )}
         {visible.length > shown.length && (
@@ -133,8 +140,12 @@ export function Conversation({ messages, optimistic, live, liveThinking, liveToo
         )}
         {streaming && <LiveTurn thinking={liveThinking} tools={liveTools || []} text={live} />}
         </div>
+        {!atBottom && (
+          <div className="jump-row">
+            <button className="jump" onClick={jumpToLatest}>回到最新 ↓</button>
+          </div>
+        )}
       </div>
-      {!atBottom && <button className="jump" onClick={jumpToLatest}>回到最新 ↓</button>}
     </>
   )
 }

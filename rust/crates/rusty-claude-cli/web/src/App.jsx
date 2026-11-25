@@ -637,7 +637,7 @@ export default function App() {
       <TopBar
         title={current?.title || current?.id || '未选择会话'}
         chips={[
-          current?.model,
+          current?.model ? current.model.split('/').pop() : null,
           current?.workspace ? basename(current.workspace) : null,
           current ? `${current.message_count ?? messages.length} 条` : null,
           current?.modified ? `更新于 ${relTime(current.modified)}` : null,

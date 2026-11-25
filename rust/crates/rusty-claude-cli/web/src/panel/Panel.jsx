@@ -20,13 +20,17 @@ export function Panel({ tab, onTab, onClose, onDock, width, currentId, workspace
   return (
     <section className={`panel ${fullscreen ? 'fullscreen' : ''}`} style={fullscreen ? undefined : { width }}>
       <div className="panel-head">
-        {TABS.map((item) => (
-          <button key={item.id} className={tab === item.id ? 'tab active' : 'tab'} onClick={() => onTab(item.id)}>{item.label}</button>
-        ))}
+        <div className="panel-tabs">
+          {TABS.map((item) => (
+            <button key={item.id} className={tab === item.id ? 'tab active' : 'tab'} onClick={() => onTab(item.id)}>{item.label}</button>
+          ))}
+        </div>
         <span className="spacer" />
-        <button onClick={onDock} title="切换停靠侧">⇄</button>
-        <button onClick={() => setFullscreen((value) => !value)} title={fullscreen ? '退出全屏 (Esc)' : '全屏'}>{fullscreen ? '⤢' : '⛶'}</button>
-        <button onClick={onClose} title="收起">×</button>
+        <div className="panel-actions">
+          <button className="panel-dock" onClick={onDock} title="切换停靠侧">⇄</button>
+          <button onClick={() => setFullscreen((value) => !value)} title={fullscreen ? '退出全屏 (Esc)' : '全屏'}>{fullscreen ? '⤢' : '⛶'}</button>
+          <button onClick={onClose} title="收起">×</button>
+        </div>
       </div>
       <div className="panel-body">
         {/* 五个面板常驻，切换只隐藏：终端连接、文件浏览状态不会因切标签丢失。 */}

@@ -137,10 +137,12 @@ export function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onTo
           </div>
           <button className="new-session" onClick={() => onNew(activeWorkspace)}>＋ 新建任务</button>
           <div className="search">
-            <input id="session-search" value={filter} onChange={(event) => onFilter(event.target.value)} placeholder="搜索会话 / Ctrl+K" />
+            <span className="search-icon" aria-hidden="true">⌕</span>
+            <input id="session-search" value={filter} onChange={(event) => onFilter(event.target.value)} placeholder="搜索会话" />
+            <kbd className="search-kbd">Ctrl K</kbd>
           </div>
           <div className="projects-head">
-            <span>项目</span>
+            <span className="projects-label">项目 <em>{projects.length}</em></span>
             <span className="projects-head-actions">
               <button
                 className={`batch-toggle ${selecting ? 'active' : ''}`}
@@ -176,7 +178,9 @@ export function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onTo
                 <div className={`project ${active ? 'active-workspace' : ''}`} key={project.path}>
                   <div className="project-head" title={project.path}>
                     <button className="project-toggle" onClick={() => toggleGroup(project.path)}>
-                      {isExpanded ? '▾' : '▸'} 📁 {project.label}
+                      <span className="project-caret" aria-hidden="true">{isExpanded ? '▾' : '▸'}</span>
+                      <span className="project-folder" aria-hidden="true">📁</span>
+                      <span className="project-name">{project.label}</span>
                       <span className="project-count">{project.count}</span>
                     </button>
                     <button
