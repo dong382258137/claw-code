@@ -429,7 +429,7 @@ fn load_web_plan_with(
         !draft
             && plan["steps"]
                 .as_array()
-                .map_or(true, |steps| steps.is_empty())
+                .is_none_or(|steps| steps.is_empty())
     });
     // 只有 hint/sidecar 都给不出目标时才需要扫会话（会话文件可能很大）。
     let need_session_id = active_hint.is_none() && (sidecar_is_shell || sidecar_id.is_none());

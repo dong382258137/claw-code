@@ -33,16 +33,6 @@ pub use commands::plugin_market;
 /// 原子安装流水线），此处重导出以保持 `crate::skill_market` 路径稳定。
 pub use commands::skill_market;
 
-#[cfg(feature = "full-tui")]
-pub mod tui;
-
-// 从 grok-build (Apache-2.0) 移植的 TUI 子模块。与原生 tui/ 隔离,
-// 便于跟踪上游变更。详见 tui-ports/PORTING.md。
-// 目录用连字符(用户要求),模块名用下划线(Rust 标识符要求),通过 #[path] 桥接。
-#[cfg(feature = "full-tui")]
-#[path = "tui-ports/mod.rs"]
-pub mod tui_ports;
-
 #[cfg(test)]
 mod tests;
 
@@ -492,83 +482,6 @@ pub(crate) fn diag_log(msg: &str) {
     }
 }
 
-#[cfg(feature = "full-tui")]
-#[allow(clippy::too_many_arguments)] // Stage 1 验收:8 参数超 clippy 默认上限 7,与 run_repl 同策略,重构参数到 struct 待 Stage 2 处理。
-pub fn run_tui_repl_entry(
-    model: String,
-    allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
-    base_commit: Option<String>,
-    reasoning_effort: Option<String>,
-    thinking_mode: Option<bool>,
-    allow_broad_cwd: bool,
-    additional_workspace_roots: Vec<PathBuf>,
-    output_verbosity: OutputVerbosity,
-) -> Result<(), Box<dyn std::error::Error>> {
-    diag_log("run_tui_repl_entry start");
-    // ---- First-run wizard pre-check ----------------------------------------
-    //
-    // On first launch, present the configuration wizard. Once the user
-    // completes it, create a sentinel file so subsequent runs skip the wizard.
-    // If the user quits the wizard, propagate the error to exit cleanly.
-    if !runtime::is_bootstrapped() {
-        diag_log("not bootstrapped, checking wizard settings");
-        // If settings.json has wizard config but we're missing the sentinel
-        // (e.g. config was copied from another machine), inject env vars and
-        // create the sentinel without showing the wizard again.
-        if let Some(saved) = runtime::load_wizard_settings() {
-            diag_log("found saved wizard settings, injecting env vars");
-            inject_wizard_env_vars(&saved);
-            let _ = runtime::mark_bootstrapped();
-        } else if any_api_key_available() {
-            // Auto-bootstrap: the user already has API keys configured via
-            // environment variables or .env file. Skip the wizard and create
-            // the sentinel silently — zero-config experience.
-            diag_log("API key(s) detected in env, auto-bootstrapping");
-            let _ = runtime::mark_bootstrapped();
-        } else {
-            diag_log("no saved settings, running first-run wizard");
-            tui::wizard::run_first_run_wizard()?;
-            diag_log("wizard completed OK");
-        }
-    }
-    // ---- End wizard pre-check -------------------------------------------
-
-    diag_log("calling enforce_broad_cwd_policy");
-    enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
-    diag_log("calling correct_cwd_from_target_dir");
-    correct_cwd_from_target_dir();
-    diag_log("calling run_stale_base_preflight");
-    run_stale_base_preflight(base_commit.as_deref());
-    diag_log("calling build_live_cli_for_repl");
-    let mut cli = build_live_cli_for_repl(
-        model,
-        allowed_tools,
-        permission_mode,
-        additional_workspace_roots,
-        output_verbosity,
-        reasoning_effort,
-        thinking_mode,
-    )?;
-    // 热升级启动检测(双大脑收官基石):TUI 是默认启动路径,必须在此
-    // (进入事件循环前)检测升级标记并恢复旧任务;REPL 路径已在
-    // run_repl 内接线。失败静默降级为普通启动。
-    // 返回 Some(notice) 时把通知传入 run_tui_repl,由其在进入事件循环前
-    // 派发首轮 —— 这才是"自动续跑";仅 push 通知不触发那一轮是旧 bug。
-    let resume_notice = cli.maybe_resume_from_upgrade()?;
-    diag_log("build_live_cli_for_repl OK, entering TUI");
-    tui::app::run_tui_repl(cli, resume_notice)
-}
-
-/// Inject wizard-saved credentials as environment variables for the current
-/// process so that downstream auth resolution picks them up transparently.
-#[cfg(feature = "full-tui")]
-fn inject_wizard_env_vars(settings: &runtime::WizardSettings) {
-    if settings.provider.as_str() == "deepseek" {
-        std::env::set_var("DEEPSEEK_API_KEY", &settings.api_key);
-    }
-}
-
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 启动最早期把 `.claw.json` 的 `env` 块应用到当前进程。
     //
@@ -815,28 +728,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             enable_policy_engine,
         } => {
             if tui {
-                #[cfg(feature = "full-tui")]
-                {
-                    return run_tui_repl_entry(
-                        model,
-                        allowed_tools,
-                        permission_mode,
-                        base_commit,
-                        reasoning_effort,
-                        thinking_mode,
-                        allow_broad_cwd,
-                        additional_workspace_roots,
-                        output_verbosity,
-                    );
-                }
-                #[cfg(not(feature = "full-tui"))]
-                {
-                    eprintln!(
-                        "error: --tui requires the `full-tui` Cargo feature.\n\
-                         Rebuild with: cargo build --release --features full-tui"
-                    );
-                    std::process::exit(1);
-                }
+                eprintln!("error: TUI 已移除，请使用 Web UI 启动：claw serve");
+                std::process::exit(1);
             }
             run_repl(
                 model,

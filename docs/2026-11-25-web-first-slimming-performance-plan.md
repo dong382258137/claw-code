@@ -206,6 +206,7 @@ infra/     会话索引、设置、热升级、路径解析
 |---|---|---|
 | Phase 0 基线 | 部分完成 | 已有：二进制 71.5 MB、启动 579 ms、空闲 RSS 28.9 MB。待补：冷启动构建耗时、1 万条消息会话的打开与轮询耗时（Phase 5 前补齐） |
 | Phase 1 解耦 | 已完成（2026-11-26） | `--no-default-features` 编译通过。`StatusEmitter` 早已定义在 `runtime`，本次只解除调用侧门控；`OutputVerbosity` 暂不搬动，随 `render.rs` 在 Phase 3 一并删除，现阶段搬动不改变依赖图 |
+| Phase 2 删除 TUI | 已完成（2026-11-26） | 删除 `tui/`（12 文件）、`tui-ports/`（4 文件）与 `ratatui`/`ansi-to-tui`/`similar` 依赖；`full-tui` 特性移除。**保留 `status_emitter`**（Web SSE 依赖），**保留 `crossterm`**（`render.rs`/`format.rs`/`tool_display.rs` 仍用，Phase 3 随 CLI 界面层删除）。实测：二进制 70.59 MB（-0.9 MB）、启动到监听 690 ms、监听后 500 ms RSS 12.5 MB（单次采样，构建噪声未排除） |
 
 ### Phase 0：基线与测量脚本
 

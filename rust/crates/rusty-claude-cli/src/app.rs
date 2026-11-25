@@ -198,96 +198,6 @@ pub(crate) fn correct_cwd_from_target_dir() -> Option<PathBuf> {
     None
 }
 
-/// 从 session 历史收集最近的项目目录(用于 project_picker)。
-///
-/// 遍历 managed sessions,加载每个 session 文件提取 `workspace_root`,
-/// 去重后按 `updated_at_ms` 倒序排列,只保留通过 `is_project_dir` 检测的目录。
-///
-/// 返回 `(路径, 最后更新时间)` 列表,最多 5 条。
-///
-/// 仅 TUI 构建使用：交互式选择属于终端界面能力，Web 不经此路径。
-#[cfg(feature = "full-tui")]
-fn collect_recent_project_dirs() -> Vec<(PathBuf, chrono::DateTime<chrono::Utc>)> {
-    let summaries = match list_managed_sessions() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[project_picker] failed to list sessions: {e}");
-            return vec![];
-        }
-    };
-
-    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    let mut projects: Vec<(PathBuf, chrono::DateTime<chrono::Utc>)> = Vec::new();
-
-    for summary in summaries {
-        // 加载 session 文件读 workspace_root
-        let session = match Session::load_from_path(&summary.path) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let Some(root) = session.workspace_root else {
-            continue;
-        };
-        if !root.is_dir() {
-            continue;
-        }
-        if !crate::tui_ports::project_picker::is_project_dir(&root) {
-            continue;
-        }
-        if !seen.insert(root.clone()) {
-            continue; // 去重
-        }
-        let ts = chrono::DateTime::from_timestamp_millis(summary.updated_at_ms as i64)
-            .unwrap_or_else(chrono::Utc::now);
-        projects.push((root, ts));
-        if projects.len() >= 5 {
-            break;
-        }
-    }
-
-    // 按时间倒序
-    projects.sort_by_key(|a| std::cmp::Reverse(a.1));
-    projects
-}
-
-/// 交互式项目选择：显示最近项目菜单并切换 cwd（仅 TUI 构建）。
-#[cfg(feature = "full-tui")]
-fn confirm_with_project_picker(
-    recent_dirs: &[(PathBuf, chrono::DateTime<chrono::Utc>)],
-    cwd: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::tui_ports::project_picker;
-    let pq = project_picker::build_project_question(recent_dirs, cwd);
-    print!("{}", project_picker::render_question_stdout(&pq));
-    io::stdout().flush()?;
-
-    loop {
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        match project_picker::parse_choice(&pq, &input) {
-            Some(Some(chosen_path)) => {
-                // 用户选择了一个项目目录,切换过去
-                if let Err(e) = env::set_current_dir(chosen_path) {
-                    eprintln!("Failed to switch to {}: {e}", chosen_path.display());
-                    std::process::exit(1);
-                }
-                println!("Switched to: {}", chosen_path.display());
-                return Ok(());
-            }
-            Some(None) => {
-                // "Don't ask me again" —— 继续在当前目录
-                // (TODO: 持久化偏好到 config.toml,后续启动跳过检测)
-                return Ok(());
-            }
-            None => {
-                // 无效输入,重新提示
-                print!("Invalid choice. Select [1-N]: ");
-                io::stdout().flush()?;
-            }
-        }
-    }
-}
-
 /// Enforce the broad-CWD policy: when running from home or root, either
 /// require the --allow-broad-cwd flag, or prompt for confirmation (interactive),
 /// or exit with an error (non-interactive).
@@ -305,16 +215,6 @@ pub(crate) fn enforce_broad_cwd_policy(
     let is_interactive = io::stdin().is_terminal();
 
     if is_interactive {
-        // TUI 构建下若有最近项目目录，用 project_picker 让用户选择；
-        // 无最近项目或不含 TUI 的构建（Web）走下面的 y/N 确认流程。
-        #[cfg(feature = "full-tui")]
-        {
-            let recent_dirs = collect_recent_project_dirs();
-            if !recent_dirs.is_empty() {
-                return confirm_with_project_picker(&recent_dirs, &cwd);
-            }
-        }
-
         println!(
             "Warning: claw is running from a very broad directory ({}).\n\
              The agent can read and search everything under this path.\n\
@@ -720,11 +620,6 @@ pub(crate) struct LiveCli {
     /// 存于此字段并在重建时经 `with_steer_inbox` 注入，否则每轮新 runtime 的队列
     /// 都是空的、插话丢失。
     steer_inbox: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    /// TUI 本地命令输出捕获：当设置时，`tui_println` 会把内容追加到此
-    /// buffer 而不是打印到 stdout（避免破坏 alternate screen）。
-    /// 由 TuiApp 在执行斜杠命令前设置，执行后清除。
-    #[cfg(feature = "full-tui")]
-    tui_output: Option<std::sync::Arc<std::sync::Mutex<crate::tui::output_view::OutputBuffer>>>,
     /// TUI 中断支持：当前 turn 的 abort signal handle。
     /// run_turn 开始时设置，turn 结束（成功/失败/中断）时清空。
     /// TUI 层 Ctrl+C（busy 时）通过此 handle 取消当前 turn。
@@ -738,15 +633,6 @@ pub(crate) struct LiveCli {
     /// prepare_turn_runtime 注入到本轮工具注册表，worker 退出 / 看门狗回收 /
     /// 会话删除时由调度器统一终止登记的进程树。
     session_processes: Option<std::sync::Arc<runtime::process_registry::SessionProcesses>>,
-    /// 细粒度诊断回调：在 run_turn 关键路径埋点，写入 claw-diag.log。
-    #[cfg(feature = "full-tui")]
-    diag_callback: Option<Box<dyn Fn(String) + Send>>,
-    /// 工具完成回调（P-fix）：runtime 内置工具（log_decision 等）不经
-    /// CliToolExecutor，不 emit ToolResult 事件，导致 TUI ToolCard 永久 ⏳。
-    /// 此回调在 prepare_turn_runtime 注入 runtime 的 tool_result_callback，
-    /// 转发为 StatusEvent::ToolResult 让 TUI 闭合卡片。
-    #[cfg(feature = "full-tui")]
-    tool_result_callback: Option<runtime::ToolResultCallback>,
 }
 
 pub(crate) struct BuiltRuntime {
@@ -919,24 +805,18 @@ impl LiveCli {
         output_verbosity: OutputVerbosity,
         workspace: &Path,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        #[cfg(feature = "full-tui")]
         crate::diag_log(&format!("[LiveCli::new] start, model={model}"));
         let t0 = std::time::Instant::now();
-        #[cfg(feature = "full-tui")]
         crate::diag_log("[LiveCli::new] calling build_system_prompt");
         let system_prompt = build_system_prompt(&model, workspace)?;
-        #[cfg(feature = "full-tui")]
         crate::diag_log("[LiveCli::new] build_system_prompt OK");
         let t_sp = t0.elapsed();
         let session_state = new_cli_session_with_roots_in(workspace, additional_workspace_roots)?;
-        #[cfg(feature = "full-tui")]
         crate::diag_log("[LiveCli::new] new_cli_session_with_roots OK");
         let t_sess = t0.elapsed();
         let session = create_managed_session_handle_in(workspace, &session_state.session_id)?;
-        #[cfg(feature = "full-tui")]
         crate::diag_log("[LiveCli::new] create_managed_session_handle OK");
         let t_handle = t0.elapsed();
-        #[cfg(feature = "full-tui")]
         crate::diag_log("[LiveCli::new] calling build_runtime");
         let mut runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
@@ -998,15 +878,9 @@ impl LiveCli {
             upgrade_signal: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             steer_inbox: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             status_emitter: None,
-            #[cfg(feature = "full-tui")]
-            tui_output: None,
             current_abort_signal: None,
             external_abort_signal: None,
             session_processes: None,
-            #[cfg(feature = "full-tui")]
-            diag_callback: None,
-            #[cfg(feature = "full-tui")]
-            tool_result_callback: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -1185,32 +1059,13 @@ impl LiveCli {
             }
         }
         // 把状态事件出口注入本轮新建的 client 与工具执行器：
-        // TUI 状态栏/输出视图与 Web SSE 都依赖它。
+        // Web SSE 依赖它输出文本与工具事件。
         if let Some(emitter) = &self.status_emitter {
             if let Some(rt) = runtime.runtime.as_mut() {
                 rt.api_client_mut().set_status_emitter(Arc::clone(emitter));
                 // Also inject into CliToolExecutor so ToolResult events are emitted
                 rt.tool_executor_mut()
                     .set_status_emitter(Arc::clone(emitter));
-            }
-        }
-        // 细粒度诊断：将 TUI 层的 diag callback 注入 runtime，在 run_turn
-        // 关键路径埋点，写入 claw-diag.log 帮助定位"会话卡死"问题。
-        #[cfg(feature = "full-tui")]
-        if let Some(cb) = self.diag_callback.take() {
-            if let Some(rt) = runtime.runtime.take() {
-                runtime.runtime = Some(rt.with_diag_callback(cb));
-            }
-        }
-        // P-fix:将 TUI 层的 tool_result_callback 注入 runtime,让内置工具
-        // (log_decision 等)完成后补发 ToolResult 事件闭合 ToolCard。
-        // 仅在有 status_emitter(TUI 模式)时注入,CLI/headless 无 UI 消费。
-        #[cfg(feature = "full-tui")]
-        if self.status_emitter.is_some() {
-            if let Some(cb) = self.tool_result_callback.take() {
-                if let Some(rt) = runtime.runtime.take() {
-                    runtime.runtime = Some(rt.with_tool_result_callback(cb));
-                }
             }
         }
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal.clone());
@@ -1301,65 +1156,6 @@ impl LiveCli {
                         "\x1b[33m⚠ Goal auto-paused due to network error. Use /goal resume when network is restored.\x1b[0m"
                     );
                 }
-                Err(Box::new(error))
-            }
-        }
-    }
-
-    /// TUI 模式专用 turn 入口(Phase A Step A5:从原 `tui_mode` gating 分离)。
-    ///
-    /// 与 `run_turn` 的差异:
-    /// - `emit_output=false`:consume_stream 写入 io::sink,流式内容通过
-    ///   status_emitter 的 TextDelta 回调驱动 TUI 渲染,避免 alternate screen
-    ///   下重复输出。
-    /// - 抑制所有 stdout/stderr 写入(spinner/println/print_status_bar/eprintln),
-    ///   因为它们绑定到 alternate-screen 终端,stray write 会破坏 TUI 渲染。
-    ///   状态更新(accumulate_usage/goal_manager.record_tokens/persist_session/
-    ///   replace_runtime)仍执行。
-    /// - 使用 `TuiSilentPermissionPrompter`:crossterm event loop 拥有 stdin
-    ///   (raw mode),CliPermissionPrompter 的阻塞 read_line 会挂起或读到垃圾,
-    ///   非交互 prompter 自动 deny(带清晰原因)让 turn 快速失败而非 wedging TUI。
-    /// - 保存 `current_abort_signal` handle,让 TUI 层 Ctrl+C 能取消当前 turn。
-    #[cfg(feature = "full-tui")]
-    pub(crate) fn run_turn_tui(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor, abort_signal) = self.prepare_turn_runtime(false)?;
-        // TUI 中断支持：保存 abort signal handle，让 TUI 层 Ctrl+C 能取消当前 turn。
-        self.current_abort_signal = Some(abort_signal.clone());
-        let mut permission_prompter: Box<dyn runtime::PermissionPrompter> =
-            Box::new(TuiSilentPermissionPrompter::new(self.permission_mode));
-        let goal_prefix = self.goal_manager.render_prompt_prefix();
-        let full_input = match &goal_prefix {
-            Some(prefix) => format!("{prefix}{input}"),
-            None => input.to_string(),
-        };
-        let result = runtime.run_turn(&full_input, Some(&mut *permission_prompter));
-        hook_abort_monitor.stop();
-        match result {
-            Ok(summary) => {
-                self.replace_runtime(runtime)?;
-                self.accumulate_usage(summary.usage);
-                let turn_tokens = u64::from(summary.usage.total_tokens());
-                let _ = self.goal_manager.record_tokens(turn_tokens);
-                self.persist_session()?;
-                // TUI 中断支持：turn 成功结束后清空 abort signal handle。
-                self.current_abort_signal = None;
-                // Agent 自触发热升级:与 run_turn 同构,状态已落盘后执行升级。
-                if tools::take_hot_upgrade_request() {
-                    self.run_upgrade()?;
-                }
-                Ok(())
-            }
-            Err(error) => {
-                runtime.shutdown_plugins()?;
-                let error_str = error.to_string().to_ascii_lowercase();
-                let is_network_error = NETWORK_ERROR_KEYWORDS
-                    .iter()
-                    .any(|kw| error_str.contains(kw));
-                if is_network_error {
-                    let _ = self.goal_manager.pause("network error");
-                }
-                // TUI 中断支持：turn 结束（含错误/中断）后清空 abort signal handle。
-                self.current_abort_signal = None;
                 Err(Box::new(error))
             }
         }
@@ -2626,22 +2422,10 @@ impl LiveCli {
             Some("pick") => {
                 // TUI 模式下不支持交互式 stdin 选择（会卡死 worker 线程），
                 // 回退为显示会话列表，提示用户用 /session switch <id> 切换。
-                #[cfg(feature = "full-tui")]
-                let in_tui = self.tui_output.is_some();
-                #[cfg(not(feature = "full-tui"))]
-                let in_tui = false;
-
-                if in_tui || !io::stdin().is_terminal() {
-                    // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                if !io::stdin().is_terminal() {
                     let content = render_session_list(&self.session.id)?;
                     if !self.tui_println(&content) {
                         println!("{content}");
-                    }
-                    if in_tui {
-                        let hint = "\n提示：使用 /session switch <session-id> 切换到指定会话";
-                        if !self.tui_println(hint) {
-                            println!("{hint}");
-                        }
                     }
                     return Ok(false);
                 }
@@ -2811,23 +2595,6 @@ impl LiveCli {
                     // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
                     let content = format!(
                         "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
-                        handle.id
-                    );
-                    if !self.tui_println(&content) {
-                        println!("{content}");
-                    }
-                    return Ok(false);
-                }
-                // TUI 模式下跳过阻塞式 stdin 确认（会卡死 worker 线程），
-                // 提示用户使用 --force 标志直接删除。
-                #[cfg(feature = "full-tui")]
-                let in_tui = self.tui_output.is_some();
-                #[cfg(not(feature = "full-tui"))]
-                let in_tui = false;
-
-                if in_tui {
-                    let content = format!(
-                        "TUI 模式下不支持交互式确认。如需删除会话，请使用：\n  /session delete {} --force",
                         handle.id
                     );
                     if !self.tui_println(&content) {
@@ -3308,59 +3075,6 @@ impl LiveCli {
         Ok(())
     }
 
-    // ===== TUI status bar snapshot accessors =====
-    // These are read-only views into LiveCli state for the TUI StatusBar to
-    // render. They are feature-gated to avoid dead-code warnings when full-tui
-    // is disabled.
-
-    #[cfg(feature = "full-tui")]
-    pub(crate) fn model_snapshot(&self) -> &str {
-        &self.model
-    }
-
-    #[cfg(feature = "full-tui")]
-    pub(crate) fn cumulative_usage_snapshot(&self) -> runtime::TokenUsage {
-        self.cumulative_usage
-    }
-
-    #[cfg(feature = "full-tui")]
-    pub(crate) fn permission_mode_label(&self) -> &'static str {
-        self.permission_mode.as_str()
-    }
-
-    #[cfg(feature = "full-tui")]
-    pub(crate) fn git_branch_snapshot(&self) -> Option<String> {
-        crate::format::status_context(None)
-            .ok()
-            .and_then(|c| c.git_branch)
-    }
-
-    #[cfg(feature = "full-tui")]
-    pub(crate) fn goal_badge_snapshot(&self) -> Option<String> {
-        // Return plain text (no ANSI codes) for TUI rendering.
-        // ratatui applies its own styling via Span::styled.
-        let goal = self.goal_manager.active()?;
-        match &goal.state {
-            runtime::GoalState::Active => Some("🎯 goal".to_string()),
-            runtime::GoalState::Blocked { .. } => {
-                Some(format!("⚠ goal ({}/3)", goal.blocked_count))
-            }
-            runtime::GoalState::Paused { .. } => None,
-        }
-    }
-
-    #[cfg(feature = "full-tui")]
-    pub(crate) fn session_id_snapshot(&self) -> &str {
-        &self.session.id
-    }
-
-    /// TUI 侧栏轮次统计：返回累计 AI 思考轮次（每个 turn +1）。
-    /// 底层由 `runtime::UsageTracker::turns()` 维护。
-    #[cfg(feature = "full-tui")]
-    pub(crate) fn turns_snapshot(&self) -> u32 {
-        self.runtime.usage().turns()
-    }
-
     /// 挂载状态事件出口，在后续每轮 prepare_turn_runtime 时注入新建的
     /// client 与工具执行器（TUI 与 Web 共用）。
     pub(crate) fn set_status_emitter(&mut self, emitter: crate::streaming::StatusEmitter) {
@@ -3406,78 +3120,7 @@ impl LiveCli {
         self.external_abort_signal = None;
     }
 
-    /// 主会话 mid-turn steering：取 `steer_inbox` 的共享句柄。
-    ///
-    /// TUI 主线程在把 `cli` move 进 worker 线程**之前**调用此方法取得 clone
-    /// （busy 时 `cli_holder` 为 None，无法再经 cli 访问）。此后 busy 期间用户
-    /// 输入可直接投入该队列，`run_turn` 下一次迭代取出并折叠进模型调用。
-    #[cfg(feature = "full-tui")]
-    pub(crate) fn steer_inbox_handle(&self) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
-        self.steer_inbox.clone()
-    }
-
-    /// 细粒度诊断支持：设置 diag callback，在 run_turn 关键路径埋点。
-    /// callback 接收 `[diag] ...` 格式的消息，应写入 claw-diag.log。
-    #[cfg(feature = "full-tui")]
-    pub(crate) fn set_diag_callback(&mut self, cb: Box<dyn Fn(String) + Send>) {
-        self.diag_callback = Some(cb);
-    }
-
-    /// 细粒度诊断支持：清空 diag callback（turn 结束后调用）。
-    #[cfg(feature = "full-tui")]
-    pub(crate) fn clear_diag_callback(&mut self) {
-        self.diag_callback = None;
-    }
-
-    /// 工具完成回调支持：设置 tool_result_callback，供 TUI 闭合
-    /// runtime 内置工具（log_decision 等）的 ToolCard。参数
-    /// (tool_use_id, tool_name, output, is_error)。
-    #[cfg(feature = "full-tui")]
-    pub(crate) fn set_tool_result_callback(&mut self, cb: runtime::ToolResultCallback) {
-        self.tool_result_callback = Some(cb);
-    }
-
-    /// 工具完成回调支持：清空 tool_result_callback（turn 结束后调用）。
-    #[cfg(feature = "full-tui")]
-    pub(crate) fn clear_tool_result_callback(&mut self) {
-        self.tool_result_callback = None;
-    }
-
-    /// TUI 模式下设置本地命令输出捕获 buffer。设置后，`tui_println` 会把
-    /// 内容追加到此 buffer 而非 stdout，避免破坏 alternate screen。
-    /// 由 TuiApp 在执行斜杠命令前调用。
-    #[cfg(feature = "full-tui")]
-    pub(crate) fn set_tui_output(
-        &mut self,
-        handle: std::sync::Arc<std::sync::Mutex<crate::tui::output_view::OutputBuffer>>,
-    ) {
-        self.tui_output = Some(handle);
-    }
-
-    /// 清除 TUI 输出捕获 buffer，后续 `tui_println` 回退到 stdout。
-    #[cfg(feature = "full-tui")]
-    pub(crate) fn clear_tui_output(&mut self) {
-        self.tui_output = None;
-    }
-
-    /// TUI 感知的 println：若设置了 tui_output，把 msg + '\n' 追加到 buffer
-    /// 并返回 true；否则返回 false，调用方应 fallback 到 `println!`。
-    /// 用于 `handle_repl_command` 中简单 println 分支，让斜杠命令在 TUI
-    /// 模式下能把输出显示在输出区而非破坏 alternate screen。
-    #[cfg(feature = "full-tui")]
-    pub(crate) fn tui_println(&self, msg: &str) -> bool {
-        if let Some(handle) = &self.tui_output {
-            if let Ok(mut buf) = handle.lock() {
-                buf.append(msg);
-                buf.append("\n");
-            }
-            true
-        } else {
-            false
-        }
-    }
-
-    #[cfg(not(feature = "full-tui"))]
+    /// CLI 输出统一走 stdout：此方法恒返回 false，调用方回退到 `println!`。
     pub(crate) fn tui_println(&self, _msg: &str) -> bool {
         false
     }
@@ -3510,10 +3153,8 @@ pub(crate) fn build_system_prompt(
     model: &str,
     workspace: &Path,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    #[cfg(feature = "full-tui")]
     crate::diag_log(&format!("[build_system_prompt] start, model={model}"));
     let cwd = workspace.to_path_buf();
-    #[cfg(feature = "full-tui")]
     crate::diag_log(&format!("[build_system_prompt] cwd={}", cwd.display()));
 
     // Step 4.3:在 repomap 渲染前初始化 LSP server。
@@ -3535,7 +3176,6 @@ pub(crate) fn build_system_prompt(
     let _ = topology.ensure_built();
 
     let extras = load_prompt_extras(&cwd, &topology);
-    #[cfg(feature = "full-tui")]
     crate::diag_log(
         "[build_system_prompt] load_prompt_extras OK, calling load_system_prompt_with_extras",
     );
@@ -3550,7 +3190,6 @@ pub(crate) fn build_system_prompt(
         model_family_identity_for(model),
         extras,
     )?;
-    #[cfg(feature = "full-tui")]
     crate::diag_log("[build_system_prompt] load_system_prompt_with_extras OK");
     Ok(result)
 }
@@ -4798,48 +4437,6 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
             Err(error) => runtime::PermissionPromptDecision::Deny {
                 reason: format!("permission approval failed: {error}"),
             },
-        }
-    }
-}
-
-/// Non-interactive permission prompter for TUI mode.
-///
-/// BUG 2 fix: `CliPermissionPrompter::decide` calls `io::stdin().read_line`
-/// which blocks waiting for line input. In TUI mode, crossterm's event loop
-/// already owns stdin in raw mode, so a blocking `read_line` would either
-/// hang the TUI forever or read raw-mode escape sequences as garbage. Instead
-/// of fighting for stdin, this prompter auto-denies every request with a
-/// clear reason pointing the user back to non-TUI mode for interactive
-/// approval. This keeps the TUI responsive and the turn fails fast.
-///
-/// Recommended workflow: use `danger-full-access` permission mode in TUI if
-/// you want tools to run without prompts, or run the same prompt in non-TUI
-/// REPL mode when interactive approval is required.
-pub(crate) struct TuiSilentPermissionPrompter {
-    current_mode: PermissionMode,
-}
-
-impl TuiSilentPermissionPrompter {
-    fn new(current_mode: PermissionMode) -> Self {
-        Self { current_mode }
-    }
-}
-
-impl runtime::PermissionPrompter for TuiSilentPermissionPrompter {
-    fn decide(
-        &mut self,
-        request: &runtime::PermissionRequest,
-    ) -> runtime::PermissionPromptDecision {
-        // Never block on stdin. Surface a deny decision with an actionable
-        // reason so the user knows to either switch permission mode or re-run
-        // the prompt outside the TUI.
-        let _ = self.current_mode; // suppress unused_field warning
-        runtime::PermissionPromptDecision::Deny {
-            reason: format!(
-                "tool '{}' requires permission approval (mode '{}'), which is not available in TUI mode. Re-run `claw` without --tui to approve interactively, or use --permission-mode danger-full-access.",
-                request.tool_name,
-                request.required_mode.as_str()
-            ),
         }
     }
 }
