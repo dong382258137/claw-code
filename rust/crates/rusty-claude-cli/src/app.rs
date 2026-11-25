@@ -204,6 +204,9 @@ pub(crate) fn correct_cwd_from_target_dir() -> Option<PathBuf> {
 /// 去重后按 `updated_at_ms` 倒序排列,只保留通过 `is_project_dir` 检测的目录。
 ///
 /// 返回 `(路径, 最后更新时间)` 列表,最多 5 条。
+///
+/// 仅 TUI 构建使用：交互式选择属于终端界面能力，Web 不经此路径。
+#[cfg(feature = "full-tui")]
 fn collect_recent_project_dirs() -> Vec<(PathBuf, chrono::DateTime<chrono::Utc>)> {
     let summaries = match list_managed_sessions() {
         Ok(s) => s,
@@ -247,6 +250,44 @@ fn collect_recent_project_dirs() -> Vec<(PathBuf, chrono::DateTime<chrono::Utc>)
     projects
 }
 
+/// 交互式项目选择：显示最近项目菜单并切换 cwd（仅 TUI 构建）。
+#[cfg(feature = "full-tui")]
+fn confirm_with_project_picker(
+    recent_dirs: &[(PathBuf, chrono::DateTime<chrono::Utc>)],
+    cwd: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::tui_ports::project_picker;
+    let pq = project_picker::build_project_question(recent_dirs, cwd);
+    print!("{}", project_picker::render_question_stdout(&pq));
+    io::stdout().flush()?;
+
+    loop {
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        match project_picker::parse_choice(&pq, &input) {
+            Some(Some(chosen_path)) => {
+                // 用户选择了一个项目目录,切换过去
+                if let Err(e) = env::set_current_dir(chosen_path) {
+                    eprintln!("Failed to switch to {}: {e}", chosen_path.display());
+                    std::process::exit(1);
+                }
+                println!("Switched to: {}", chosen_path.display());
+                return Ok(());
+            }
+            Some(None) => {
+                // "Don't ask me again" —— 继续在当前目录
+                // (TODO: 持久化偏好到 config.toml,后续启动跳过检测)
+                return Ok(());
+            }
+            None => {
+                // 无效输入,重新提示
+                print!("Invalid choice. Select [1-N]: ");
+                io::stdout().flush()?;
+            }
+        }
+    }
+}
+
 /// Enforce the broad-CWD policy: when running from home or root, either
 /// require the --allow-broad-cwd flag, or prompt for confirmation (interactive),
 /// or exit with an error (non-interactive).
@@ -264,61 +305,31 @@ pub(crate) fn enforce_broad_cwd_policy(
     let is_interactive = io::stdin().is_terminal();
 
     if is_interactive {
-        // Interactive mode: 用 project_picker 让用户选择项目目录(如果有 recent)
-        // 或确认继续(无 recent 时回退到原 y/N 确认)。
-        let recent_dirs = collect_recent_project_dirs();
-
-        if recent_dirs.is_empty() {
-            // 无最近项目目录,回退到原 y/N 确认流程
-            println!(
-                "Warning: claw is running from a very broad directory ({}).\n\
-                 The agent can read and search everything under this path.\n\
-                 Consider running from inside your project: cd /path/to/project && claw",
-                cwd.display()
-            );
-            print!("Continue anyway? [y/N]: ");
-            io::stdout().flush()?;
-
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-            let trimmed = input.trim().to_lowercase();
-            if trimmed != "y" && trimmed != "yes" {
-                println!("Aborted.");
-                std::process::exit(0);
+        // TUI 构建下若有最近项目目录，用 project_picker 让用户选择；
+        // 无最近项目或不含 TUI 的构建（Web）走下面的 y/N 确认流程。
+        #[cfg(feature = "full-tui")]
+        {
+            let recent_dirs = collect_recent_project_dirs();
+            if !recent_dirs.is_empty() {
+                return confirm_with_project_picker(&recent_dirs, &cwd);
             }
-            return Ok(());
         }
 
-        // 有最近项目目录:显示 project_picker 菜单
-        use crate::tui_ports::project_picker;
-        let pq = project_picker::build_project_question(&recent_dirs, &cwd);
-        print!("{}", project_picker::render_question_stdout(&pq));
+        println!(
+            "Warning: claw is running from a very broad directory ({}).\n\
+             The agent can read and search everything under this path.\n\
+             Consider running from inside your project: cd /path/to/project && claw",
+            cwd.display()
+        );
+        print!("Continue anyway? [y/N]: ");
         io::stdout().flush()?;
 
-        loop {
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-            match project_picker::parse_choice(&pq, &input) {
-                Some(Some(chosen_path)) => {
-                    // 用户选择了一个项目目录,切换过去
-                    if let Err(e) = env::set_current_dir(chosen_path) {
-                        eprintln!("Failed to switch to {}: {e}", chosen_path.display());
-                        std::process::exit(1);
-                    }
-                    println!("Switched to: {}", chosen_path.display());
-                    break;
-                }
-                Some(None) => {
-                    // "Don't ask me again" —— 继续在当前目录
-                    // (TODO: 持久化偏好到 config.toml,后续启动跳过检测)
-                    break;
-                }
-                None => {
-                    // 无效输入,重新提示
-                    print!("Invalid choice. Select [1-N]: ");
-                    io::stdout().flush()?;
-                }
-            }
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let trimmed = input.trim().to_lowercase();
+        if trimmed != "y" && trimmed != "yes" {
+            println!("Aborted.");
+            std::process::exit(0);
         }
         Ok(())
     } else {
@@ -690,11 +701,8 @@ pub(crate) struct LiveCli {
     // 在 run_turn 调 runtime.run_turn 之前 prepend goal 前缀；
     // 网络错误时 pause；GoalTool 失败时 record_blocked。
     goal_manager: runtime::GoalManager,
-    // Phase 2: feature-gated status_emitter holder. When set (by TuiApp
-    // via set_status_emitter), prepare_turn_runtime injects it into the
-    // freshly-constructed AnthropicRuntimeClient so streaming events drive
-    // the TUI's StatusBarState + OutputView in real time.
-    #[cfg(feature = "full-tui")]
+    // 流式状态事件出口：TUI 与 Web 共用（Web 在 serve.rs 中挂载，
+    // 驱动 SSE 文本/工具事件）。不再按特性门控。
     status_emitter: Option<crate::streaming::StatusEmitter>,
     /// 热升级优雅中断信号(双大脑收官基石)。
     ///
@@ -989,11 +997,9 @@ impl LiveCli {
             goal_manager,
             upgrade_signal: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             steer_inbox: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            #[cfg(feature = "full-tui")]
             status_emitter: None,
             #[cfg(feature = "full-tui")]
             tui_output: None,
-            #[cfg(feature = "full-tui")]
             current_abort_signal: None,
             external_abort_signal: None,
             session_processes: None,
@@ -1178,10 +1184,8 @@ impl LiveCli {
                 client.set_thinking_mode(thinking);
             }
         }
-        // Phase 2: if a status_emitter is attached (TUI mode), inject it
-        // into the freshly-built AnthropicRuntimeClient so streaming events
-        // drive the TUI's StatusBarState + OutputView in real time.
-        #[cfg(feature = "full-tui")]
+        // 把状态事件出口注入本轮新建的 client 与工具执行器：
+        // TUI 状态栏/输出视图与 Web SSE 都依赖它。
         if let Some(emitter) = &self.status_emitter {
             if let Some(rt) = runtime.runtime.as_mut() {
                 rt.api_client_mut().set_status_emitter(Arc::clone(emitter));
@@ -3357,19 +3361,13 @@ impl LiveCli {
         self.runtime.usage().turns()
     }
 
-    /// Phase 2: Attach a StatusEmitter that will be injected into every
-    /// subsequently-built AnthropicRuntimeClient via prepare_turn_runtime.
-    /// The emitter receives streaming events (TextDelta, Usage, MessageStop,
-    /// StreamStart, ToolUse) and should update the caller's shared state
-    /// (e.g., TuiApp's OutputView + StatusBarState).
-    #[cfg(feature = "full-tui")]
+    /// 挂载状态事件出口，在后续每轮 prepare_turn_runtime 时注入新建的
+    /// client 与工具执行器（TUI 与 Web 共用）。
     pub(crate) fn set_status_emitter(&mut self, emitter: crate::streaming::StatusEmitter) {
         self.status_emitter = Some(emitter);
     }
 
-    /// Phase 2: Detach any previously-attached status emitter. Useful for
-    /// cleanup or switching emitters between sessions.
-    #[cfg(feature = "full-tui")]
+    /// 解除已挂载的状态事件出口。
     pub(crate) fn clear_status_emitter(&mut self) {
         self.status_emitter = None;
     }

@@ -60,9 +60,8 @@ pub(crate) struct CliToolExecutor {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
-    /// Optional status emitter for TUI mode. When set, ToolResult events are
-    /// emitted so the TUI can render collapsible tool cards.
-    #[cfg(feature = "full-tui")]
+    /// 状态事件出口（TUI 与 Web 共用）：工具执行完成时据此补发
+    /// ToolResult 事件，界面才能闭合工具卡片。
     status_emitter: Option<crate::streaming::StatusEmitter>,
     /// Phase 4 认知外骨骼：共享 ProjectTopology 实例，用于 refactor_algorithm_topo。
     /// 与 ConversationRuntime 共享同一个 Arc，避免重复构建。
@@ -83,7 +82,6 @@ impl CliToolExecutor {
             allowed_tools,
             tool_registry,
             mcp_state,
-            #[cfg(feature = "full-tui")]
             status_emitter: None,
             topology: None,
         }
@@ -98,7 +96,6 @@ impl CliToolExecutor {
         self
     }
 
-    #[cfg(feature = "full-tui")]
     pub(crate) fn set_status_emitter(&mut self, emitter: crate::streaming::StatusEmitter) {
         self.status_emitter = Some(emitter);
     }
@@ -120,7 +117,6 @@ impl CliToolExecutor {
         self.tool_registry.set_session_processes(processes);
     }
 
-    #[cfg(feature = "full-tui")]
     pub(crate) fn clear_status_emitter(&mut self) {
         self.status_emitter = None;
     }
@@ -288,7 +284,6 @@ impl ToolExecutor for CliToolExecutor {
         match result {
             Ok(output) => {
                 // Emit ToolResult event for TUI consumption (regardless of emit_output)
-                #[cfg(feature = "full-tui")]
                 if let Some(emitter) = &self.status_emitter {
                     emitter(crate::streaming::StatusEvent::ToolResult {
                         id: String::new(),
@@ -317,7 +312,6 @@ impl ToolExecutor for CliToolExecutor {
             }
             Err(error) => {
                 // Emit ToolResult error event for TUI consumption
-                #[cfg(feature = "full-tui")]
                 if let Some(emitter) = &self.status_emitter {
                     emitter(crate::streaming::StatusEvent::ToolResult {
                         id: String::new(),

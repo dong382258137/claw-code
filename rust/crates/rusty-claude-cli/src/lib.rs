@@ -466,10 +466,9 @@ pub fn plugin_load_failure_json(failure: &plugins::PluginLoadFailure) -> Value {
     })
 }
 
-/// Entry point for `claw --tui`: construct LiveCli via the shared helper and
-/// hand off to `tui::run_tui_repl`. Only compiled when `full-tui` feature is on;
-/// without the feature, the dispatch in `run()` prints an error and exits.
-#[cfg(feature = "full-tui")]
+/// 细粒度诊断日志（`~/.claw/claw-diag.log`）。
+///
+/// 原为 TUI 专用，但 Web 端排查会话卡死同样依赖该日志，故不再按特性门控。
 pub(crate) fn diag_log(msg: &str) {
     use std::io::Write;
     let home = std::env::var_os("USERPROFILE")
