@@ -90,13 +90,13 @@
 ### 1.2 三处硬耦合
 
 1. **流式事件类型挂在终端渲染栈上**
-   Web 每轮调用 [`set_status_emitter`](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/serve.rs#L2060)，该方法在 [`app.rs`](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/app.rs#L3365-L3368) 被 `#[cfg(feature = "full-tui")]` 门控；`StatusEmitter` 定义在 `streaming.rs`，经 `render.rs` 依赖 `crossterm` 与 `syntect`。
+   Web 每轮调用 [`set_status_emitter`](file:///d:/claw-code-src/rust/crates/claw-server/src/serve.rs#L2060)，该方法在 [`app.rs`](file:///d:/claw-code-src/rust/crates/claw-server/src/app.rs#L3365-L3368) 被 `#[cfg(feature = "full-tui")]` 门控；`StatusEmitter` 定义在 `streaming.rs`，经 `render.rs` 依赖 `crossterm` 与 `syntect`。
 
 2. **CLI 核心代码反向引用 TUI 模块**
-   [`enforce_broad_cwd_policy`](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/app.rs#L210-L248) 直接调用 `crate::tui_ports::project_picker`，没有特性门控。
+   [`enforce_broad_cwd_policy`](file:///d:/claw-code-src/rust/crates/claw-server/src/app.rs#L210-L248) 直接调用 `crate::tui_ports::project_picker`，没有特性门控。
 
 3. **执行内核与界面层混在一个结构里**
-   [`LiveCli`](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/app.rs#L674-L742) 同时持有 Web 需要的运行态（`external_abort_signal`、`session_processes`、`steer_inbox`）和 TUI 专用的 `tui_output`、`status_emitter`、`diag_callback`、`tool_result_callback`。
+   [`LiveCli`](file:///d:/claw-code-src/rust/crates/claw-server/src/app.rs#L674-L742) 同时持有 Web 需要的运行态（`external_abort_signal`、`session_processes`、`steer_inbox`）和 TUI 专用的 `tui_output`、`status_emitter`、`diag_callback`、`tool_result_callback`。
 
 **验证结果**：`cargo check -p rusty-claude-cli --no-default-features` 报 5 个错误，全部来自上述耦合。
 
@@ -121,26 +121,26 @@ release 二进制 71.5 MB（2026-11-26 复核 `target/release/claw.exe`，早期
 ### 1.5 Web 端现有性能问题
 
 1. **会话流每 0.9 秒全量重读**
-   [`api_stream`](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/serve.rs#L1768-L1783) 每个轮询周期调用 [`session_view`](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/serve.rs#L5558-L5560)，后者 `Session::load_from_path` 重新读盘并解析整个 JSONL。每个打开的浏览器标签各跑一份，长会话越用越慢。
+   [`api_stream`](file:///d:/claw-code-src/rust/crates/claw-server/src/serve.rs#L1768-L1783) 每个轮询周期调用 [`session_view`](file:///d:/claw-code-src/rust/crates/claw-server/src/serve.rs#L5558-L5560)，后者 `Session::load_from_path` 重新读盘并解析整个 JSONL。每个打开的浏览器标签各跑一份，长会话越用越慢。
 
 2. **会话列表每次重新扫描，且有 50 条硬上限**
    `all=1` 聚合时每个工作区只取最近 50 条，`total` 也按截断后的数量计算。第 51 条以后的历史会话在侧栏里不存在。
 
 3. **流式用量被丢弃**
-   [`StatusEvent::Usage(_) => return`](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/serve.rs#L2150)，前端只能轮末从快照统计，流式期间没有上下文占用反馈。
+   [`StatusEvent::Usage(_) => return`](file:///d:/claw-code-src/rust/crates/claw-server/src/serve.rs#L2150)，前端只能轮末从快照统计，流式期间没有上下文占用反馈。
 
 4. **恢复会话没有挂全文索引**
-   [`new_cli_session_in`](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/session_mgr.rs#L1225-L1241) 会挂 `.claw/history.db`，但 Web 恢复会话走的 [`load_session_reference_in`](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/session_mgr.rs#L1370-L1384) 不挂。结果是 Web 会话里的 `session_search` 能力很可能一直失效。
+   [`new_cli_session_in`](file:///d:/claw-code-src/rust/crates/claw-server/src/session_mgr.rs#L1225-L1241) 会挂 `.claw/history.db`，但 Web 恢复会话走的 [`load_session_reference_in`](file:///d:/claw-code-src/rust/crates/claw-server/src/session_mgr.rs#L1370-L1384) 不挂。结果是 Web 会话里的 `session_search` 能力很可能一直失效。
 
 5. **多会话并发受常驻 worker 数量影响**
-   [`MAX_HOT_WORKERS = 8`、空闲 90 秒退出](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/serve/scheduler.rs#L34-L41)。每个常驻 worker 持有一份 `LiveCli`，包含系统提示、仓库拓扑与 MCP 客户端；并发会话多时内存会抬升。
+   [`MAX_HOT_WORKERS = 8`、空闲 90 秒退出](file:///d:/claw-code-src/rust/crates/claw-server/src/serve/scheduler.rs#L34-L41)。每个常驻 worker 持有一份 `LiveCli`，包含系统提示、仓库拓扑与 MCP 客户端；并发会话多时内存会抬升。
 
 ### 1.6 已有的可复用基础设施
 
 - **SQLite 已在用**：`rusqlite` bundled（[runtime Cargo.toml](file:///d:/claw-code-src/rust/crates/runtime/Cargo.toml#L16)）。
 - **FTS5 全文索引已存在**：[`HistoryIndex`](file:///d:/claw-code-src/rust/crates/runtime/src/history_search.rs#L54-L97)，含 v1→v4 迁移、CJK 分词、可选向量表 `history_vectors`。
 - **记忆注入已存在**：每轮取 top-3 记忆渲染为 `# Relevant Memories` 注入请求（[conversation.rs](file:///d:/claw-code-src/rust/crates/runtime/src/conversation.rs#L3990-L4020)）。
-- **调度器已存在**：全局并发 4、每工作区 1、每会话排队 5（[scheduler.rs](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/serve/scheduler.rs#L31-L83)）。
+- **调度器已存在**：全局并发 4、每工作区 1、每会话排队 5（[scheduler.rs](file:///d:/claw-code-src/rust/crates/claw-server/src/serve/scheduler.rs#L31-L83)）。
 
 ---
 
@@ -213,7 +213,7 @@ infra/     会话索引、设置、热升级、路径解析
 | Phase 6 定时任务真实执行 | 已完成（2026-11-26） | 新增 `serve/cron_expr`（5 段 cron：`*`、`*/n`、`a-b`、列表，按本地时区求下次时间，日/周同时受限走标准「或」语义）与 `serve/cron_runner`（15 s tick、进程内下次到期表、启动按 `last_run_at`→`created_at` 重算只补跑最近一次）。`CronEntry` 增加 `session_id`/`last_status`/`last_finished_at`/`last_error`（`serde(default)` 兼容旧文件），新增 `bind_session`/`record_start`/`record_finish`；到期任务封装为 `PromptJob` 进入现有 `Scheduler`，不绕过并发门闸；专属会话首次执行时创建（标题 `定时任务 · 名称`，删除后下次执行自动重建，不提供改绑）；权限继承 Web 设置且最高 `workspace-write`；同一任务上次未结束时记 `skipped` 并推跳过事件。API：列表返回 `next_run_at`/`last_status`/`schedule_error`，新建时校验表达式（非法 400），`POST .../{id}/run` 实装为立即入队（运行中 409）；worker 收尾写回结果并向该会话事件流推送 `kind=cron` 的 `start`/`end`/`skipped`；TasksPane 显示下次执行/上次结果并支持立即执行。实测（debug serve + 真实模型）：每分钟任务连续 3 次 `success`，会话落盘 3 轮 user/assistant 且 `run_count=3`；重启后 8 s 内不重复，下一分钟继续第 4 次；全局并发 4 被占满时手动触发任务状态 `queued>running` 后 `success`；重叠触发返回 409 且 `run_count` 不增；SSE 收到 start/end 各 1 条；非法表达式 400。`cargo test -p rusty-claude-cli` 151 通过（新增 cron_expr 7）、`cargo test -p runtime cron` 29 通过，clippy 干净 |
 | Phase 7 中文嵌入模型与 ONNX 动态加载 | 已完成（2026-11-26，体积目标未达） | `fastembed` 改 `default-features = false` + `ort-load-dynamic` + `hf-hub-native-tls`（不再静态链接 ONNX、去掉 image-models 依赖），模型切 `BGESmallZHV15`（512 维，`name()` = `bge-small-zh-v1.5`）。新增 `runtime::EmbeddingStatus` / `embedding_status()`：serve 启动后台预热，`/api/meta.embedding` 上报 `ready/keyword/loading/disabled`，设置页「关于」新增「语义检索」状态行（降级显示“关键词降级”并附原因）。初始化前预检 `onnxruntime.dll`（`ORT_DYLIB_PATH` → exe 同目录 → cwd），缺库/版本不兼容（ort 内部 panic 已兜住）统一返回 None 走关键词降级。`history_meta` 增加 `embedding_model`：与当前模型不一致时清空 `history_vectors` 并后台分批重建（独立连接 + busy timeout + EXISTS 守卫防孤儿向量）；记忆 L1 索引本就只存文本，加载时重算，未改。评测（25 条中文记忆查询对，top-3）：BGE-small-en-v1.5 11/25 = 44.0%，bge-small-zh-v1.5 20/25 = 80.0%，保留切换。实测：`claw.exe` 58.7 → **40.41 MB**（-18.3 MB，`onnxruntime.dll` 16.0 MB 独立分发）；移走 DLL 后服务正常启动、首页 200、`/api/meta` 返回 `state=keyword`；旧工作区（schema v4、384 维旧向量、无 `embedding_model`）首次对话后自动写入 `embedding_model` 并将 2 条旧向量重建为 2048 B（512×f32），日志 `[history] rebuilt 2 vector(s)`。**偏差**：主二进制未达 ≤25 MB，剩余体积（wasmtime/tiktoken 词表/axum/portable-pty 等）留 Phase 8 排查。`cargo test -p runtime history` 45 通过（新增模型切换重建回归测试）、`cargo test -p rusty-claude-cli` 151 通过，clippy 干净 |
 | Phase 8 体积实测与动态加载收口 | 已完成（2026-11-26） | release profile 增加 `opt-level="z"` + `lto="fat"` + `codegen-units=1` + `strip="symbols"`：`claw.exe` 40.41 → **22.88 MB**（较 Phase 3 静态基线 58.7 MB 降 61%，≤25 MB 达成）。语义检索从“启动预热”改为“启动仅探测 DLL、首次检索加载模型”（新增 `runtime::probe_embedding`，状态可更新）：空闲 RSS 10.3–10.6 MB，加载模型后 ≈163 MB，首轮 `build_runtime` 1.07 s（含模型加载）。三组实测见下方对比表（静态基线 58.7 MB / 560–772 ms / 12.5 MB；动态+profile 22.88 MB / 503–516 ms / 10.3–10.6 MB；移走 DLL 同二进制 / 501–514 ms / 10.6 MB，`/api/meta` state=keyword，首页 200、737 KB）。`cargo bloat`：CLI 4.6 / tools 4.4 / runtime 4.2 / chromiumoxide 3.9 MiB，未再删功能依赖（wasmtime、tiktoken 已不在依赖图）。新增 `scripts/package-release.ps1`（exe×2 + DLL×2 + README，zip 实测 22.38 MB）。**遗留**：启动到监听 503–516 ms，仍未达 ≤300 ms 目标（Phase 9 前再评估）。`cargo test -p rusty-claude-cli` 151 通过、`cargo test -p runtime history` 45 通过，clippy 干净 |
-| Phase 9 收尾 | 已完成（2026-11-26） | crate 目录与包名 `rusty-claude-cli` → `claw-server`，同步更新 `use claw_server`、runtime 的路径判断（`source_root` / `upgrade_helper` / `evolution_*` / `compact` / `conversation` 热升级提示）与 `scripts/package-release.ps1`、`install.ps1`、`dogfood-build.sh`。CI：`rust-ci.yml` 新增前端构建校验（`npm ci && npm run build` + 产物非空），Windows smoke 改为构建 `claw-server` + `im-bridge` 并执行 `--version`/`--help`（旧 `help/status/config/doctor` 已删除）。文档：README 快速开始改 `claw serve`、性能数据回填；USAGE 重写为 Web 启动/配置/权限/定时任务/语义检索/排障；`rust/README.md` 重写 crate 地图；CLAUDE.md 更新仓库形态；PARITY.md 收缩为当前有效条目并移除 CLI/TUI/mock harness 记录；删除 4 个已失效的 mock parity 脚本/清单。回退点：tag `phase8-pre-rename`（Phase 8 提交 `434847d4`）。验证：`cargo test -p claw-server` 151 通过、runtime history 45 通过、clippy/fmt 干净 |
+| Phase 9 收尾 | 已完成（2026-11-26） | crate 目录与包名 `rusty-claude-cli` → `claw-server`，同步更新 `use claw_server`、runtime 的路径判断（`source_root` / `upgrade_helper` / `evolution_*` / `compact` / `conversation` 热升级提示）与 `scripts/package-release.ps1`、`install.ps1`、`dogfood-build.sh`。CI：`rust-ci.yml` 新增前端构建校验（`npm ci && npm run build` + 产物非空），Windows smoke 改为构建 `claw-server` + `im-bridge` 并执行 `--version`/`--help`（旧 `help/status/config/doctor` 已删除）；release-readiness 链接检查收窄到 living/policy 文档（归档设计文档为历史记录，不再参与，消除 300+ 条历史断链误报）。文档：README 快速开始改 `claw serve`、性能数据回填；USAGE 重写为 Web 启动/配置/权限/定时任务/语义检索/排障；`rust/README.md` 重写 crate 地图；CLAUDE.md 更新仓库形态；PARITY.md 收缩为当前有效条目并移除 CLI/TUI/mock harness 记录；删除 4 个已失效的 mock parity 脚本/清单。回退点：tag `phase8-pre-rename`（Phase 8 提交 `434847d4`）。验证：`cargo test -p claw-server` 151 通过、runtime history 45 通过、clippy/fmt 干净 |
 
 ### Phase 0：基线与测量脚本
 

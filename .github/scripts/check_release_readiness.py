@@ -5,8 +5,8 @@ The check is intentionally dependency-free so it can run on developer machines,
 Windows CI, and minimal release jobs. It validates:
 
 * required repository policy files exist;
-* local Markdown links and image targets resolve;
-* local heading anchors referenced from Markdown resolve; and
+* local Markdown links and image targets in living/policy docs resolve;
+* local heading anchors referenced from living docs resolve; and
 * command examples do not present the deprecated `cargo install claw-code`
   package as an executable install path.
 """
@@ -41,7 +41,18 @@ MARKDOWN_ROOTS = [
     ROOT / "docs",
     ROOT / "rust" / "README.md",
     ROOT / "rust" / "USAGE.md",
-    ROOT / "rust" / "MOCK_PARITY_HARNESS.md",
+]
+
+# Link/anchors are validated only for living or policy docs. Archived design
+# notes under docs/ are historical records whose links are not maintained.
+LIVING_DOCS = [
+    ROOT / "README.md",
+    ROOT / "USAGE.md",
+    ROOT / "PARITY.md",
+    ROOT / "PHILOSOPHY.md",
+    ROOT / "ROADMAP.md",
+    ROOT / "rust" / "README.md",
+    *(ROOT / name for name in REQUIRED_POLICY_FILES),
 ]
 
 LINK_PATTERN = re.compile(r"(?<!!)\[[^\]\n]+\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
@@ -92,7 +103,7 @@ def validate_policies(errors: list[str]) -> None:
 
 def validate_markdown_links(errors: list[str]) -> None:
     anchor_cache: dict[Path, set[str]] = {}
-    for path in iter_markdown_files():
+    for path in sorted(p for p in LIVING_DOCS if p.is_file()):
         text = path.read_text(encoding="utf-8")
         candidates = [m.group(1) for m in LINK_PATTERN.finditer(text)]
         candidates.extend(m.group(1) for m in HTML_LINK_PATTERN.finditer(text))
@@ -101,6 +112,8 @@ def validate_markdown_links(errors: list[str]) -> None:
                 not target
                 or is_external(target)
                 or target.startswith(("mailto:", "tel:", "data:"))
+                # Documentation may quote example links verbatim; skip placeholders.
+                or "/absolute/path/to/" in target
             ):
                 continue
             link_path, _, raw_anchor = target.partition("#")
