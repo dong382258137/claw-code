@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { api, postJson, withToken } from './api'
 import { useToasts } from './shared/useToasts.js'
-import { basename, clampWidth, relTime } from './shared/utils.js'
+import { basename, clampWidth, formatTokens, relTime } from './shared/utils.js'
 import { navigate, useRoute } from './shared/router.js'
 import { Sidebar } from './shell/Sidebar.jsx'
 import { WorkspacePicker } from './shell/WorkspacePicker.jsx'
@@ -54,6 +54,9 @@ export default function App() {
   // 当前会话的调度状态：idle / queued / running + 等待条数 + 队首位次。
   // mine 是本次发送在队列里的位次（来自 POST /prompt 的 202 响应）。
   const [queue, setQueue] = useState({ state: 'idle', position: 0, queued: 0, mine: 0 })
+  // 最近一次 Usage 事件：输入侧三桶之和即当前请求的上下文占用。
+  const [usage, setUsage] = useState(null)
+  const [compacting, setCompacting] = useState(false)
   // SSE 回调里读 running 会拿到创建闭包时的旧值（该 effect 只依赖 currentId/push），
   // 用 ref 同步最新运行态，供「重试」动作判断本轮是否仍在跑。
   const runningRef = useRef(false)
@@ -214,6 +217,7 @@ export default function App() {
     setConnected,
     setPendingDraft,
     setTaskEvent,
+    setUsage,
     lastPromptRef,
     runningRef,
     sendRef,
@@ -367,6 +371,7 @@ export default function App() {
     setOptimistic(null)
     setApprovals([])
     setQueue({ state: 'idle', position: 0, queued: 0, mine: 0 })
+    setUsage(null)
   }, [])
 
   // 返回新建的会话（失败返回 null）。发送路径需要在「没有选中会话」时自动建会话，
@@ -486,6 +491,31 @@ export default function App() {
     }
   }, [currentId, push])
 
+  const exportSession = useCallback((session) => {
+    const url = withToken(`/api/session/${encodeURIComponent(session.id)}/export?format=md`)
+    // 用隐藏链接触发下载：Content-Disposition 由后端给出，浏览器不会离开当前页面。
+    const link = document.createElement('a')
+    link.href = url
+    link.download = ''
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    push('已开始导出会话（Markdown）')
+  }, [push])
+
+  const initWorkspace = useCallback(async () => {
+    const target = activeWorkspace
+    if (!target) { push('请先选择工作区', 'error'); return }
+    if (!window.confirm(`将在 ${target} 生成 CLAUDE.md / .claw.json，并补齐 .gitignore 规则。继续？`)) return
+    try {
+      const result = await postJson('/api/workspace/init', { workspace: target })
+      const count = (list) => (list || []).length
+      push(`项目初始化完成：新建 ${count(result.created)}、更新 ${count(result.updated)}、覆盖 ${count(result.overwritten)}、跳过 ${count(result.skipped)}。${result.next_step || ''}`)
+    } catch (error) {
+      push(`初始化失败：${error.message}`, 'error')
+    }
+  }, [activeWorkspace, push])
+
   const decideApproval = useCallback(async (approval, allow) => {
     setApprovals((list) => list.filter((item) => item.id !== approval.id))
     try {
@@ -566,6 +596,25 @@ export default function App() {
     }
   }, [currentId, push, running])
 
+  // 手动压缩：服务端会重写会话文件并推送 reset，前端随后自动拉新快照。
+  const compactSession = useCallback(async () => {
+    if (!currentId || compacting) return
+    if (!window.confirm('压缩会移除较早的消息并写入摘要，压缩后无法撤销。继续？')) return
+    setCompacting(true)
+    try {
+      const result = await postJson(`/api/session/${encodeURIComponent(currentId)}/compact`, {})
+      if (result.removed_messages > 0) {
+        push(`已压缩：移除 ${result.removed_messages} 条消息，${formatTokens(result.before_tokens)} → ${formatTokens(result.after_tokens)} tok`)
+      } else {
+        push(result.message || '消息太少，无需压缩')
+      }
+    } catch (error) {
+      push(`压缩失败：${error.message}`, 'error')
+    } finally {
+      setCompacting(false)
+    }
+  }, [compacting, currentId, push])
+
   // 语音讨论不是任务，也不该是 agent 会话：
   // 它只需要一个纯对话通道（/api/voice/chat，无工具、不落盘），
   // 因此这里不再创建 session、不切 currentId、不动主会话的任何状态。
@@ -621,6 +670,7 @@ export default function App() {
       onRename={renameSession}
       onDelete={deleteSession}
       onDeleteMany={deleteSessions}
+      onExport={exportSession}
       total={sessionTotal}
       onLoadMore={loadMoreSessions}
       onSettings={() => setSettingsOpen(true)}
@@ -673,7 +723,11 @@ export default function App() {
         onNewInWorkspace={startInFolder}
         onPickWorkspace={pickTargetWorkspace}
         onOpenWorkspacePicker={() => setWorkspacePickerOpen(true)}
+        onInitWorkspace={initWorkspace}
         stats={current?.stats}
+        usage={usage}
+        compacting={compacting}
+        onCompact={compactSession}
         pendingRef={pendingRef}
         onRefUsed={setPendingRef}
         pendingDraft={pendingDraft}

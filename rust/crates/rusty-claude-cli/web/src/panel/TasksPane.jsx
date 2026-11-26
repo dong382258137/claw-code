@@ -86,7 +86,7 @@ function PlanGlyph() {
   )
 }
 
-export function TasksPane({ currentId, workspace, taskEvent, connected, onError }) {
+export function TasksPane({ currentId, workspace, taskEvent, connected, onError, onToast }) {
   const [data, setData] = useState(EMPTY_TASKS)
   const [goal, setGoal] = useState(null)
   const [plans, setPlans] = useState([])
@@ -97,6 +97,11 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError 
   const [planState, setPlanState] = useState(EMPTY_PLAN)
   const [newTodo, setNewTodo] = useState('')
   const [busy, setBusy] = useState(false)
+  // 定时任务（Phase 4 骨架）：存储在工作区 .claw/crons.json，执行器 Phase 6 接入。
+  const [scheduledCrons, setScheduledCrons] = useState([])
+  const [cronSchedule, setCronSchedule] = useState('')
+  const [cronPrompt, setCronPrompt] = useState('')
+  const [cronBusy, setCronBusy] = useState(false)
 
   // 版本号用于丢弃乱序/重复事件：SSE 事件与 GET 快照都带 revision，
   // 只有更大的才覆盖，重连后旧快照不会把新状态冲掉。
@@ -125,13 +130,15 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError 
       api(sessionPath('/tasks')).catch(() => EMPTY_TASKS),
       api(withWorkspace('/api/workspace/goal', workspace)).catch(() => ({ goal: null })),
       api(withWorkspace('/api/workspace/plans', workspace)).catch(() => ({ plans: [] })),
+      api(withWorkspace('/api/workspace/crons', workspace)).catch(() => ({ crons: [] })),
       api(sessionPath('/todos')).catch(() => ({ items: [], revision: 0 })),
       api(sessionPath('/plan')).catch(() => null),
-    ]).then(([tasks, goalBody, plansBody, todoBody, planBody]) => {
+    ]).then(([tasks, goalBody, plansBody, cronBody, todoBody, planBody]) => {
       setData(tasks)
       setActivePlanId(tasks.active_plan_id || null)
       setGoal(goalBody.goal)
       setPlans(plansBody.plans || [])
+      setScheduledCrons(cronBody.crons || [])
       const revision = Number(todoBody.revision || 0)
       if (revision >= todoRev.current) {
         todoRev.current = revision
@@ -155,8 +162,12 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError 
     setPlans([])
     setGoal(null)
     setPlanState(EMPTY_PLAN)
+    setScheduledCrons([])
     setNewTodo('')
+    setCronSchedule('')
+    setCronPrompt('')
     setBusy(false)
+    setCronBusy(false)
     loadAll()
     return undefined
     // connected 只在切换会话时取初始值，断线重连由下面的 effect 处理。
@@ -245,6 +256,70 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError 
       onError?.(`计划模式切换失败：${error.message}`)
     } finally {
       setBusy(false)
+    }
+  }
+
+  const addCron = async () => {
+    const schedule = cronSchedule.trim()
+    const prompt = cronPrompt.trim()
+    if (!schedule || !prompt) { onError?.('定时任务需要填写表达式和提示词'); return }
+    if (cronBusy) return
+    setCronBusy(true)
+    try {
+      const body = await postJson('/api/workspace/crons', { schedule, prompt, workspace })
+      setScheduledCrons((list) => [body.cron, ...list])
+      setCronSchedule('')
+      setCronPrompt('')
+      onToast?.('定时任务已创建（真实执行将在 Phase 6 接入）')
+    } catch (error) {
+      onError?.(`创建定时任务失败：${error.message}`)
+    } finally {
+      setCronBusy(false)
+    }
+  }
+
+  const toggleCron = async (cron) => {
+    if (cronBusy) return
+    setCronBusy(true)
+    try {
+      const body = await api(
+        withWorkspace(`/api/workspace/crons/${encodeURIComponent(cron.cron_id)}/toggle`, workspace),
+        { method: 'POST' },
+      )
+      setScheduledCrons((list) => list.map((item) => (item.cron_id === cron.cron_id ? body.cron : item)))
+    } catch (error) {
+      onError?.(`切换定时任务失败：${error.message}`)
+    } finally {
+      setCronBusy(false)
+    }
+  }
+
+  const deleteCron = async (cron) => {
+    if (cronBusy) return
+    if (!window.confirm(`删除定时任务「${cron.description || cron.schedule}」？`)) return
+    setCronBusy(true)
+    try {
+      await api(
+        withWorkspace(`/api/workspace/crons/${encodeURIComponent(cron.cron_id)}`, workspace),
+        { method: 'DELETE' },
+      )
+      setScheduledCrons((list) => list.filter((item) => item.cron_id !== cron.cron_id))
+    } catch (error) {
+      onError?.(`删除定时任务失败：${error.message}`)
+    } finally {
+      setCronBusy(false)
+    }
+  }
+
+  // Phase 4 骨架：后端明确返回 501，这里把原因原样告诉用户。
+  const runCron = async (cron) => {
+    try {
+      await api(
+        withWorkspace(`/api/workspace/crons/${encodeURIComponent(cron.cron_id)}/run`, workspace),
+        { method: 'POST' },
+      )
+    } catch (error) {
+      onError?.(`立即执行：${error.detail || error.message}`)
     }
   }
 
@@ -501,6 +576,47 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError 
               }}
             />
             <button onClick={addTodo}>添加</button>
+          </div>
+        </section>
+
+        <section className="tp-section">
+          <div className="tp-section-head">
+            定时任务
+            <span className="tp-count">{scheduledCrons.length}</span>
+          </div>
+          {scheduledCrons.length > 0 && (
+            <div className="tp-list">
+              {scheduledCrons.map((cron) => (
+                <div key={cron.cron_id} className={`tp-cron ${cron.enabled ? '' : 'off'}`}>
+                  <span className="tp-cron-schedule">{cron.schedule}</span>
+                  <span className="tp-cron-prompt" title={cron.prompt}>{cron.description || cron.prompt}</span>
+                  <span className="tp-cron-actions">
+                    <button disabled={cronBusy} onClick={() => toggleCron(cron)}>{cron.enabled ? '停用' : '启用'}</button>
+                    <button disabled={cronBusy} onClick={() => runCron(cron)}>执行</button>
+                    <button disabled={cronBusy} onClick={() => deleteCron(cron)}>×</button>
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+          {scheduledCrons.length === 0 && <div className="tp-empty-line">还没有定时任务（真实执行将在 Phase 6 接入）</div>}
+          <div className="tp-cron-add">
+            <input
+              value={cronSchedule}
+              placeholder="表达式，如 0 9 * * *"
+              onChange={(event) => setCronSchedule(event.target.value)}
+            />
+            <input
+              value={cronPrompt}
+              placeholder="到点执行的提示词"
+              onChange={(event) => setCronPrompt(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== 'Enter') return
+                event.preventDefault()
+                addCron()
+              }}
+            />
+            <button disabled={cronBusy} onClick={addCron}>添加</button>
           </div>
         </section>
 

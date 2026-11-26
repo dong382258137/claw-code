@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { basename, relTime } from '../shared/utils.js'
 
-export function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, onSelect, onNew, onNewIn, onAddWorkspace, onOpenPicker, workspaces, activeWorkspace, onRename, onDelete, onDeleteMany, total, onLoadMore, onSettings, onTheme, theme, route = 'chat', onNavigate }) {
+export function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, onSelect, onNew, onNewIn, onAddWorkspace, onOpenPicker, workspaces, activeWorkspace, onRename, onDelete, onDeleteMany, onExport, total, onLoadMore, onSettings, onTheme, theme, route = 'chat', onNavigate }) {
   // 侧栏项目组默认全部收起：首次打开只列出项目本身，便于先选工作区再看会话。
   // 这里只记录用户手动「展开」过的项目（空集 = 全收起），比记录收起集合少一次
   // 依赖 sessions 异步加载的初始化时序。搜索时忽略收起状态，否则命中的会话会被
@@ -217,6 +217,7 @@ export function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onTo
                         </button>
                         {!selecting && (
                           <span className="session-actions">
+                            <button title="导出会话（Markdown）" onClick={(event) => { event.stopPropagation(); onExport?.(session) }}>⤓</button>
                             <button title="重命名" onClick={(event) => { event.stopPropagation(); onRename(session) }}>✎</button>
                             <button title="删除" onClick={(event) => { event.stopPropagation(); onDelete(session) }}>×</button>
                           </span>

@@ -385,6 +385,19 @@ impl CronRegistry {
         Ok(())
     }
 
+    /// Re-enable a previously disabled cron entry.
+    pub fn enable(&self, cron_id: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().expect("cron registry lock poisoned");
+        let entry = inner
+            .entries
+            .get_mut(cron_id)
+            .ok_or_else(|| format!("cron not found: {cron_id}"))?;
+        entry.enabled = true;
+        entry.updated_at = now_secs();
+        persist_cron_inner(&mut inner);
+        Ok(())
+    }
+
     /// Record a cron run.
     pub fn record_run(&self, cron_id: &str) -> Result<(), String> {
         let mut inner = self.inner.lock().expect("cron registry lock poisoned");
@@ -682,6 +695,25 @@ mod tests {
         assert!(entry.enabled);
         assert_eq!(entry.run_count, 0);
         assert_eq!(entry.last_run_at, None);
+    }
+
+    #[test]
+    fn cron_enable_restores_disabled_entry() {
+        // given
+        let registry = CronRegistry::new();
+        let entry = registry.create("0 9 * * *", "Daily", Some("morning"));
+        registry
+            .disable(&entry.cron_id)
+            .expect("disable should succeed");
+        assert!(!registry.get(&entry.cron_id).expect("entry").enabled);
+
+        // when
+        registry.enable(&entry.cron_id).expect("enable should succeed");
+
+        // then
+        assert!(registry.get(&entry.cron_id).expect("entry").enabled);
+        assert_eq!(registry.list(true).len(), 1);
+        assert!(registry.enable("missing").is_err());
     }
 
     #[test]

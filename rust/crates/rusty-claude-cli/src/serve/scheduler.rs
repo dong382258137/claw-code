@@ -282,6 +282,9 @@ pub struct Scheduler {
     /// S3-M2:每会话的子进程登记表（bash 前台/后台）。worker 退出、看门狗
     /// 回收、会话删除时整体终止该会话的进程树。
     processes: Mutex<HashMap<String, Arc<SessionProcesses>>>,
+    /// 会话文件被外部改写（如手动压缩）时递增；worker 的 LiveCli 缓存
+    /// 代际不匹配就必须从磁盘重建，避免用旧会话覆盖压缩结果。
+    epochs: Mutex<HashMap<String, u64>>,
 }
 
 #[derive(Clone, Copy)]
@@ -299,7 +302,29 @@ impl Scheduler {
             workers: Mutex::new(HashMap::new()),
             orphans: AtomicUsize::new(0),
             processes: Mutex::new(HashMap::new()),
+            epochs: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 会话文件被外部改写：递增代际，让所有 worker 下一轮重建 LiveCli。
+    pub fn bump_epoch(&self, session: &str) -> u64 {
+        let mut epochs = self
+            .epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = epochs.entry(session.to_string()).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    /// 当前代际；未发生过外部改写时为 0。
+    pub fn epoch(&self, session: &str) -> u64 {
+        *self
+            .epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session)
+            .unwrap_or(&0)
     }
 
     /// S3-M2:取得（或创建）该会话的子进程登记表，供 worker 注入本轮运行态。
@@ -737,6 +762,10 @@ impl Scheduler {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         sessions.remove(session);
         drop(sessions);
+        self.epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session);
         // S3-M2:删除会话即终止其登记的全部子进程树。
         self.kill_processes(session);
     }

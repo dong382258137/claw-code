@@ -1300,6 +1300,24 @@ details.plan > summary { display: flex; justify-content: space-between; gap: 10p
 .queue-hint { margin: 0 4px 6px; padding: 4px 8px; border-radius: var(--r-sm); background: var(--layer-2); color: var(--label-secondary); font-size: 12px; }
 .queue-hint.full { color: var(--danger); }
 
+/* 上下文占用条：压在输入框正上方，流式期间随 Usage 事件实时更新。 */
+.context-bar {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 4px 6px; padding: 4px 8px;
+  border-radius: var(--r-sm);
+  background: var(--layer-2);
+  color: var(--label-secondary);
+  font-size: 12px;
+}
+.context-track { position: relative; flex: none; width: 88px; height: 4px; border-radius: 999px; background: var(--border-l1); overflow: hidden; }
+.context-track i { display: block; height: 100%; border-radius: inherit; background: var(--link); transition: width 0.25s var(--ease); }
+.context-bar.high .context-track i { background: var(--danger); }
+.context-bar.high .context-text { color: var(--danger); }
+.context-text { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.context-compact { flex: none; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border-l1); background: transparent; color: var(--label-secondary); font-size: 11.5px; }
+.context-compact:hover:not(:disabled) { color: var(--label-primary); border-color: var(--label-secondary); }
+.context-compact:disabled { opacity: 0.5; cursor: default; }
+
 /* 窄屏（<1100px）面板改为浮层抽屉：按钮的「显示/隐藏面板」与真实可见性严格一致。 */
 @media (max-width: 1100px) {
   .panel-drawer-mask { position: fixed; inset: 0; z-index: 70; display: flex; background: rgba(0, 0, 0, 0.45); }
@@ -1694,6 +1712,30 @@ details.process-thinking .expand-full { margin: 4px 0 8px; }
 .tp-todo-add input:focus { border-color: var(--border-l3); }
 .tp-todo-add input::placeholder { color: var(--label-caption); }
 .tp-todo-add button { flex: none; border: 1px solid var(--border-l2); font-size: 12px; }
+
+/* 定时任务（Phase 4 骨架）：一行一条，表达式固定宽度，提示词省略。 */
+.tp-cron {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px; border-radius: var(--r-sm);
+  background: var(--tp-card); border: 1px solid var(--border-l1);
+}
+.tp-cron.off { opacity: 0.55; }
+.tp-cron-schedule { flex: none; font-family: var(--font-code); font-size: 11.5px; color: var(--link); }
+.tp-cron-prompt { flex: 1; min-width: 0; font-size: 12px; color: var(--label-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tp-cron-actions { flex: none; display: flex; gap: 4px; }
+.tp-cron-actions button { padding: 2px 7px; font-size: 11.5px; border: 1px solid var(--border-l1); border-radius: 999px; color: var(--label-secondary); }
+.tp-cron-actions button:hover:not(:disabled) { color: var(--label-primary); border-color: var(--border-l3); }
+.tp-cron-actions button:disabled { opacity: 0.4; cursor: default; }
+.tp-cron-add { display: flex; gap: 6px; margin-top: 8px; }
+.tp-cron-add input {
+  flex: 1; min-width: 0;
+  padding: 5px 9px; font-size: 12.5px; color: var(--label-primary);
+  background: var(--tp-card); border: 1px solid var(--border-l1);
+  border-radius: var(--r-sm); outline: none;
+}
+.tp-cron-add input:focus { border-color: var(--border-l3); }
+.tp-cron-add input::placeholder { color: var(--label-caption); }
+.tp-cron-add button { flex: none; border: 1px solid var(--border-l2); font-size: 12px; }
 
 .tp-goal-head { display: flex; align-items: center; gap: 8px; }
 .tp-goal-head .tp-pill { margin-left: auto; }

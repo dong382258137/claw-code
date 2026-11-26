@@ -24,6 +24,7 @@ export function useSessionEvents({
   setConnected,
   setPendingDraft,
   setTaskEvent,
+  setUsage,
   lastPromptRef,
   runningRef,
   sendRef,
@@ -46,6 +47,8 @@ export function useSessionEvents({
     // 任务面板与对话共用这一条事件流：切会话时先清掉上一个会话的尾事件，
     // 避免新面板挂载时把旧会话的待办/计划又应用一次。
     setTaskEvent(null)
+    // 上下文占用属于单个会话：切走即清空，避免用量条显示上一个会话的数字。
+    setUsage(null)
 
     // 「运行中」属于哪个会话只有服务端知道：立刻对齐一次，否则切到空闲会话后
     // 仍会显示上一个会话在执行（状态轮询要 1.2s 才纠正）。
@@ -152,6 +155,21 @@ export function useSessionEvents({
             return next
           })
         }
+        else if (data.kind === 'usage') {
+          // MessageStart 的 usage 可能全为 0：忽略它，别把已有占用条清空。
+          const total = (data.input_tokens || 0)
+            + (data.output_tokens || 0)
+            + (data.cache_creation_input_tokens || 0)
+            + (data.cache_read_input_tokens || 0)
+          if (total > 0) {
+            setUsage({
+              input_tokens: data.input_tokens || 0,
+              output_tokens: data.output_tokens || 0,
+              cache_creation_input_tokens: data.cache_creation_input_tokens || 0,
+              cache_read_input_tokens: data.cache_read_input_tokens || 0,
+            })
+          }
+        }
         else if (TASK_EVENT_KINDS.has(data.kind)) {
           // 任务面板的增量事件：随会话 id 一起转发，面板切会话后不会误用旧事件。
           setTaskEvent({ sessionId: currentId, payload: data })
@@ -184,5 +202,5 @@ export function useSessionEvents({
     })
     events.onerror = () => { setConnected(false); reconcile() }
     return () => { closed = true; events.close() }
-  }, [currentId, push, setTaskEvent])
+  }, [currentId, push, setTaskEvent, setUsage])
 }

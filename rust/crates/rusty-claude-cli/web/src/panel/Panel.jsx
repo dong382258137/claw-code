@@ -36,7 +36,7 @@ export function Panel({ tab, onTab, onClose, onDock, width, currentId, workspace
         {/* 五个面板常驻，切换只隐藏：终端连接、文件浏览状态不会因切标签丢失。 */}
         <div className={`pane-wrap ${tab === 'files' ? 'active' : ''}`}><FilesPane workspace={workspace} onError={onError} onReference={onReference} /></div>
         <div className={`pane-wrap ${tab === 'diff' ? 'active' : ''}`}><DiffPane workspace={workspace} currentId={currentId} onError={onError} onReference={onReference} /></div>
-        <div className={`pane-wrap ${tab === 'tasks' ? 'active' : ''}`}><TasksPane currentId={currentId} workspace={workspace} taskEvent={taskEvent} connected={connected} onError={onError} /></div>
+        <div className={`pane-wrap ${tab === 'tasks' ? 'active' : ''}`}><TasksPane currentId={currentId} workspace={workspace} taskEvent={taskEvent} connected={connected} onError={onError} onToast={onToast} /></div>
         <div className={`pane-wrap ${tab === 'attachments' ? 'active' : ''}`}><AttachmentsPane workspace={workspace} onError={onError} /></div>
         <div className={`pane-wrap ${tab === 'terminal' ? 'active' : ''}`}>{terminalMounted && <TerminalPane workspace={workspace} />}</div>
       </div>

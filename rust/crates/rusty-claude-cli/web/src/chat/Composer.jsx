@@ -12,7 +12,7 @@ import {
 } from '../shared/constants.js'
 import { basename, createDictation, formatTokens, resolveModelLabel, voiceClock } from '../shared/utils.js'
 
-export function Composer({ running, queue, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission, model, onModel, workspace, workspaces = [], sessionModel = '', onVoiceDiscussion, onNewInWorkspace, onPickWorkspace, onOpenWorkspacePicker, stats, pendingRef, onRefUsed, pendingDraft, onDraftUsed }) {
+export function Composer({ running, queue, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission, model, onModel, workspace, workspaces = [], sessionModel = '', onVoiceDiscussion, onNewInWorkspace, onPickWorkspace, onOpenWorkspacePicker, onInitWorkspace, stats, usage, compacting, onCompact, pendingRef, onRefUsed, pendingDraft, onDraftUsed }) {
   const [value, setValue] = useState('')
   const [files, setFiles] = useState([])
   const [suggest, setSuggest] = useState(null)
@@ -395,6 +395,17 @@ export function Composer({ running, queue, onSend, onStop, onQuickAction, onErro
   const perm = PERMISSION_LOOKUP[permission] || PERMISSION_PRESETS[1]
   const shownModel = resolveModelLabel(model, sessionModel)
   const canSend = Boolean(value.trim())
+  // 上下文占用：输入侧三桶（普通输入 + 缓存写 + 缓存读）就是本次请求的上下文；
+  // 没有实时 Usage 事件时退回会话快照里的估算值。
+  const usageInput = usage
+    ? (usage.input_tokens || 0) + (usage.cache_creation_input_tokens || 0) + (usage.cache_read_input_tokens || 0)
+    : 0
+  const contextWindow = Number(stats?.context_window || 0)
+  const contextTokens = usage ? usageInput : Number(stats?.estimated_tokens || 0)
+  const contextPct = contextWindow > 0 ? Math.min(100, Math.round((contextTokens / contextWindow) * 100)) : 0
+  const cacheHitPct = usageInput > 0
+    ? Math.round(((usage.cache_read_input_tokens || 0) / usageInput) * 100)
+    : Number(stats?.cache_hit_pct || 0)
 
   return (
     <form className="composer" ref={rootRef} onSubmit={(event) => { event.preventDefault(); submit() }}>
@@ -446,6 +457,18 @@ export function Composer({ running, queue, onSend, onStop, onQuickAction, onErro
           {queueFull
             ? `队列已满（${queued}/${queueLimit}），等前面的消息处理完成后再发送`
             : `已排队：${queued} 条待处理${(queue?.mine || 0) > 1 ? ` · 你的消息第 ${queue.mine} 位` : ''}`}
+        </div>
+      )}
+      {!voiceActive && contextWindow > 0 && contextTokens > 0 && (
+        <div className={`context-bar ${contextPct >= 85 ? 'high' : ''}`} title="上下文占用为估算值；达到上限前可手动压缩会话">
+          <span className="context-track" aria-hidden="true"><i style={{ width: `${Math.max(2, contextPct)}%` }} /></span>
+          <span className="context-text">
+            上下文 ≈ {formatTokens(contextTokens)} / {formatTokens(contextWindow)} tok
+            {cacheHitPct > 0 ? ` · 缓存命中 ${cacheHitPct}%` : ''}
+          </span>
+          <button type="button" className="context-compact" disabled={compacting || !currentId} onClick={onCompact}>
+            {compacting ? '压缩中…' : '压缩会话'}
+          </button>
         </div>
       )}
       <div
@@ -677,6 +700,7 @@ export function Composer({ running, queue, onSend, onStop, onQuickAction, onErro
               {workspaces.length === 0 && <div className="popover-empty">还没有工作区</div>}
               <div className="popover-sep" />
               <PopoverItem icon="plus" label="选择其他文件夹…" onClick={() => { setFooterMenu(null); onOpenWorkspacePicker?.() }} />
+              <PopoverItem icon="doc" label="初始化项目说明" hint="生成 CLAUDE.md / .claw.json" onClick={() => { setFooterMenu(null); onInitWorkspace?.() }} />
             </Popover>
           )}
         </div>

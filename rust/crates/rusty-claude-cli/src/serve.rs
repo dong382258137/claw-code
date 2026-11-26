@@ -71,6 +71,8 @@ struct AppState {
     plugin_market: crate::plugin_market::PluginMarketPaths,
     /// 同名插件安装/卸载互斥（并发同名返回 409）。
     plugin_install_locks: Arc<Mutex<BTreeSet<String>>>,
+    /// 定时任务存储的读改写串行化（每个工作区一个 `.claw/crons.json`）。
+    crons_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -1263,6 +1265,7 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             skill_registry_lock: Arc::new(Mutex::new(())),
             plugin_market,
             plugin_install_locks: Arc::new(Mutex::new(BTreeSet::new())),
+            crons_lock: Arc::new(Mutex::new(())),
         };
         spawn_session_watchdog(state.clone());
         let app = Router::new()
@@ -1281,6 +1284,10 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .route("/api/session/{id}/prompt", post(api_prompt))
             .route("/api/session/{id}/interrupt", post(api_interrupt))
             .route("/api/session/{id}/status", get(api_status))
+            // 导出会话：md（默认）/ json，浏览器直接下载。
+            .route("/api/session/{id}/export", get(api_session_export))
+            // 手动压缩：移除较早消息并写入摘要，返回压缩前后的 token 估算。
+            .route("/api/session/{id}/compact", post(api_session_compact))
             .route("/api/workspace/files", get(api_files))
             .route("/api/workspace/file", get(api_file).post(api_file_write))
             .route("/api/workspace/raw", get(api_raw))
@@ -1294,6 +1301,13 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 get(api_workspaces).post(api_workspace_add),
             )
             .route("/api/workspaces/pick", post(api_workspace_pick))
+            // 项目初始化：生成 CLAUDE.md / .claw.json 并补齐 .gitignore 规则。
+            .route("/api/workspace/init", post(api_workspace_init))
+            // 定时任务骨架（Phase 6 接入真实执行器）：列表 / 新建 / 启停 / 删除 / 立即执行。
+            .route("/api/workspace/crons", get(api_crons).post(api_cron_create))
+            .route("/api/workspace/crons/{id}", delete(api_cron_delete))
+            .route("/api/workspace/crons/{id}/toggle", post(api_cron_toggle))
+            .route("/api/workspace/crons/{id}/run", post(api_cron_run))
             .route("/api/client-error", post(api_client_error))
             .route("/api/upload", post(api_upload))
             .route("/api/meta", get(api_meta))
@@ -1681,6 +1695,183 @@ async fn api_session(
 }
 
 #[derive(Deserialize)]
+struct ExportQuery {
+    t: Option<String>,
+    /// `md`（默认）或 `json`。
+    format: Option<String>,
+}
+
+/// 导出会话：直接返回文件内容，由 `Content-Disposition` 触发浏览器下载。
+///
+/// Markdown 复用 `session_mgr` 的渲染（与 CLI 时代的导出文本一致）；
+/// JSON 走 `Session::to_json`，保留消息块与用量等结构化字段。
+async fn api_session_export(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(query): Query<ExportQuery>,
+) -> Response {
+    if query.t.as_deref() != Some(state.token.as_str()) {
+        return unauthorized();
+    }
+    let (path, _workspace) = match resolve_session(&state, &id) {
+        Ok(found) => found,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let session = match runtime::Session::load_from_path(&path) {
+        Ok(session) => session,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("会话不可读（可能只有 header 或已损坏）: {error}"),
+            )
+                .into_response()
+        }
+    };
+    let stem = crate::session_mgr::default_export_filename(&session);
+    let stem = stem.strip_suffix(".txt").unwrap_or(&stem);
+    let (content_type, body, extension) = match query.format.as_deref().unwrap_or("md") {
+        "md" | "markdown" => (
+            "text/markdown; charset=utf-8",
+            crate::session_mgr::render_session_markdown(&session, &id, &path),
+            "md",
+        ),
+        "json" => match session.to_json() {
+            Ok(value) => {
+                // runtime 的 JsonValue 是自有类型：先渲染成 JSON 文本，再尽量美化。
+                let rendered = value.render();
+                let pretty = serde_json::from_str::<Value>(&rendered)
+                    .ok()
+                    .and_then(|parsed| serde_json::to_string_pretty(&parsed).ok())
+                    .unwrap_or(rendered);
+                ("application/json; charset=utf-8", pretty, "json")
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("导出失败: {error}"),
+                )
+                    .into_response()
+            }
+        },
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("format 只支持 md / json，收到 {other}"),
+            )
+                .into_response()
+        }
+    };
+    (
+        [
+            (header::CONTENT_TYPE, content_type.to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{stem}.{extension}\""),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct CompactBody {
+    /// 保留的最近消息条数；缺省 4（与自动压缩一致）。
+    #[serde(default)]
+    preserve_recent_messages: Option<usize>,
+}
+
+/// 手动压缩会话：不受自动阈值限制，按「保留最近 N 条」直接压缩并落盘。
+///
+/// 压缩会重写会话文件，因此只在会话空闲时允许；写完提升会话代际，
+/// 让持有旧会话的热 worker 下一轮从压缩后的文件重建，避免旧内存态覆盖结果。
+async fn api_session_compact(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<CompactBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let (path, _workspace) = match resolve_session(&state, &id) {
+        Ok(found) => found,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    if state.scheduler.is_active(&id) {
+        return (StatusCode::CONFLICT, "会话正在执行或排队，不能压缩").into_response();
+    }
+    let session = match runtime::Session::load_from_path(&path) {
+        Ok(session) => session,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("会话不可读: {error}"),
+            )
+                .into_response()
+        }
+    };
+    let before_tokens = runtime::estimate_session_tokens(&session);
+    let config = runtime::CompactionConfig {
+        preserve_recent_messages: body.preserve_recent_messages.unwrap_or(4).clamp(1, 50),
+        // 手动压缩不设阈值：用户点「压缩」即执行，不再等自动触发条件。
+        max_estimated_tokens: 0,
+    };
+    let result = runtime::compact_session(&session, config);
+    if result.removed_message_count == 0 {
+        return Json(json!({
+            "session": id,
+            "before_tokens": before_tokens,
+            "after_tokens": before_tokens,
+            "removed_messages": 0,
+            "kept_messages": session.messages.len(),
+            "message": "消息太少，无需压缩",
+        }))
+        .into_response();
+    }
+    // 压缩耗时期间可能刚好入队新一轮：此时放弃写入，避免覆盖运行中的会话。
+    if state.scheduler.is_active(&id) {
+        return (StatusCode::CONFLICT, "会话刚开始执行，未压缩").into_response();
+    }
+    let after_tokens = runtime::estimate_session_tokens(&result.compacted_session);
+    // 小会话里摘要可能比被移除的原文还长：不写盘，避免"压缩后反而更大"。
+    if after_tokens >= before_tokens {
+        return Json(json!({
+            "session": id,
+            "before_tokens": before_tokens,
+            "after_tokens": after_tokens,
+            "removed_messages": 0,
+            "kept_messages": session.messages.len(),
+            "message": "压缩后 token 未减少（摘要比原文长），已取消",
+        }))
+        .into_response();
+    }
+    if let Err(error) = result.compacted_session.save_to_path(&path) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("写入压缩结果失败: {error}"),
+        )
+            .into_response();
+    }
+    // 热 worker 的 LiveCli 里还是压缩前的会话：提升代际，下一轮按文件重建。
+    state.scheduler.bump_epoch(&id);
+    state.events.emit(&id, json!({ "kind": "reset" }));
+    Json(json!({
+        "session": id,
+        "before_tokens": before_tokens,
+        "after_tokens": after_tokens,
+        "removed_messages": result.removed_message_count,
+        "kept_messages": result.compacted_session.messages.len(),
+        "compactions": result
+            .compacted_session
+            .compaction
+            .as_ref()
+            .map_or(0, |value| value.count),
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
 struct BlockQuery {
     t: Option<String>,
     /// `session_id:message_index:block_index`，由会话视图里的 `truncated.ref` 下发。
@@ -1911,6 +2102,8 @@ struct CachedCli {
     mode: runtime::PermissionMode,
     workspace: PathBuf,
     session_path: PathBuf,
+    /// 缓存建立时的会话代际；外部改写（手动压缩）后必须重建。
+    epoch: u64,
 }
 
 struct SessionWorker {
@@ -1990,11 +2183,13 @@ impl SessionWorker {
     /// 否则新建并 `resume_from_path` 载入同一会话。
     fn cli_for_turn(&mut self, job: &PromptJob) -> Result<&mut crate::app::LiveCli, String> {
         let model = Self::effective_model(&job.model, &job.workspace);
+        let epoch = self.state.scheduler.epoch(&self.session_id);
         let reusable = self.cached.as_ref().is_some_and(|cached| {
             cached.model == model
                 && cached.mode == job.permission
                 && cached.workspace == job.workspace
                 && cached.session_path == job.session_path
+                && cached.epoch == epoch
         });
         if reusable {
             // 复用证据：日志里出现 `reuse` 即表示本轮没有重建 LiveCli。
@@ -2024,6 +2219,7 @@ impl SessionWorker {
                 mode: job.permission,
                 workspace: job.workspace.clone(),
                 session_path: job.session_path.clone(),
+                epoch,
             });
         }
         Ok(&mut self.cached.as_mut().expect("缓存刚写入").cli)
@@ -2146,7 +2342,14 @@ impl SessionWorker {
                 runtime::StatusEvent::MessageStop => {
                     json!({ "session": emit_sid, "kind": "message_stop" })
                 }
-                runtime::StatusEvent::Usage(_) => return,
+                runtime::StatusEvent::Usage(usage) => json!({
+                    "session": emit_sid,
+                    "kind": "usage",
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": usage.cache_read_input_tokens,
+                }),
             };
             sender.emit(&emit_sid, payload);
         }));
@@ -3228,7 +3431,278 @@ async fn api_workspace_add(
     }
 }
 
-/// 弹系统文件夹选择框（Windows）。返回 None 表示用户取消。
+#[derive(Deserialize)]
+struct InitWorkspaceBody {
+    workspace: Option<String>,
+    /// `true` 时覆盖已存在的 CLAUDE.md / .claw.json（原 CLI 的 `/init --force`）。
+    #[serde(default)]
+    force: bool,
+}
+
+/// 项目初始化：复用 `init::initialize_repo`，返回逐文件状态与 CLAUDE.md 摘要。
+async fn api_workspace_init(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<InitWorkspaceBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let workspace = match resolve_workspace(&state, body.workspace.as_deref()) {
+        Ok(path) => path,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let report = match crate::init::initialize_repo(&workspace, body.force) {
+        Ok(report) => report,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("初始化失败: {error}"),
+            )
+                .into_response()
+        }
+    };
+    let claude_md = std::fs::read_to_string(workspace.join("CLAUDE.md")).unwrap_or_default();
+    Json(json!({
+        "project_root": report.project_root.display().to_string(),
+        "created": report.artifacts_with_status(crate::init::InitStatus::Created),
+        "updated": report.artifacts_with_status(crate::init::InitStatus::Updated),
+        "overwritten": report.artifacts_with_status(crate::init::InitStatus::Overwritten),
+        "skipped": report.artifacts_with_status(crate::init::InitStatus::Skipped),
+        "artifacts": report.artifact_json_entries(),
+        "next_step": crate::init::InitReport::NEXT_STEP,
+        "claude_md_excerpt": truncate_chars(&claude_md, 1200),
+    }))
+    .into_response()
+}
+
+const CRON_STORE_REL: &str = ".claw/crons.json";
+
+fn cron_registry_for(workspace: &Path) -> Result<runtime::CronRegistry, (StatusCode, String)> {
+    let path = workspace.join(CRON_STORE_REL);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("创建定时任务目录失败: {error}"),
+            )
+        })?;
+    }
+    runtime::CronRegistry::with_persistence(&path).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("读取定时任务失败: {error}"),
+        )
+    })
+}
+
+fn cron_entry_json(entry: &runtime::CronEntry) -> Value {
+    json!({
+        "cron_id": entry.cron_id,
+        "schedule": entry.schedule,
+        "prompt": entry.prompt,
+        "description": entry.description,
+        "enabled": entry.enabled,
+        "created_at": entry.created_at,
+        "updated_at": entry.updated_at,
+        "last_run_at": entry.last_run_at,
+        "run_count": entry.run_count,
+    })
+}
+
+/// 定时任务列表。存储在工作区 `.claw/crons.json`，与 Phase 6 的执行器共用。
+async fn api_crons(State(state): State<AppState>, Query(query): Query<WorkspaceQuery>) -> Response {
+    if !authorize(&state, &AuthQuery { t: query.t.clone() }) {
+        return unauthorized();
+    }
+    let workspace = match resolve_workspace(&state, query.workspace.as_deref()) {
+        Ok(path) => path,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let registry = match cron_registry_for(&workspace) {
+        Ok(registry) => registry,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let mut crons: Vec<Value> = registry.list(false).iter().map(cron_entry_json).collect();
+    crons.sort_by_key(|item| std::cmp::Reverse(item["created_at"].as_u64().unwrap_or(0)));
+    Json(json!({
+        "crons": crons,
+        "execution_ready": false,
+        "notice": "真实到点执行将在 Phase 6 接入；当前可维护任务条目。",
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct CronCreateBody {
+    schedule: String,
+    prompt: String,
+    #[serde(default)]
+    description: Option<String>,
+    workspace: Option<String>,
+}
+
+/// 新建定时任务（Phase 4 只落库，不启动调度）。
+async fn api_cron_create(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<CronCreateBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let schedule = body.schedule.trim();
+    let prompt = body.prompt.trim();
+    if schedule.is_empty() || prompt.is_empty() {
+        return (StatusCode::BAD_REQUEST, "schedule 与 prompt 不能为空").into_response();
+    }
+    let workspace = match resolve_workspace(&state, body.workspace.as_deref()) {
+        Ok(path) => path,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let _guard = state
+        .crons_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registry = match cron_registry_for(&workspace) {
+        Ok(registry) => registry,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let entry = registry.create(
+        schedule,
+        prompt,
+        body.description
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty()),
+    );
+    if let Some(error) = registry.last_persist_error() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("保存定时任务失败: {error}"),
+        )
+            .into_response();
+    }
+    Json(json!({ "cron": cron_entry_json(&entry) })).into_response()
+}
+
+fn cron_id_arg(id: &str) -> Result<(), (StatusCode, String)> {
+    let valid = !id.is_empty()
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'));
+    if valid {
+        Ok(())
+    } else {
+        Err((StatusCode::BAD_REQUEST, "无效的定时任务 ID".to_string()))
+    }
+}
+
+/// 启用 / 停用定时任务。
+async fn api_cron_toggle(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(query): Query<WorkspaceQuery>,
+) -> Response {
+    if !authorize(&state, &AuthQuery { t: query.t.clone() }) {
+        return unauthorized();
+    }
+    if let Err((code, message)) = cron_id_arg(&id) {
+        return (code, message).into_response();
+    }
+    let workspace = match resolve_workspace(&state, query.workspace.as_deref()) {
+        Ok(path) => path,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let _guard = state
+        .crons_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registry = match cron_registry_for(&workspace) {
+        Ok(registry) => registry,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let Some(current) = registry.get(&id) else {
+        return (StatusCode::NOT_FOUND, "定时任务不存在").into_response();
+    };
+    let result = if current.enabled {
+        registry.disable(&id)
+    } else {
+        registry.enable(&id)
+    };
+    if let Err(error) = result {
+        return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    if let Some(error) = registry.last_persist_error() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("保存定时任务失败: {error}"),
+        )
+            .into_response();
+    }
+    match registry.get(&id) {
+        Some(entry) => Json(json!({ "cron": cron_entry_json(&entry) })).into_response(),
+        None => (StatusCode::NOT_FOUND, "定时任务不存在").into_response(),
+    }
+}
+
+/// 删除定时任务。
+async fn api_cron_delete(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(query): Query<WorkspaceQuery>,
+) -> Response {
+    if !authorize(&state, &AuthQuery { t: query.t.clone() }) {
+        return unauthorized();
+    }
+    if let Err((code, message)) = cron_id_arg(&id) {
+        return (code, message).into_response();
+    }
+    let workspace = match resolve_workspace(&state, query.workspace.as_deref()) {
+        Ok(path) => path,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let _guard = state
+        .crons_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registry = match cron_registry_for(&workspace) {
+        Ok(registry) => registry,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    match registry.delete(&id) {
+        Ok(_) => {
+            if let Some(error) = registry.last_persist_error() {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("保存定时任务失败: {error}"),
+                )
+                    .into_response();
+            }
+            Json(json!({ "deleted": id })).into_response()
+        }
+        Err(error) => (StatusCode::NOT_FOUND, error).into_response(),
+    }
+}
+
+/// 立即执行：Phase 4 只返回明确的未实现提示，避免前端以为已经跑过。
+async fn api_cron_run(
+    State(state): State<AppState>,
+    UrlPath(_id): UrlPath<String>,
+    Query(query): Query<WorkspaceQuery>,
+) -> Response {
+    if !authorize(&state, &AuthQuery { t: query.t.clone() }) {
+        return unauthorized();
+    }
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "code": "cron_execution_not_ready",
+            "message": "立即执行尚未实现（Phase 6 接入真实调度器）",
+        })),
+    )
+        .into_response()
+}
 ///
 /// Windows 上有两个必须在这里处理的坑，否则 Web UI 里点“+”会出现
 /// “选择框弹在其它窗口后面”和“工作区不存在：D:\+乱码”（GBK 被当成 UTF-8）。
@@ -5660,6 +6134,15 @@ fn session_view(path: &Path) -> Result<Value, String> {
         .saturating_mul(100)
         .checked_div(stats_input + stats_cache_read)
         .unwrap_or(0);
+    // 上下文占用：会话未记录模型时回退到工作区默认模型，用于前端占用条的分母。
+    let model_hint = session.model.clone().unwrap_or_else(|| {
+        workspace_of_session_path(path)
+            .and_then(|workspace| crate::config_model_for(&workspace))
+            .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
+    });
+    let context_window =
+        api::model_token_limit(&model_hint).map_or(0, |limit| limit.context_window_tokens);
+    let estimated_tokens = runtime::estimate_session_tokens(&session);
 
     Ok(json!({
         "id": session.session_id,
@@ -5680,6 +6163,8 @@ fn session_view(path: &Path) -> Result<Value, String> {
             "cache_read_tokens": stats_cache_read,
             "cache_hit_pct": stats_cache_pct,
             "duration_ms": stats_last_ts.saturating_sub(stats_first_ts),
+            "estimated_tokens": estimated_tokens,
+            "context_window": context_window,
         },
     }))
 }
