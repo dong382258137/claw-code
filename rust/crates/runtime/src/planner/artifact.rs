@@ -362,8 +362,12 @@ impl PlanArtifact {
     #[must_use]
     pub fn render_skeleton(&self) -> String {
         let mut out = String::with_capacity(512 + self.steps.len() * 200);
+        // 2026-11-27 去重:不再渲染 `Task: <task_summary>`。
+        // 尾部槽位 4「Current Task」已逐字渲染同一份 task_summary,此处再发
+        // 一次等于同一段文本每轮付两次全价(实测 ~130 tok/轮)。槽位 4 由
+        // `current_task_slot_uses_active_plan_not_workspace_snapshot` 守护
+        // (防工作区旧目标泄漏),故保留槽位、移除本段重复。
         out.push_str("# Active Plan\n\n");
-        out.push_str(&format!("Task: {}\n\n", self.task_summary));
         if self.steps.is_empty() {
             out.push_str("Steps: (pending decomposition)\n\n");
             out.push_str(
@@ -378,6 +382,8 @@ impl PlanArtifact {
             return out;
         }
         out.push_str("Steps:\n");
+        // 2026-11-27:high-risk 预承诺协议正文只发一次(见循环后),此处仅标记。
+        let mut high_risk_seen = false;
         for (idx, step) in self.steps.iter().enumerate() {
             // 第4项:已闭环(Succeeded)的子目标折叠为单行摘要,减少长任务 prompt
             // 膨胀。完成的 step 不再需要 acceptance/verify/attempts 详情,也无需
@@ -404,12 +410,18 @@ impl PlanArtifact {
                 step.verify_command.as_deref().unwrap_or("(skip)"),
             ));
             if step.risk_level == StepRisk::High {
-                out.push_str(
-                    "   ⚠ PRE-COMMITMENT REQUIRED: This step is high-risk (destructive/irreversible/security-sensitive).\n   \
-                     Before implementing, generate 2+ candidate approaches and briefly state trade-offs (cost, risk, reversibility).\n   \
-                     Only commit after explicit comparison — never commit to the first feasible option just because it is feasible.\n",
-                );
+                high_risk_seen = true;
             }
+        }
+        // 2026-11-27 去重:协议正文只发一次(原实现每个 high-risk step 各发一份,
+        // 实测 4 个 high-risk 步 ≈360 tok/轮 的纯重复)。high-risk 归属由每步
+        // 的 `⚠ high-risk` 标签表达,协议正文在此统一给出一次。
+        if high_risk_seen {
+            out.push_str(
+                "\n   ⚠ PRE-COMMITMENT REQUIRED for the high-risk step(s) marked ⚠ above:\n   \
+                 Before implementing, generate 2+ candidate approaches and briefly state trade-offs (cost, risk, reversibility).\n   \
+                 Only commit after explicit comparison — never commit to the first feasible option just because it is feasible.\n",
+            );
         }
         out.push_str("\nFocus on the current step. Do not skip ahead.");
         out
