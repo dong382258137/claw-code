@@ -222,8 +222,7 @@ impl SystemPromptSplit {
 ///   (元认知触发)、## Memory Verification(召回记忆使用协议,纯静态教程)、
 ///   ## History & Decisions(Context Recovery,纯静态协议文本,不含动态
 ///   状态,故归能力层而非状态层)、## Multi-Agent Orchestration、
-///   ## Agent Subagent Types、## Session Bus、## Worker Lifecycle、
-///   ## Tool Usage Guidance。
+///   ## Agent Subagent Types、## Session Bus、## Tool Usage Guidance。
 /// - [`Self::Boundary`]:[`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`] 结构性标记,
 ///   不是内容 section,不属于三层中任何一层;仅用于 `build()` 原序还原,
 ///   `build_layers()` 分组时跳过。
@@ -679,11 +678,6 @@ impl SystemPromptBuilder {
         fragments.push(PromptFragment::new(
             SectionTier::CapabilityLayer,
             get_session_bus_section(),
-        ));
-        // P1: Worker 生命周期（9 步状态机）
-        fragments.push(PromptFragment::new(
-            SectionTier::CapabilityLayer,
-            get_worker_lifecycle_section(),
         ));
         // 工具使用引导（WebSearch 优先 / 知识新鲜度 / ToolSearch / TaskUpdate）
         fragments.push(PromptFragment::new(
@@ -1552,10 +1546,8 @@ fn get_framework_switching_section() -> String {
      - **Stubborn direction**: Current approach feels wrong. Explicitly acknowledge \
      and re-derive — admitting a wrong turn is rigor, not weakness.\n\
      - **Guess loop (猜测循环)**: You keep re-deriving the same uncertain point \
-     in your thinking (\"wait\", \"I can't be sure\", \"need to confirm\") without \
-     converging. Stop guessing and trace the uncertainty to its source: use the \
-     four-class triage in `### 确定性预算` below — never reason out a fact that \
-     only an external source can answer.\n\
+     without converging. Stop guessing and trace the uncertainty to its source \
+     — see `### 确定性预算` below, the single triage rulebook.\n\
      \n\
      Trigger protocol:\n\
      1. State the problem definition explicitly.\n\
@@ -1792,21 +1784,6 @@ fn get_agent_subagent_types_section() -> String {
         .to_string()
 }
 
-/// P1: Worker 生命周期 — 9 个 Worker* 工具组成的 boot→trust-gate→ready-handshake→
-/// prompt→complete 状态机。仅面向高级用例（coding worker 启动 + prompt 投递），
-/// 避免模型在常规任务中滥用。
-fn get_worker_lifecycle_section() -> String {
-    "## Worker Lifecycle (高级编码工作器)\n\
-     \n\
-     The 9 `Worker*` tools implement a full coding-worker lifecycle \
-     (WorkerCreate → WorkerObserve → WorkerResolveTrust → WorkerAwaitReady \
-     → WorkerSendPrompt → WorkerObserveCompletion, plus WorkerGet/Restart/\
-     Terminate). This is an advanced workflow for programmatic agent control. \
-     Most tasks should use `Agent` (fire-and-forget) or `dispatch_subagent` \
-     (async with polling) instead."
-        .to_string()
-}
-
 /// 工具使用引导段（Tool Usage Guidance）。
 ///
 /// 解决"工具已实现但 AI 从不调用"的缺口（docs/2026-08-09-design-gaps-benefit-list.md
@@ -1862,33 +1839,6 @@ fn get_tool_usage_guidance_section() -> String {
      status in sync as work progresses (e.g. running → completed/cancelled), \
      so task progress stays trackable.\n\
      \n\
-     ### 编辑前先精确读取\n\
-     Before calling `edit_file` or `replace_lines`, first `read_file` the \
-     exact target lines to confirm the precise bytes (indentation, quotes, \
-     line endings). Never construct old_string from memory — it causes \
-     `old_string not found` retries. If a match fails, read the error's line \
-     count/line-ending hint and correct the old_string once instead of \
-     retrying identical parameters.\n\
-     \n\
-     ### replace_lines 行号漂移护栏\n\
-     `replace_lines` addresses lines by 1-based line numbers; EVERY replacement \
-     shifts the line numbers of all later content in that file. Therefore:\n\
-     - NEVER issue two `replace_lines` calls on the same file within one turn — \
-       line numbers from the first call are stale for the second. If you must \
-       make multiple changes to one file, batch them into a single `replace_lines` \
-       range, or prefer `edit_file` (old_string match) / `write_file` (full rewrite).\n\
-     - After each `replace_lines`, immediately `read_file` the replaced region to \
-       confirm function boundaries are intact (not truncated / duplicated).\n\
-     - When a series of edits triggers diagnostics errors, do NOT keep stacking \
-       more `replace_lines` on the already-broken file — stop, re-read the affected \
-       functions, and fix the underlying cause with one exact `edit_file`.\n\
-     \n\
-     ### 任务 ID 来源\n\
-     The `task_id` for `TaskOutput`/`TaskGet`/`TaskStop`/`TaskUpdate` must \
-     come from the return value of `TaskCreate` or `RunTaskPacket`. A bash \
-     background PID (`backgroundPid` in bash output) is an OS process number, \
-     NOT a task_id — passing it to task tools fails with `task not found`.\n\
-     \n\
      ### 复杂任务规划(create_plan)\n\
      Use your own judgment about task complexity: when a task is complex, \
      multi-step, or spans multiple files, call `create_plan` to build an \
@@ -1939,10 +1889,10 @@ fn get_tool_usage_guidance_section() -> String {
      If you catch yourself writing any of \"可能 / 也许 / 应该 / 猜测 / might /\n\
      maybe / probably / I think\", STOP — that is a signal you are reasoning\n\
      about a verifiable fact. Convert it into one tool call instead of\n\
-     continuing the guess (the four uncertainty classes above ARE the\n\
-     **Guess loop** source-triage order in `## Framework Switching` — same\n\
-     protocol, no second rulebook). A single probe takes ~1-3s; a guess\n\
-     loop costs 10-30s of tokens and is often wrong."
+     continuing the guess — that is the **Guess loop** trip-wire listed in\n\
+     `## Framework Switching`, and this section is its triage rulebook.\n\
+     A single probe takes ~1-3s; a guess loop costs 10-30s of tokens and\n\
+     is often wrong."
         .to_string()
 }
 
@@ -1974,11 +1924,8 @@ pub fn retune_tool_usage_guidance(split: &mut SystemPromptSplit, tool_names: &[&
         if heading.starts_with("代码编辑后 LSP 诊断") {
             return has("LSP");
         }
-        if heading.starts_with("任务生命周期") || heading.starts_with("任务 ID 来源") {
+        if heading.starts_with("任务生命周期") {
             return has_task_tool;
-        }
-        if heading.starts_with("replace_lines 行号漂移护栏") {
-            return has("replace_lines");
         }
         if heading.starts_with("复杂任务规划(create_plan)") || heading.starts_with("规划机制分水岭")
         {
@@ -2174,15 +2121,15 @@ mod tests {
         get_execution_style_section, get_framework_switching_section,
         get_memory_verification_section, get_multi_agent_orchestration_section,
         get_session_bus_section, get_simple_doing_tasks_section, get_simple_intro_section,
-        get_simple_system_section, get_tool_usage_guidance_section, get_worker_lifecycle_section,
-        is_blueprint_skeleton, normalize_instruction_content,
-        parse_project_context_instruction_count, render_blueprint_section, render_config_section,
-        render_instruction_content, render_instruction_files, render_mcp_catalog_section,
-        render_persistent_memory_section, render_project_context, render_project_context_fresh,
-        render_repomap_section, render_skill_catalog_section, truncate_instruction_content,
-        ContextFile, ModelFamilyIdentity, ProjectContext, PromptFragment, SectionTier,
-        SystemPromptBuilder, SystemPromptSplit, MAX_INSTRUCTION_FILE_CHARS,
-        MAX_TOTAL_INSTRUCTION_CHARS, PLACEHOLDER_POINTER_MARKER, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        get_simple_system_section, get_tool_usage_guidance_section, is_blueprint_skeleton,
+        normalize_instruction_content, parse_project_context_instruction_count,
+        render_blueprint_section, render_config_section, render_instruction_content,
+        render_instruction_files, render_mcp_catalog_section, render_persistent_memory_section,
+        render_project_context, render_project_context_fresh, render_repomap_section,
+        render_skill_catalog_section, truncate_instruction_content, ContextFile,
+        ModelFamilyIdentity, ProjectContext, PromptFragment, SectionTier, SystemPromptBuilder,
+        SystemPromptSplit, MAX_INSTRUCTION_FILE_CHARS, MAX_TOTAL_INSTRUCTION_CHARS,
+        PLACEHOLDER_POINTER_MARKER, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::cache_alignment::DynamicValueExtractor;
     use crate::config::{ConfigLoader, RuntimeConfig};
@@ -3827,7 +3774,6 @@ mod tests {
             get_multi_agent_orchestration_section(),
             get_agent_subagent_types_section(),
             get_session_bus_section(),
-            get_worker_lifecycle_section(),
             get_tool_usage_guidance_section(),
             render_persistent_memory_section(&fixture.memory),
             render_repomap_section("src/main.rs (refs: 5)\n  fn main"),
@@ -3927,7 +3873,7 @@ mod tests {
     ///   ## History & Decisions(Context Recovery — 经判断为纯静态协议
     ///   文本,不含动态状态,归能力层而非状态层)/
     ///   ## Multi-Agent Orchestration / ## Agent Subagent Types /
-    ///   ## Session Bus / ## Worker Lifecycle / ## Tool Usage Guidance。
+    ///   ## Session Bus / ## Tool Usage Guidance。
     #[test]
     fn every_section_fragment_has_exactly_one_tier_and_all_tiers_non_empty() {
         let fixture = RepresentativePromptFixture::new();
@@ -3959,8 +3905,8 @@ mod tests {
             "状态层至少含 memory/repomap/environment/config/instructions/project/catalog/appended,实际 {state_count}"
         );
         assert!(
-            capability_count >= 8,
-            "能力层至少含 framework/memory-verification/context-recovery/multi-agent/subagent/session-bus/worker/tool-guidance,实际 {capability_count}"
+            capability_count >= 7,
+            "能力层至少含 framework/memory-verification/context-recovery/multi-agent/subagent/session-bus/tool-guidance,实际 {capability_count}"
         );
 
         // 关键 section 的层级归属抽查(按标题前缀定位)。
@@ -4004,7 +3950,6 @@ mod tests {
             SectionTier::CapabilityLayer
         );
         assert_eq!(tier_of("## Session Bus"), SectionTier::CapabilityLayer);
-        assert_eq!(tier_of("## Worker Lifecycle"), SectionTier::CapabilityLayer);
         assert_eq!(
             tier_of("## Tool Usage Guidance"),
             SectionTier::CapabilityLayer
@@ -4093,16 +4038,17 @@ fn retune_tool_guidance_drops_latent_sections_when_tools_absent() {
     for heading in [
         "### 代码编辑后 LSP 诊断",
         "### 任务生命周期",
-        "### 任务 ID 来源",
-        "### replace_lines 行号漂移护栏",
         "### 复杂任务规划(create_plan)",
         "### 规划机制分水岭",
     ] {
         assert!(!rendered.contains(heading), "不应出现: {heading}");
     }
-    // 四段(含前置 "\n\n### " 分隔符)合计恰为 3,228 字符。
+    // 四段(含前置 "\n\n### " 分隔符)合计恰为 2,093 字符。
+    // 2026-11-26: 原为 3,228；「编辑前先精确读取」「replace_lines 行号漂移护栏」
+    // 「任务 ID 来源」三段已下沉到工具侧 description（贴近触发点，且
+    // replace_lines 的护栏本就在其 description 中重复），故少 1,135 字符。
     let removed = full.chars().count() - rendered.chars().count();
-    assert_eq!(removed, 3_228, "removed={removed}");
+    assert_eq!(removed, 2_093, "removed={removed}");
     // 非条件段仍在。
     assert!(rendered.contains("### Web 搜索优先"));
     assert!(rendered.contains("### 确定性预算"));
