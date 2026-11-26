@@ -37,6 +37,8 @@ use api::{
 
 use crate::session_mgr::PRIMARY_SESSION_EXTENSION;
 
+mod cron_expr;
+mod cron_runner;
 mod scheduler;
 
 use scheduler::{ConcurrencyConfig, EnqueueError, EventHub, PromptJob, Scheduler, SessionState};
@@ -1290,6 +1292,8 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             session_views: Arc::new(Mutex::new(HashMap::new())),
         };
         spawn_session_watchdog(state.clone());
+        // Phase 6:进程内 tick 线程,扫描各工作区到期的定时任务并入队。
+        cron_runner::spawn_cron_runner(state.clone());
         let app = Router::new()
             .route("/", get(index))
             .route("/api/sessions", get(api_sessions).post(api_create_session))
@@ -2591,6 +2595,32 @@ fn spawn_session_worker(state: AppState, session_id: String) {
                 }
                 // 收尾权由 worker 与看门狗共享：谁先 swap 成功谁发 done。
                 if !turn.finished.swap(true, Ordering::SeqCst) {
+                    // Phase 6：定时任务把结果写回注册表（仅正常收尾路径；
+                    // 被看门狗回收的孤儿轮次由代际检查挡掉，不覆盖新一轮状态）。
+                    if let Some(cron_id) = turn.job.cron_id.as_deref() {
+                        let status = if turn.signal.is_aborted() {
+                            "interrupted"
+                        } else if failed {
+                            "failed"
+                        } else {
+                            "success"
+                        };
+                        let error = outcome.as_ref().err().map(|message| {
+                            if message.contains("interrupted by user") {
+                                "本轮已被用户停止".to_string()
+                            } else {
+                                message.clone()
+                            }
+                        });
+                        cron_runner::finish_cron_run(
+                            &task_state,
+                            &turn.job.workspace,
+                            cron_id,
+                            &worker_session,
+                            status,
+                            error.as_deref(),
+                        );
+                    }
                     // turn 结束是计划文件/任务工具唯一可靠的落盘点：先推一次
                     // 快照，前端无需在 done 后再轮询任务面板。
                     if let Ok(snapshot) = tasks_snapshot(
@@ -2715,6 +2745,7 @@ async fn api_prompt(
         text,
         permission: crate::permission_mode_from_label(permission),
         model: body.model.clone(),
+        cron_id: None,
     };
 
     match state.scheduler.enqueue(job) {
@@ -3335,13 +3366,28 @@ async fn api_create_session(
         Ok(path) => path,
         Err((code, message)) => return (code, message).into_response(),
     };
-    let Ok(store) = runtime::SessionStore::from_cwd(&workspace) else {
-        return (StatusCode::BAD_REQUEST, "无法读取该工作区的会话目录").into_response();
-    };
+    match create_session_file(&workspace) {
+        Ok((id, _path)) => Json(json!({
+            "id": id,
+            "title": "新会话",
+            "created_at_ms": now_ms(),
+            "workspace": workspace.display().to_string(),
+        }))
+        .into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+
+/// 在工作区会话目录里创建一个只有 `session_meta` 头的空会话。
+///
+/// Web「新建会话」与定时任务专属会话共用:写入者随后由调度器 worker 追加消息。
+fn create_session_file(workspace: &Path) -> Result<(String, PathBuf), String> {
+    let store = runtime::SessionStore::from_cwd(workspace)
+        .map_err(|_| "无法读取该工作区的会话目录".to_string())?;
     let sessions_dir = store.sessions_dir().to_path_buf();
     let now = now_ms();
     let model =
-        crate::config_model_for(&workspace).unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
+        crate::config_model_for(workspace).unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
     let mut attempt = 0u32;
     let (id, path) = loop {
         let id = if attempt == 0 {
@@ -3355,9 +3401,7 @@ async fn api_create_session(
         }
         attempt += 1;
     };
-    if let Err(error) = std::fs::create_dir_all(&sessions_dir) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
-    }
+    std::fs::create_dir_all(&sessions_dir).map_err(|error| error.to_string())?;
     let meta = json!({
         "type": "session_meta",
         "version": 1,
@@ -3367,16 +3411,8 @@ async fn api_create_session(
         "updated_at_ms": now,
         "workspace_root": workspace.display().to_string(),
     });
-    match std::fs::write(&path, format!("{meta}\n")) {
-        Ok(()) => Json(json!({
-            "id": id,
-            "title": "新会话",
-            "created_at_ms": now,
-            "workspace": workspace.display().to_string(),
-        }))
-        .into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
-    }
+    std::fs::write(&path, format!("{meta}\n")).map_err(|error| error.to_string())?;
+    Ok((id, path))
 }
 
 fn now_ms() -> u64 {
@@ -3592,6 +3628,12 @@ fn cron_registry_for(workspace: &Path) -> Result<runtime::CronRegistry, (StatusC
 }
 
 fn cron_entry_json(entry: &runtime::CronEntry) -> Value {
+    // 下次执行时间按本地时区现算:表达式非法时给出原因,前端据此提示而不是
+    // 显示一个永远不更新的时间。
+    let (next_run_at, schedule_error) = match cron_expr::CronSchedule::parse(&entry.schedule) {
+        Ok(schedule) => (schedule.next_after_ms(now_ms()), None),
+        Err(error) => (None, Some(error)),
+    };
     json!({
         "cron_id": entry.cron_id,
         "schedule": entry.schedule,
@@ -3602,6 +3644,12 @@ fn cron_entry_json(entry: &runtime::CronEntry) -> Value {
         "updated_at": entry.updated_at,
         "last_run_at": entry.last_run_at,
         "run_count": entry.run_count,
+        "session_id": entry.session_id,
+        "last_status": entry.last_status,
+        "last_finished_at": entry.last_finished_at,
+        "last_error": entry.last_error,
+        "next_run_at": next_run_at,
+        "schedule_error": schedule_error,
     })
 }
 
@@ -3622,8 +3670,7 @@ async fn api_crons(State(state): State<AppState>, Query(query): Query<WorkspaceQ
     crons.sort_by_key(|item| std::cmp::Reverse(item["created_at"].as_u64().unwrap_or(0)));
     Json(json!({
         "crons": crons,
-        "execution_ready": false,
-        "notice": "真实到点执行将在 Phase 6 接入；当前可维护任务条目。",
+        "execution_ready": true,
     }))
     .into_response()
 }
@@ -3650,6 +3697,9 @@ async fn api_cron_create(
     let prompt = body.prompt.trim();
     if schedule.is_empty() || prompt.is_empty() {
         return (StatusCode::BAD_REQUEST, "schedule 与 prompt 不能为空").into_response();
+    }
+    if let Err(error) = cron_expr::CronSchedule::parse(schedule) {
+        return (StatusCode::BAD_REQUEST, format!("cron 表达式无效：{error}")).into_response();
     }
     let workspace = match resolve_workspace(&state, body.workspace.as_deref()) {
         Ok(path) => path,
@@ -3780,23 +3830,30 @@ async fn api_cron_delete(
     }
 }
 
-/// 立即执行：Phase 4 只返回明确的未实现提示，避免前端以为已经跑过。
+/// 立即执行：与到点触发共用同一条入队路径（并发门闸、权限模式、专属会话）。
 async fn api_cron_run(
     State(state): State<AppState>,
-    UrlPath(_id): UrlPath<String>,
+    UrlPath(id): UrlPath<String>,
     Query(query): Query<WorkspaceQuery>,
 ) -> Response {
     if !authorize(&state, &AuthQuery { t: query.t.clone() }) {
         return unauthorized();
     }
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "code": "cron_execution_not_ready",
-            "message": "立即执行尚未实现（Phase 6 接入真实调度器）",
-        })),
-    )
-        .into_response()
+    if let Err((code, message)) = cron_id_arg(&id) {
+        return (code, message).into_response();
+    }
+    let workspace = match resolve_workspace(&state, query.workspace.as_deref()) {
+        Ok(path) => path,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    match cron_runner::run_now(&state, &workspace, &id) {
+        Ok(body) => (StatusCode::ACCEPTED, Json(body)).into_response(),
+        Err((code, message)) => (
+            code,
+            Json(json!({ "code": "cron_run_rejected", "message": message })),
+        )
+            .into_response(),
+    }
 }
 ///
 /// Windows 上有两个必须在这里处理的坑，否则 Web UI 里点“+”会出现
@@ -4795,6 +4852,7 @@ fn enqueue_session_prompt(
         text: prompt,
         permission: crate::permission_mode_from_label(permission),
         model,
+        cron_id: None,
     };
     match state.scheduler.enqueue(job) {
         Ok(enqueued) => {

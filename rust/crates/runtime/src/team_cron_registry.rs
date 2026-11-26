@@ -251,6 +251,18 @@ pub struct CronEntry {
     pub updated_at: u64,
     pub last_run_at: Option<u64>,
     pub run_count: u64,
+    /// Phase 6:该任务绑定的专属会话。首次执行时创建并写回,之后不再改绑。
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// 最近一次执行状态:`running` / `success` / `failed` / `skipped` / `interrupted`。
+    #[serde(default)]
+    pub last_status: Option<String>,
+    /// 最近一次执行结束时间(秒)。`last_status=running` 时为空。
+    #[serde(default)]
+    pub last_finished_at: Option<u64>,
+    /// 最近一次执行失败或跳过的简要原因。
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 /// 持久化镜像 — JSON 文件的 wire format。
@@ -341,6 +353,10 @@ impl CronRegistry {
             updated_at: ts,
             last_run_at: None,
             run_count: 0,
+            session_id: None,
+            last_status: None,
+            last_finished_at: None,
+            last_error: None,
         };
         inner.entries.insert(cron_id, entry.clone());
         persist_cron_inner(&mut inner);
@@ -408,6 +424,63 @@ impl CronRegistry {
         entry.last_run_at = Some(now_secs());
         entry.run_count += 1;
         entry.updated_at = now_secs();
+        persist_cron_inner(&mut inner);
+        Ok(())
+    }
+
+    /// 绑定任务专属会话。已绑定同一会话时为空操作;绑定其它会话会直接覆盖,
+    /// 调用方负责保证只在「首次执行」或「绑定的会话已被删除」时使用。
+    pub fn bind_session(&self, cron_id: &str, session_id: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().expect("cron registry lock poisoned");
+        let entry = inner
+            .entries
+            .get_mut(cron_id)
+            .ok_or_else(|| format!("cron not found: {cron_id}"))?;
+        if entry.session_id.as_deref() == Some(session_id) {
+            return Ok(());
+        }
+        entry.session_id = Some(session_id.to_owned());
+        entry.updated_at = now_secs();
+        persist_cron_inner(&mut inner);
+        Ok(())
+    }
+
+    /// 开始一次执行:记录执行次数与开始时间,状态置为 `running`。
+    pub fn record_start(&self, cron_id: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().expect("cron registry lock poisoned");
+        let entry = inner
+            .entries
+            .get_mut(cron_id)
+            .ok_or_else(|| format!("cron not found: {cron_id}"))?;
+        let ts = now_secs();
+        entry.last_run_at = Some(ts);
+        entry.run_count += 1;
+        entry.updated_at = ts;
+        entry.last_status = Some("running".to_string());
+        entry.last_finished_at = None;
+        entry.last_error = None;
+        persist_cron_inner(&mut inner);
+        Ok(())
+    }
+
+    /// 结束一次执行(或记录一次跳过)。`status` 为
+    /// `success` / `failed` / `skipped` / `interrupted` 之一。
+    pub fn record_finish(
+        &self,
+        cron_id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        let mut inner = self.inner.lock().expect("cron registry lock poisoned");
+        let entry = inner
+            .entries
+            .get_mut(cron_id)
+            .ok_or_else(|| format!("cron not found: {cron_id}"))?;
+        let ts = now_secs();
+        entry.last_status = Some(status.to_owned());
+        entry.last_finished_at = Some(ts);
+        entry.last_error = error.map(str::to_owned);
+        entry.updated_at = ts;
         persist_cron_inner(&mut inner);
         Ok(())
     }
@@ -882,6 +955,55 @@ mod tests {
         assert_eq!(reloaded.len(), 1);
         assert!(reloaded.get(&c1.cron_id).is_some());
         assert!(reloaded.get(&c2.cron_id).is_none());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn cron_entry_tracks_session_and_run_status() {
+        let path = temp_path("cron-status");
+        let _ = std::fs::remove_file(&path);
+        let registry = CronRegistry::with_persistence(&path).expect("create");
+        let entry = registry.create("* * * * *", "Check", None);
+        registry.bind_session(&entry.cron_id, "session-1").unwrap();
+        registry.record_start(&entry.cron_id).unwrap();
+
+        let running = registry.get(&entry.cron_id).unwrap();
+        assert_eq!(running.session_id.as_deref(), Some("session-1"));
+        assert_eq!(running.last_status.as_deref(), Some("running"));
+        assert_eq!(running.run_count, 1);
+        assert!(running.last_finished_at.is_none());
+
+        registry
+            .record_finish(&entry.cron_id, "success", None)
+            .unwrap();
+        let done = registry.get(&entry.cron_id).unwrap();
+        assert_eq!(done.last_status.as_deref(), Some("success"));
+        assert!(done.last_finished_at.is_some());
+
+        let reloaded = CronRegistry::with_persistence(&path).expect("reload");
+        let reloaded_entry = reloaded.get(&entry.cron_id).unwrap();
+        assert_eq!(reloaded_entry.session_id.as_deref(), Some("session-1"));
+        assert_eq!(reloaded_entry.last_status.as_deref(), Some("success"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn cron_entry_legacy_json_without_phase6_fields_loads() {
+        let path = temp_path("cron-legacy");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            r#"{"entries":[{"cron_id":"cron_legacy","schedule":"* * * * *","prompt":"p","description":null,"enabled":true,"created_at":1,"updated_at":1,"last_run_at":null,"run_count":0}],"counter":1}"#,
+        )
+        .unwrap();
+
+        let registry = CronRegistry::with_persistence(&path).expect("legacy json loads");
+        let entry = registry.get("cron_legacy").unwrap();
+        assert!(entry.session_id.is_none());
+        assert!(entry.last_status.is_none());
+        assert!(entry.last_finished_at.is_none());
 
         std::fs::remove_file(&path).ok();
     }

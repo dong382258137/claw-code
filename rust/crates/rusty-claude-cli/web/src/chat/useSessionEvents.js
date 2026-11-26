@@ -3,7 +3,7 @@ import { api, withToken } from '../api'
 
 // 任务面板关心的增量事件：与对话事件共用同一条 EventSource，
 // 由这里转发给 App，再由 App 传给 TasksPane（不再另开一条连接）。
-const TASK_EVENT_KINDS = new Set(['todos', 'plan', 'plan_mode', 'tasks', 'plans'])
+const TASK_EVENT_KINDS = new Set(['todos', 'plan', 'plan_mode', 'tasks', 'plans', 'cron'])
 
 // 会话事件订阅：唯一一条 /api/session/:id/events EventSource。
 // 快照不再轮询 /stream —— 连接建立（含重连）、收到 done、收到 reset 时，

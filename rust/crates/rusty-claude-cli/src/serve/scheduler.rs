@@ -99,6 +99,9 @@ pub struct PromptJob {
     pub text: String,
     pub permission: runtime::PermissionMode,
     pub model: Option<String>,
+    /// Phase 6：由定时任务触发时带上 cron_id，worker 收尾时写回执行状态；
+    /// 普通会话消息为 `None`。
+    pub cron_id: Option<String>,
 }
 
 /// 已接受的排队结果：`position` 从 1 开始（第 1 位即最先执行）。
@@ -930,6 +933,7 @@ mod tests {
             text: text.to_string(),
             permission: runtime::PermissionMode::ReadOnly,
             model: None,
+            cron_id: None,
         }
     }
 

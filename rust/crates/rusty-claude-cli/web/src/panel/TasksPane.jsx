@@ -24,6 +24,15 @@ const STATUS_LABEL = {
   skipped: '跳过',
 }
 
+// 定时任务最近一次执行的状态文案（后端 last_status 的原值集合）。
+const CRON_STATUS_LABEL = {
+  running: '执行中',
+  success: '成功',
+  failed: '失败',
+  skipped: '跳过',
+  interrupted: '已停止',
+}
+
 const readSteps = (plan) =>
   (plan && Array.isArray(plan.steps) ? plan.steps : []).map((step, index) => ({
     id: step.id || `s${index + 1}`,
@@ -148,6 +157,13 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError,
     }).catch((error) => onError?.(`任务加载失败：${error.message}`))
   }, [applyPlan, currentId, onError, sessionPath, workspace])
 
+  // 只刷新定时任务列表：cron 事件、立即执行后不必重拉整份任务快照。
+  const loadCrons = useCallback(() => {
+    api(withWorkspace('/api/workspace/crons', workspace))
+      .then((body) => setScheduledCrons(body.crons || []))
+      .catch((error) => onError?.(`定时任务加载失败：${error.message}`))
+  }, [onError, workspace])
+
   // 切换会话：清空所有派生状态并拉一次快照。
   // 实时事件由 App 的唯一 EventSource 透传（taskEvent），这里不再单独建连接。
   useEffect(() => {
@@ -208,10 +224,14 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError,
       case 'plans':
         setPlans(payload.plans || [])
         break
+      case 'cron':
+        // 到点执行/跳过/结束都会推一条 cron 事件：刷新列表拿到最新状态与下次时间。
+        loadCrons()
+        break
       default:
         break
     }
-  }, [applyPlan, currentId, taskEvent])
+  }, [applyPlan, currentId, loadCrons, taskEvent])
 
   // 断线重连（connected false → true）后事件可能已丢，补一次快照；
   // 首次挂载不重复拉取（切换会话的 effect 已经拉过）。
@@ -270,7 +290,7 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError,
       setScheduledCrons((list) => [body.cron, ...list])
       setCronSchedule('')
       setCronPrompt('')
-      onToast?.('定时任务已创建（真实执行将在 Phase 6 接入）')
+      onToast?.('定时任务已创建，到点会绑定专属会话自动执行')
     } catch (error) {
       onError?.(`创建定时任务失败：${error.message}`)
     } finally {
@@ -311,15 +331,23 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError,
     }
   }
 
-  // Phase 4 骨架：后端明确返回 501，这里把原因原样告诉用户。
+  // 立即执行：后端会创建/复用专属会话并走同一条调度队列，返回更新后的任务。
   const runCron = async (cron) => {
+    if (cronBusy) return
+    setCronBusy(true)
     try {
-      await api(
+      const body = await api(
         withWorkspace(`/api/workspace/crons/${encodeURIComponent(cron.cron_id)}/run`, workspace),
         { method: 'POST' },
       )
+      if (body.cron) {
+        setScheduledCrons((list) => list.map((item) => (item.cron_id === cron.cron_id ? body.cron : item)))
+      }
+      onToast?.(body.session ? `定时任务已开始执行（会话 ${body.session}）` : '定时任务已开始执行')
     } catch (error) {
       onError?.(`立即执行：${error.detail || error.message}`)
+    } finally {
+      setCronBusy(false)
     }
   }
 
@@ -589,7 +617,22 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError,
               {scheduledCrons.map((cron) => (
                 <div key={cron.cron_id} className={`tp-cron ${cron.enabled ? '' : 'off'}`}>
                   <span className="tp-cron-schedule">{cron.schedule}</span>
-                  <span className="tp-cron-prompt" title={cron.prompt}>{cron.description || cron.prompt}</span>
+                  <div className="tp-cron-main">
+                    <span className="tp-cron-prompt" title={cron.prompt}>{cron.description || cron.prompt}</span>
+                    <span className="tp-cron-meta">
+                      {cron.schedule_error
+                        ? `表达式无效：${cron.schedule_error}`
+                        : !cron.enabled
+                          ? '已停用'
+                          : cron.next_run_at
+                            ? `下次 ${fmtTime(cron.next_run_at)}`
+                            : '下次执行时间未知'}
+                      {cron.last_status
+                        ? ` · 上次 ${CRON_STATUS_LABEL[cron.last_status] || cron.last_status}`
+                        : ''}
+                      {cron.last_status && cron.last_finished_at ? ` ${fmtTime(cron.last_finished_at)}` : ''}
+                    </span>
+                  </div>
                   <span className="tp-cron-actions">
                     <button disabled={cronBusy} onClick={() => toggleCron(cron)}>{cron.enabled ? '停用' : '启用'}</button>
                     <button disabled={cronBusy} onClick={() => runCron(cron)}>执行</button>
@@ -599,7 +642,7 @@ export function TasksPane({ currentId, workspace, taskEvent, connected, onError,
               ))}
             </div>
           )}
-          {scheduledCrons.length === 0 && <div className="tp-empty-line">还没有定时任务（真实执行将在 Phase 6 接入）</div>}
+          {scheduledCrons.length === 0 && <div className="tp-empty-line">还没有定时任务，到点会绑定专属会话自动执行</div>}
           <div className="tp-cron-add">
             <input
               value={cronSchedule}
