@@ -1,207 +1,51 @@
-# 🦞 Claw Plus — Rust Implementation
+# 🦞 CLAW — Rust Workspace
 
-> 本项目基于 [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code)（MIT License）的 Rust 实现，经二次开发增加企业审计模块、IM 桥接等功能。
+> 早期代码基于 [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code)（MIT License），现已独立演进。
+> 产品形态为本地 Web UI；唯一启动入口是 `claw serve`（CLI/TUI 已在 Phase 3 移除）。
 
-A high-performance Rust rewrite of the Claw Plus CLI agent harness. Built for speed, safety, and native tool execution.
-
-For a task-oriented guide with copy/paste examples, see [`../USAGE.md`](../USAGE.md).
+任务导向的使用说明见 [`../USAGE.md`](../USAGE.md)。
 
 ## Quick Start
 
 ```bash
-# Inspect available commands
-cd rust/
-cargo run -p rusty-claude-cli -- --help
+cd rust
 
-# Build the workspace
-cargo build --workspace
+# 构建 Web 服务（产出 claw 与兼容名 claw-plus）
+cargo build --release -p claw-server
 
-# Run the interactive REPL
-cargo run -p rusty-claude-cli -- --model claude-opus-4-6
+# 启动（浏览器打开日志中带 token 的 URL）
+./target/release/claw serve --port 8787 --no-open
 
-# One-shot prompt
-cargo run -p rusty-claude-cli -- prompt "explain this codebase"
-
-# JSON output for automation
-cargo run -p rusty-claude-cli -- --output-format json prompt "summarize src/main.rs"
+# 可选：语义检索需要 onnxruntime.dll >= 1.24 与可执行文件同目录
 ```
-
-## 网页版模型后端（零 Token，无 Electron）
-
-`crates/web-bridge` 提供「DeepSeek 网页登录会话 → claw 模型后端」的能力，**不依赖
-Electron 壳/浏览器扩展**：登录一次保存凭证，之后运行时直接调用 chat.deepseek.com
-内部 API（PoW challenge + SSE `FINISHED` 完成信号，工具经增强提示协议注入并本地执行）。
-
-```bash
-cargo run -p web-bridge -- login                       # 一次登录：打开浏览器，抓 cookie+bearer 存 auth.json
-cargo run -p web-bridge -- import --cookie "<cookie>"  # 或手动粘贴浏览器 Cookie，自动取 token
-cargo run -p web-bridge -- run "读取 CLAUDE.md 并总结"   # 跑完整 agent 回合（本地工具执行），打印最终结果
-```
-
-- 凭证位置：`~/.claw/web-bridge/deepseek-auth.json`（`DEEPSEEK_WEB_AUTH` 覆盖）
-- 库级 API：`web_bridge::deepseek_web::DeepseekWebClient` 实现 `WebExchange`，
-  配合 `WebApiClient`/`driver::run_prompt` 复用 claw 全部回合与工具链
-- 旧链路（Electron 桌面壳、浏览器扩展、WS 网关 `serve`）已退役并移除
-
-### 主 CLI 直接使用（推荐）
-
-登录一次后，`claw` 主程序即可直接以网页版作为模型后端运行，无需单独的
-`claw-web-bridge run`：
-
-```bash
-claw.exe --model deepseek-web "读取 CLAUDE.md 并总结"     # 完整 agent 回合,零 API 消耗
-```
-
-网页後端同样走完整 agent 循环（工具调用有 claw 代码块协议保护），
-推理参数（`--reasoning-effort` / thinking 模式）对其无效。
 
 ## Configuration
 
-Set your API credentials:
+通过环境变量或 `~/.claw/settings.json` 提供 Provider 凭证：
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
-# Or use a proxy
-export ANTHROPIC_BASE_URL="https://your-proxy.com"
+export ANTHROPIC_BASE_URL="https://your-proxy.com"   # 可选
 ```
 
-Or provide an OAuth bearer token directly:
-
-```bash
-export ANTHROPIC_AUTH_TOKEN="anthropic-oauth-or-proxy-bearer-token"
-```
-
-## Mock parity harness
-
-The workspace now includes a deterministic Anthropic-compatible mock service and a clean-environment CLI harness for end-to-end parity checks.
-
-```bash
-cd rust/
-
-# Run the scripted clean-environment harness
-./scripts/run_mock_parity_harness.sh
-
-# Or start the mock service manually for ad hoc CLI runs
-cargo run -p mock-anthropic-service -- --bind 127.0.0.1:0
-```
-
-Harness coverage:
-
-- `streaming_text`
-- `read_file_roundtrip`
-- `grep_chunk_assembly`
-- `write_file_allowed`
-- `write_file_denied`
-- `multi_tool_turn_roundtrip`
-- `bash_stdout_roundtrip`
-- `bash_permission_prompt_approved`
-- `bash_permission_prompt_denied`
-- `plugin_tool_roundtrip`
-
-Primary artifacts:
-
-- `crates/mock-anthropic-service/` — reusable mock Anthropic-compatible service
-- `crates/rusty-claude-cli/tests/mock_parity_harness.rs` — clean-env CLI harness
-- `scripts/run_mock_parity_harness.sh` — reproducible wrapper
-- `scripts/run_mock_parity_diff.py` — scenario checklist + PARITY mapping runner
-- `mock_parity_scenarios.json` — scenario-to-PARITY manifest
+配置层级：`~/.claw/settings.json` → `.claw.json` → `.claw/settings.json`
+→ `.claw/settings.local.json`。
 
 ## Features
 
 | Feature | Status |
 |---------|--------|
+| 本地 Web UI（会话、流式对话、工具卡片、文件/终端面板） | ✅ |
 | Anthropic / OpenAI-compatible provider flows + streaming | ✅ |
-| Direct bearer-token auth via `ANTHROPIC_AUTH_TOKEN` | ✅ |
-| Interactive REPL (rustyline) | ✅ |
-| Tool system (bash, read, write, edit, grep, glob) | ✅ |
-| Web tools (search, fetch) | ✅ |
-| Sub-agent / agent surfaces | ✅ |
-| Todo tracking | ✅ |
-| Notebook editing | ✅ |
-| CLAUDE.md / project memory | ✅ |
-| Config file hierarchy (`.claw.json` + merged config sections) | ✅ |
-| Permission system | ✅ |
-| MCP server lifecycle + inspection | ✅ |
-| Session persistence + resume | ✅ |
-| Cost / usage / stats surfaces | ✅ |
-| Git integration | ✅ |
-| Markdown terminal rendering (ANSI) | ✅ |
-| Model aliases (opus/sonnet/haiku) | ✅ |
-| Direct CLI subcommands (`status`, `sandbox`, `agents`, `mcp`, `skills`, `doctor`) | ✅ |
-| Slash commands (including `/skills`, `/agents`, `/mcp`, `/doctor`, `/plugin`, `/subagent`) | ✅ |
-| Hooks (`/hooks`, config-backed lifecycle hooks) | ✅ |
-| Plugin management surfaces | ✅ |
-| Skills inventory / install surfaces | ✅ |
-| Machine-readable JSON output across core CLI surfaces | ✅ |
-
-## Model Aliases
-
-Short names resolve to the latest model versions:
-
-| Alias | Resolves To |
-|-------|------------|
-| `opus` | `claude-opus-4-6` |
-| `sonnet` | `claude-sonnet-4-6` |
-| `haiku` | `claude-haiku-4-5-20251213` |
-
-## CLI Flags and Commands
-
-Representative current surface:
-
-```text
-claw [OPTIONS] [COMMAND]
-
-Flags:
-  --model MODEL
-  --output-format text|json
-  --permission-mode MODE
-  --dangerously-skip-permissions
-  --allowedTools TOOLS
-  --resume [SESSION.jsonl|session-id|latest]
-  --version, -V
-
-Top-level commands:
-  prompt <text>
-  help
-  version
-  status
-  sandbox
-  dump-manifests
-  bootstrap-plan
-  agents
-  mcp
-  skills
-  system-prompt
-  init
-```
-
-The command surface is moving quickly. For the canonical live help text, run:
-
-```bash
-cargo run -p rusty-claude-cli -- --help
-```
-
-## Slash Commands (REPL)
-
-Tab completion expands slash commands, model aliases, permission modes, and recent session IDs.
-
-The REPL now exposes a much broader surface than the original minimal shell:
-
-- session / visibility: `/help`, `/status`, `/sandbox`, `/cost`, `/resume`, `/session`, `/version`, `/usage`, `/stats`
-- workspace / git: `/compact`, `/clear`, `/config`, `/memory`, `/init`, `/diff`, `/commit`, `/pr`, `/issue`, `/export`, `/hooks`, `/files`, `/release-notes`
-- discovery / debugging: `/mcp`, `/agents`, `/skills`, `/doctor`, `/tasks`, `/context`, `/desktop`
-- automation / analysis: `/review`, `/advisor`, `/insights`, `/security-review`, `/subagent`, `/team`, `/telemetry`, `/providers`, `/cron`, and more
-- plugin management: `/plugin` (with aliases `/plugins`, `/marketplace`)
-
-Notable claw-first surfaces now available directly in slash form:
-- `/skills [list|install <path>|help]`
-- `/agents [list|help]`
-- `/mcp [list|show <server>|help]`
-- `/doctor`
-- `/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]`
-- `/subagent [list|steer <target> <msg>|kill <id>]`
-
-See [`../USAGE.md`](../USAGE.md) for usage examples and run `cargo run -p rusty-claude-cli -- --help` for the live canonical command list.
+| 工具系统（bash, read, write, edit, grep, glob） | ✅ |
+| Web tools（search, fetch） | ✅ |
+| 多智能体 DAG / 子智能体 | ✅ |
+| 任务、计划与定时任务（真实到点执行） | ✅ |
+| 插件 / Skills / MCP / Hooks | ✅ |
+| 会话持久化、索引、导出、压缩 | ✅ |
+| 权限系统（read-only / workspace-write / full-access） | ✅ |
+| 中文语义检索（bge-small-zh-v1.5，可选 onnxruntime.dll） | ✅ |
+| IM 桥接（独立二进制） | ✅ |
 
 ## Workspace Layout
 
@@ -210,34 +54,49 @@ rust/
 ├── Cargo.toml              # Workspace root
 ├── Cargo.lock
 └── crates/
-    ├── api/                # Provider clients + streaming + request preflight
-    ├── commands/           # Shared slash-command registry + help rendering
-    ├── mock-anthropic-service/ # Deterministic local Anthropic-compatible mock
-    ├── plugins/            # Plugin metadata, manager, install/enable/disable surfaces
-    ├── runtime/            # Session, config, permissions, MCP, prompts, auth/runtime loop
-    ├── rusty-claude-cli/   # Main CLI binary (`claw-plus`)
-    ├── telemetry/          # Session tracing and usage telemetry types
-    └── tools/              # Built-in tools, skill resolution, tool search, agent runtime surfaces
+    ├── api/                  # Provider 客户端 + SSE + 请求预检
+    ├── claw-server/          # Web 服务、调度器、Web 前端（claw / claw-plus）
+    ├── runtime/              # 会话、记忆、工具运行时、SQLite 索引
+    ├── tools/                # 工具实现与调度
+    ├── commands/             # 斜杠命令、技能/插件市场
+    ├── plugins/              # 插件生命周期
+    ├── im-bridge/            # 独立 IM 桥接二进制
+    ├── claw-acp/             # ACP 协议
+    ├── claw-shell/           # 独立 shell 二进制
+    ├── web-bridge/           # DeepSeek 网页登录后端（独立 crate）
+    ├── telemetry/            # 会话追踪与用量遥测
+    ├── llm-eval/             # 评测工具
+    └── mock-deepseek-service/# 本地 mock 服务
 ```
 
 ### Crate Responsibilities
 
-- **api** — provider clients, SSE streaming, request/response types, auth (`ANTHROPIC_API_KEY` + bearer-token support), request-size/context-window preflight
-- **commands** — slash command definitions, parsing, help text generation, JSON/text command rendering
-- **mock-anthropic-service** — deterministic `/v1/messages` mock for CLI parity tests and local harness runs
-- **plugins** — plugin metadata, install/enable/disable/update flows, plugin tool definitions, hook integration surfaces
-- **runtime** — `ConversationRuntime`, config loading, session persistence, permission policy, MCP client lifecycle, system prompt assembly, usage tracking
-- **rusty-claude-cli** — REPL, one-shot prompt, direct CLI subcommands, streaming display, tool call rendering, CLI argument parsing
-- **telemetry** — session trace events and supporting telemetry payloads
-- **tools** — tool specs + execution: Bash, ReadFile, WriteFile, EditFile, GlobSearch, GrepSearch, WebSearch, WebFetch, Agent, TodoWrite, NotebookEdit, Skill, ToolSearch, and runtime-facing tool discovery
+- **api** —— provider 客户端、SSE 流式、认证、上下文窗口预检
+- **claw-server** —— axum 路由、调度器、turn 执行、Web 前端（内嵌单页）
+- **runtime** —— 会话、配置、权限、MCP、提示词组装、FTS5/向量索引、记忆
+- **tools** —— 工具规格与执行：Bash、文件 I/O、搜索、Web、Agent、Todo、Skill 等
+- **commands** —— 斜杠命令定义、解析、帮助文本、技能/插件市场
+- **plugins** —— 插件元数据、安装/启停/更新
+- **im-bridge** —— 飞书 / Discord 等远程操控，独立进程
+
+## Verification
+
+```bash
+# 仓库根
+scripts/fmt.sh --check
+cd rust
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+
+# Web 前端
+cd crates/claw-server/web && npm ci && npm run build
+```
 
 ## Stats
 
-- **~20K lines** of Rust
-- **9 crates** in workspace
-- **Binary name:** `claw-plus`
-- **Default model:** `claude-opus-4-6`
-- **Default permissions:** `danger-full-access`
+- **Binary:** `claw`（兼容 `claw-plus`）
+- **Release 二进制：** 22.88 MB（Phase 8 实测，Windows）
+- **默认权限：** `workspace-write`（以 Web 设置页为准）
 
 ## License
 

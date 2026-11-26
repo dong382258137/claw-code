@@ -38,9 +38,6 @@ target/
 # Vendored reference sources (not a build dependency)
 .vendor/
 
-# Porting notes (deferred)
-rust/crates/rusty-claude-cli/tui-ports/PORTING.md
-
 # fastembed model cache (downloaded ONNX models)
 .fastembed_cache/
 
@@ -49,7 +46,7 @@ _claw_tui_*.png
 _screenshot.ps1
 
 # Temporary example/test scratch files
-rust/crates/rusty-claude-cli/examples/
+rust/crates/claw-server/examples/
 
 # Benchmark task data. Regenerable/intermediate fetch outputs stay ignored,
 # but the *validated* pass^1 denominators are curated artifacts (each task

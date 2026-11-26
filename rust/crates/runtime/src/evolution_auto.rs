@@ -171,13 +171,13 @@ pub fn committed_file_list(source_root: &Path) -> String {
 
 /// 构建 release 并把二进制回拷到当前运行路径(**自动部署到全局**)。
 ///
-/// 从 `rusty-claude-cli` 的 `install` 分支原样下移到 runtime:进化管道
+/// 从 `claw-server` 的 `install` 分支原样下移到 runtime:进化管道
 /// (runtime 层)与 CLI 手动入口共用同一实现,避免"自动部署"与"手动部署"
 /// 两条路径行为漂移。失败回滚旧 exe,绝不留下半截二进制。
 pub fn install_binary(source_root: &Path) -> Result<std::path::PathBuf, String> {
     // quiet_command:进化构建在 Web 端后台执行,不能弹控制台窗口。
     let status = crate::sandbox::quiet_command("cargo")
-        .args(["build", "--release", "-p", "rusty-claude-cli"])
+        .args(["build", "--release", "-p", "claw-server"])
         .current_dir(source_root)
         .status()
         .map_err(|e| format!("启动 cargo 失败: {e}"))?;

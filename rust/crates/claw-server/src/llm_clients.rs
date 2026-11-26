@@ -4,7 +4,7 @@
 //! # 背景
 //!
 //! runtime crate 不能依赖 api crate(避免循环依赖),因此 v2 Phase 2 的两个 trait
-//! 通过依赖倒置方式定义在 runtime 内,生产实现必须在上层 crate(rusty-claude-cli)构造。
+//! 通过依赖倒置方式定义在 runtime 内,生产实现必须在上层 crate(claw-server)构造。
 //!
 //! 本模块:
 //! - [`LlmBridge`] 共享桥接:同步 trait → async LLM 调用,与 `AnthropicRuntimeClient::stream`
@@ -160,7 +160,7 @@ impl LlmBridge {
 ///
 /// # 构造
 /// ```ignore
-/// use rusty_claude_cli::llm_clients::DeepSeekJudgeClient;
+/// use claw_server::llm_clients::DeepSeekJudgeClient;
 /// use std::sync::Arc;
 /// use runtime::multi_agent::validation::{JudgeClient, LlmJudgeGate};
 ///
@@ -200,7 +200,7 @@ impl JudgeClient for DeepSeekJudgeClient {
 ///
 /// # 构造
 /// ```ignore
-/// use rusty_claude_cli::llm_clients::DeepSeekDecisionExtractorClient;
+/// use claw_server::llm_clients::DeepSeekDecisionExtractorClient;
 /// use std::sync::Arc;
 /// use runtime::decision_log::{DecisionExtractorClient, set_global_decision_extractor_client};
 ///
@@ -241,7 +241,7 @@ impl DecisionExtractorClient for DeepSeekDecisionExtractorClient {
 ///
 /// # 构造
 /// ```ignore
-/// use rusty_claude_cli::llm_clients::DeepSeekCompactionSummarizerClient;
+/// use claw_server::llm_clients::DeepSeekCompactionSummarizerClient;
 /// use std::sync::Arc;
 /// use runtime::compact::{CompactionSummarizerClient, set_global_compaction_summarizer_client};
 ///
@@ -330,7 +330,7 @@ impl runtime::memory_extract::MemoryExtractorClient for DeepSeekMemoryExtractorC
 /// # 架构
 ///
 /// `runtime::knowledge_freshness::ResearchClient` 是 async trait,定义在 runtime
-/// crate(不依赖 tools/api)。本实现位于 rusty-claude-cli(同时依赖 runtime +
+/// crate(不依赖 tools/api)。本实现位于 claw-server(同时依赖 runtime +
 /// tools + api),封装:
 ///
 /// 1. **搜索+抓取**(同步):调用 `tools::research_topic`(内部用 reqwest
@@ -358,7 +358,7 @@ impl runtime::memory_extract::MemoryExtractorClient for DeepSeekMemoryExtractorC
 ///
 /// # 构造
 /// ```ignore
-/// use rusty_claude_cli::llm_clients::WebResearchClient;
+/// use claw_server::llm_clients::WebResearchClient;
 /// use std::sync::Arc;
 /// use runtime::knowledge_freshness::{ResearchClient, set_global_research_client};
 ///
@@ -478,7 +478,7 @@ impl runtime::knowledge_freshness::ResearchClient for WebResearchClient {
 ///
 /// # 构造
 /// ```ignore
-/// use rusty_claude_cli::llm_clients::DeepSeekFreshnessAssessor;
+/// use claw_server::llm_clients::DeepSeekFreshnessAssessor;
 /// use std::sync::Arc;
 /// use runtime::knowledge_freshness::{FreshnessAssessor, set_global_freshness_assessor};
 ///
@@ -599,7 +599,7 @@ impl runtime::knowledge_freshness::FreshnessAssessor for DeepSeekFreshnessAssess
 ///
 /// # 构造
 /// ```ignore
-/// use rusty_claude_cli::llm_clients::DeepSeekQueryBuilderClient;
+/// use claw_server::llm_clients::DeepSeekQueryBuilderClient;
 /// use std::sync::Arc;
 /// use runtime::knowledge_freshness::{QueryBuilderClient, set_global_query_builder};
 ///

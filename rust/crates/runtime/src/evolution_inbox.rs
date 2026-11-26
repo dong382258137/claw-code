@@ -308,6 +308,9 @@ mod tests {
     fn archive_list_mark_processed_roundtrip() {
         let tmp = std::env::temp_dir().join(format!("claw-inbox-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
+        // 必须真实创建目录：resolve_source_root 只在 env 指向已存在目录时才采用，
+        // 否则会回退到本机注册表（开发机可能已自动登记源码树）。
+        std::fs::create_dir_all(&tmp).expect("mkdir");
         // 用 CLAW_SOURCE_ROOT 指向临时目录,使 resolve_inbox_dir 落到 tmp。
         let saved = std::env::var_os(crate::source_root::SOURCE_ROOT_ENV);
         std::env::set_var(crate::source_root::SOURCE_ROOT_ENV, &tmp);

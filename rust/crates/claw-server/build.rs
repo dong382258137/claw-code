@@ -144,7 +144,7 @@ fn workspace_source_inputs() -> Vec<PathBuf> {
     let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") else {
         return Vec::new();
     };
-    // CARGO_MANIFEST_DIR = <rust>/crates/rusty-claude-cli
+    // CARGO_MANIFEST_DIR = <rust>/crates/claw-server
     let crates_dir = PathBuf::from(&manifest_dir).join("..");
     let rust_root = crates_dir.join("..");
     let mut inputs = vec![
@@ -220,7 +220,7 @@ fn compute_fingerprint(git_sha: &str) -> String {
 /// 从 CARGO_MANIFEST_DIR 向上定位 git 仓库根的 .git 条目。
 /// 普通仓库是目录;worktree/submodule 是文件,内容为 `gitdir: <path>`。
 /// 只接受含 HEAD 文件的有效 gitdir:残留的空 `.git` 目录(误操作 git init
-/// 遗留,如 crates/rusty-claude-cli/.git)会被跳过,继续向上找真正的仓库根。
+/// 遗留,如 crates/claw-server/.git)会被跳过,继续向上找真正的仓库根。
 fn find_git_dir() -> Option<PathBuf> {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").ok()?;
     let mut dir = PathBuf::from(manifest_dir);

@@ -487,6 +487,7 @@ fn embedding_status_slot() -> &'static std::sync::Mutex<EmbeddingStatus> {
     })
 }
 
+#[cfg_attr(not(feature = "embedding"), allow(dead_code))]
 fn set_embedding_status(status: EmbeddingStatus) {
     let mut slot = embedding_status_slot()
         .lock()

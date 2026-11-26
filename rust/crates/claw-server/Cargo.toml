@@ -1,5 +1,5 @@
 [package]
-name = "rusty-claude-cli"
+name = "claw-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

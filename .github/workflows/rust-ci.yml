@@ -113,6 +113,26 @@ jobs:
       - name: Run workspace clippy
         run: cargo clippy --workspace
 
+  frontend-build:
+    name: web frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust/crates/claw-server/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: rust/crates/claw-server/web/package-lock.json
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Build single-file bundle
+        run: npm run build
+      - name: Verify embedded bundle exists
+        run: test -s dist/index.html
+
   windows-smoke:
     name: windows PowerShell smoke
     runs-on: windows-latest
@@ -126,9 +146,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust -> target
-      - name: Build CLI for Windows smoke
-        run: cargo build -p rusty-claude-cli
-      - name: Smoke local commands without live credentials
+      - name: Build claw and im-bridge
+        run: cargo build -p claw-server -p im-bridge
+      - name: Smoke version and help without live credentials
         env:
           ANTHROPIC_API_KEY: ""
           ANTHROPIC_AUTH_TOKEN: ""
@@ -139,18 +159,9 @@ jobs:
           $ErrorActionPreference = "Stop"
           $env:CLAW_CONFIG_HOME = Join-Path $env:RUNNER_TEMP "claw config home"
           New-Item -ItemType Directory -Force -Path $env:CLAW_CONFIG_HOME | Out-Null
-          $workspace = Join-Path $env:RUNNER_TEMP "claw path smoke"
-          New-Item -ItemType Directory -Force -Path $workspace | Out-Null
           $claw = Join-Path $env:GITHUB_WORKSPACE "rust\target\debug\claw.exe"
-          Push-Location $workspace
-          try {
-            & $claw help
-            & $claw status
-            & $claw config env
-            & $claw doctor
-          } finally {
-            Pop-Location
-          }
+          & $claw --version
+          & $claw --help
 
   compat-harness:
     name: compat-harness (upstream parity check)

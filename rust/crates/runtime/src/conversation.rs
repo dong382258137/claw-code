@@ -3595,11 +3595,11 @@ where
         if !abs_norm.starts_with(&format!("{root_norm}/")) || !abs_norm.contains("/rust/crates/") {
             return None;
         }
-        let is_web_source = abs_norm.contains("/rusty-claude-cli/web/src/");
+        let is_web_source = abs_norm.contains("/claw-server/web/src/");
         if is_web_source {
             return Some(format!(
                 "[hot-upgrade] 目标文件 `{target}` 属于 claw Web 前端源码。前端产物不会自动构建 —— \
-                 请先在工作区运行 `npm run build`（目录 `rust/crates/rusty-claude-cli/web`），\
+                 请先在工作区运行 `npm run build`（目录 `rust/crates/claw-server/web`），\
                  再在本 turn 结束后调用 `HotUpgrade` 工具。Web 模式下新进程会复用同端口和同 token，\
                  已打开的页面会自动重连并 reload 出新界面。"
             ));
@@ -5678,8 +5678,8 @@ where
                             if self.own_source_dirty && !self.upgrade_pending() {
                                 output_to_store = format!(
                                     "{output_to_store}\n\n[hot-upgrade-debt] 本会话已修改 claw 自身源码（含 Web 前端），但运行进程/前端产物仍是旧的。\
-                                     结束前请：Web 前端改动先 `npm run build`（`rust/crates/rusty-claude-cli/web`），\
-                                     再调用 `HotUpgrade`；TUI 与 Web 均支持，Web 会复用端口/token 并自动刷新页面。"
+                                     结束前请：Web 前端改动先 `npm run build`（`rust/crates/claw-server/web`），\
+                                     再调用 `HotUpgrade`；Web 会复用端口/token 并自动刷新页面。"
                                 );
                             }
                         }
@@ -22463,7 +22463,7 @@ mod tests {
     fn hot_upgrade_note_fires_for_web_frontend() {
         let (runtime, _tmp) = runtime_with_claw_layout();
         let hint = runtime
-            .maybe_hot_upgrade_note(r#"{"path": "rust/crates/rusty-claude-cli/web/src/App.jsx"}"#)
+            .maybe_hot_upgrade_note(r#"{"path": "rust/crates/claw-server/web/src/App.jsx"}"#)
             .expect("Web 前端源码应触发热升级提醒");
         assert!(hint.contains("[hot-upgrade]"), "应带标记: {hint}");
         assert!(hint.contains("npm run build"), "应提示先构建前端: {hint}");

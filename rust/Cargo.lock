@@ -529,6 +529,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw-server"
+version = "2026.11.10"
+dependencies = [
+ "api",
+ "async-trait",
+ "axum",
+ "chrono",
+ "commands",
+ "futures-util",
+ "mock-deepseek-service",
+ "plugins",
+ "portable-pty",
+ "reqwest 0.12.28",
+ "runtime",
+ "serde",
+ "serde_json",
+ "sha2",
+ "telemetry",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tools",
+ "uuid",
+]
+
+[[package]]
 name = "claw-shell"
 version = "2026.11.10"
 dependencies = [
@@ -3214,32 +3240,6 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
-
-[[package]]
-name = "rusty-claude-cli"
-version = "2026.11.10"
-dependencies = [
- "api",
- "async-trait",
- "axum",
- "chrono",
- "commands",
- "futures-util",
- "mock-deepseek-service",
- "plugins",
- "portable-pty",
- "reqwest 0.12.28",
- "runtime",
- "serde",
- "serde_json",
- "sha2",
- "telemetry",
- "tempfile",
- "tokio",
- "tokio-util",
- "tools",
- "uuid",
-]
 
 [[package]]
 name = "ryu"

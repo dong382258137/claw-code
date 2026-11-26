@@ -14,7 +14,7 @@
 //!    状态已落盘)。
 //! 2. `mv` 当前 exe → `exe.old`(Windows 允许重命名运行中的文件,旧进程
 //!    即使尚未完全退出也不冲突)。
-//! 3. `cargo build -p rusty-claude-cli`(workspace root 执行;输出显示在本
+//! 3. `cargo build -p claw-server`(workspace root 执行;输出显示在本
 //!    新控制台)。
 //! 4. 启动新 exe(`current_dir = user_cwd` → 自动检测 upgrade-request.json
 //!    → resume session + restore plan + 继续任务,无感衔接)。
@@ -195,7 +195,7 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     //    历史教训:部署版 exe 位于 `.cargo/bin`,从 exe 上溯到用户主目录不含
     //    Cargo.toml,推导必失败(2026-09-02 实测);注册表正是为此补的缺口。
     let workspace_root = runtime::source_root::resolve_source_root()
-        .filter(|p| is_rusty_claude_workspace(p))
+        .filter(|p| is_claw_server_workspace(p))
         .map(Ok)
         .unwrap_or_else(|| {
             workspace_root_from_user_cwd(user_cwd).or_else(|_| workspace_root_from_exe(&exe))
@@ -240,7 +240,7 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
         &format!(
             "[upgrade-helper] 编译: cargo build {}{} @ {}",
             if use_release { "--release " } else { "" },
-            "-p rusty-claude-cli",
+            "-p claw-server",
             workspace_root.display()
         ),
     );
@@ -248,7 +248,7 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     if use_release {
         args.push("--release".to_string());
     }
-    args.extend(["-p".to_string(), "rusty-claude-cli".to_string()]);
+    args.extend(["-p".to_string(), "claw-server".to_string()]);
     // 用 .output() 而非 .status():捕获 cargo 的 stdout/stderr 并写入日志,
     // 否则编译错误只出现在独立新终端,窗口关闭即丢失,无法定位
     // (2026-09-03 实测:仅剩 exit=101,原因不可见)。
@@ -290,7 +290,7 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
             .and_then(|name| name.to_str())
             .ok_or("无法获取 exe 文件名")?;
         // 入口名不一定是 cargo 产物名：桌面快捷方式用 claw-web.exe，但
-        // `cargo build -p rusty-claude-cli` 只产出 claw.exe。按产物名解析，
+        // `cargo build -p claw-server` 只产出 claw.exe。按产物名解析，
         // 避免再次出现“构建成功却找不到产物、入口已被改名”的事故。
         let built =
             resolve_built_product(&workspace_root, profile_dir, exe_name).ok_or_else(|| {
@@ -607,18 +607,18 @@ fn workspace_root_from_exe(exe: &Path) -> Result<PathBuf, Box<dyn std::error::Er
     Ok(root.to_path_buf())
 }
 
-/// 判断目录是否为 `rusty-claude-cli` 的 cargo workspace。
+/// 判断目录是否为 `claw-server` 的 cargo workspace。
 ///
 /// 不能只用"含 Cargo.toml"判定 —— 仓库里可能有多个含 Cargo.toml 的目录
 /// (如本项目 `D:\claw-code-src` 下有 `rust/` 与 `demo-monorepo/`),
 /// `read_dir` 遍历顺序不定,误命中非目标目录会导致
-/// `cargo build -p rusty-claude-cli` 报 "package not found"。
-/// 可靠判定:该目录是 cargo workspace 且含 `crates/rusty-claude-cli` 包。
-fn is_rusty_claude_workspace(dir: &Path) -> bool {
+/// `cargo build -p claw-server` 报 "package not found"。
+/// 可靠判定:该目录是 cargo workspace 且含 `crates/claw-server` 包。
+fn is_claw_server_workspace(dir: &Path) -> bool {
     dir.join("Cargo.toml").is_file()
         && dir
             .join("crates")
-            .join("rusty-claude-cli")
+            .join("claw-server")
             .join("Cargo.toml")
             .is_file()
 }
@@ -629,14 +629,14 @@ fn is_rusty_claude_workspace(dir: &Path) -> bool {
 /// (上溯到用户主目录无 Cargo.toml)。因此 `/upgrade` 的自编译升级必须基于
 /// **用户当前工作目录**定位源码仓库:
 ///
-/// 1. 从 `user_cwd` 向上逐级找 `rusty-claude-cli` 的 workspace(在源码目录内运行)。
+/// 1. 从 `user_cwd` 向上逐级找 `claw-server` 的 workspace(在源码目录内运行)。
 /// 2. 回退:探测 `user_cwd` 的直接子目录(覆盖"cwd=仓库根、workspace 在
 ///    `rust/` 子目录"的布局,如本项目 `D:\claw-code-src` → `D:\claw-code-src\rust`)。
 /// 3. 仍失败则报错,提示需在源码仓库内运行 `/upgrade`。
 fn workspace_root_from_user_cwd(user_cwd: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let mut cursor = Some(user_cwd);
     while let Some(dir) = cursor {
-        if is_rusty_claude_workspace(dir) {
+        if is_claw_server_workspace(dir) {
             return Ok(dir.to_path_buf());
         }
         cursor = dir.parent();
@@ -644,13 +644,13 @@ fn workspace_root_from_user_cwd(user_cwd: &Path) -> Result<PathBuf, Box<dyn std:
     if let Ok(entries) = std::fs::read_dir(user_cwd) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() && is_rusty_claude_workspace(&path) {
+            if path.is_dir() && is_claw_server_workspace(&path) {
                 return Ok(path);
             }
         }
     }
     Err(format!(
-        "无法从工作目录 {} 定位 rusty-claude-cli 的 cargo workspace(未找到含 crates/rusty-claude-cli 的目录);请在源码仓库内运行 /upgrade",
+        "无法从工作目录 {} 定位 claw-server 的 cargo workspace(未找到含 crates/claw-server 的目录);请在源码仓库内运行 /upgrade",
         user_cwd.display()
     )
     .into())
@@ -753,15 +753,15 @@ mod tests {
 
     // ---- 2026-09-02 部署版源码根推导修复 ----
 
-    /// 构造一个含 `rusty-claude-cli` 包的 workspace 目录结构。
+    /// 构造一个含 `claw-server` 包的 workspace 目录结构。
     fn make_rusty_workspace(base: &Path) {
         std::fs::write(base.join("Cargo.toml"), "[workspace]\n").unwrap();
-        let cli = base.join("crates").join("rusty-claude-cli");
+        let cli = base.join("crates").join("claw-server");
         std::fs::create_dir_all(&cli).unwrap();
         std::fs::write(cli.join("Cargo.toml"), "[package]\n").unwrap();
     }
 
-    /// user_cwd 本身就是 workspace(cwd 含 Cargo.toml + rusty-claude-cli)→ 直接命中。
+    /// user_cwd 本身就是 workspace(cwd 含 Cargo.toml + claw-server)→ 直接命中。
     #[test]
     fn workspace_root_from_user_cwd_hits_cwd_itself() {
         let dir = tempfile::tempdir().unwrap();
@@ -794,11 +794,11 @@ mod tests {
 
     /// 回归(2026-09-02):仓库根下存在多个含 Cargo.toml 的子目录
     /// (本项目 `rust/` 与 `demo-monorepo/`),read_dir 顺序不定。
-    /// 必须跳过非 rusty-claude-cli 的候选(如 demo-monorepo),命中真正的 workspace。
+    /// 必须跳过非 claw-server 的候选(如 demo-monorepo),命中真正的 workspace。
     #[test]
     fn workspace_root_from_user_cwd_skips_non_rusty_workspace() {
         let dir = tempfile::tempdir().unwrap();
-        // 干扰候选:含 Cargo.toml 但非 rusty-claude-cli workspace(demo-monorepo 场景)。
+        // 干扰候选:含 Cargo.toml 但非 claw-server workspace(demo-monorepo 场景)。
         let decoy = dir.path().join("demo-monorepo");
         std::fs::create_dir_all(&decoy).unwrap();
         std::fs::write(decoy.join("Cargo.toml"), "[package]\n").unwrap();
@@ -810,7 +810,7 @@ mod tests {
         assert_eq!(root, target, "必须跳过 demo-monorepo 命中 rust");
     }
 
-    /// 完全找不到 rusty-claude-cli workspace → 明确报错。
+    /// 完全找不到 claw-server workspace → 明确报错。
     #[test]
     fn workspace_root_from_user_cwd_errors_when_no_workspace() {
         let dir = tempfile::tempdir().unwrap();

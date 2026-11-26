@@ -223,7 +223,7 @@ mod tests {
         assert_eq!(diff_violates_forbidden("\n \n"), None);
         // 黑名单命中(大小写不敏感)
         assert_eq!(
-            diff_violates_forbidden("rust/crates/rusty-claude-cli/src/upgrade_helper.rs"),
+            diff_violates_forbidden("rust/crates/claw-server/src/upgrade_helper.rs"),
             Some("upgrade_helper.rs")
         );
         assert_eq!(

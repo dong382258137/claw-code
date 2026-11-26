@@ -26,12 +26,12 @@ echo "  Commit: $(git -C "$REPO_ROOT" log --oneline -1)" >&2
 # on build failure cargo exits non-zero and set -e aborts.
 if ! GIT_SHA="$EXPECTED_SHA" cargo build \
         --manifest-path "$RUST_DIR/Cargo.toml" \
-        -p rusty-claude-cli -q 2>/dev/null; then
+        -p claw-server -q 2>/dev/null; then
     # Re-run with visible output so the user sees the error
     echo "✗ Build failed — rerunning with output:" >&2
     GIT_SHA="$EXPECTED_SHA" cargo build \
         --manifest-path "$RUST_DIR/Cargo.toml" \
-        -p rusty-claude-cli 2>&1 | sed 's/^/  /' >&2
+        -p claw-server 2>&1 | sed 's/^/  /' >&2
     exit 1
 fi
 

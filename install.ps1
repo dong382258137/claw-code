@@ -124,7 +124,7 @@ if ($MISSING.Count -gt 0) {
 # Step 3: build claw binaries
 # =========================================================
 Step "Building claw ($BUILD_PROFILE)"
-$CARGO_FLAGS = @('build', '-p', 'rusty-claude-cli')
+$CARGO_FLAGS = @('build', '-p', 'claw-server')
 if ($BUILD_PROFILE -eq 'release') { $CARGO_FLAGS += '--release' }
 Info "Running: cargo $($CARGO_FLAGS -join ' ')"
 Info "First build may take a few minutes. Please wait..."

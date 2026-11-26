@@ -30,7 +30,7 @@ CLAW 是一个完全独立演进的 Rust 代码智能体，围绕「模型之外
 
 | 能力 | 说明 |
 |------|------|
-| 🚀 高性能 Rust 引擎 | 单二进制、<50ms 冷启动、<50MB 空闲内存 |
+| 🚀 高性能 Rust 引擎 | 单二进制、约 0.5s 启动、约 10MB 空闲内存（未加载嵌入模型） |
 | 🔁 回放分支自进化闭环 | 失败点定位 → 自动分支重试 → 工具级晋升门控 |
 | 🤖 多智能体 DAG 编排 | 依赖图调度、worktree 写隔离、SAGA 补偿、团队编排 |
 | 🧬 自进化 Harness | 失败模式挖掘 + 双重门控 + 动态注入，越用越强 |
@@ -53,10 +53,10 @@ The entire project is rewritten in Rust, compiling to a single native binary wit
 
 | 指标 Metric | 数据 Value |
 |---|---|
-| 代码规模 Codebase | ~20,000+ 行 Rust / lines of Rust |
-| Crate 数量 Crates | 9+ 个工作区 crate / workspace crates |
-| 启动速度 Startup | <50ms（冷启动）/ <50ms (cold start) |
-| 内存占用 Memory | <50MB（空闲时）/ <50MB (idle) |
+| 代码规模 Codebase | 20 万+ 行 Rust / 200k+ lines of Rust |
+| Crate 数量 Crates | 13 个工作区 crate / workspace crates |
+| 启动速度 Startup | 约 0.5 s（release 实测）/ ~0.5 s (measured) |
+| 内存占用 Memory | 约 10 MB（空闲，未加载嵌入模型）/ ~10 MB idle; ~163 MB after embedding model loads |
 
 - **原生工具执行 / Native tool execution** — Bash、PowerShell、文件 I/O 等工具绕过脚本层，直接在 Rust 中调用系统 API
 - **零拷贝流式处理 / Zero-copy streaming** — SSE 事件流直接解析，无中间序列化开销
@@ -241,20 +241,19 @@ implementation lives in [`rust/`](./rust)。项目已从最初的 MIT License �
 # 1. Clone and build
 git clone https://github.com/dong382258137/claw-code
 cd claw-code/rust
-cargo build --workspace
+cargo build --release -p claw-server
 
 # 2. Set your API key (Anthropic API key — not a Claude subscription)
 export ANTHROPIC_API_KEY="sk-ant-..."
 
-# 3. Verify everything is wired correctly
-./target/debug/claw-plus doctor
+# 3. Start the local Web UI (browser opens the token URL printed on startup)
+./target/release/claw serve --port 8787
 
-# 4. Run a prompt
-./target/debug/claw-plus prompt "say hello"
+# 4. Optional: put onnxruntime.dll (>=1.24) next to the binary to enable semantic search
 ```
 
 > [!NOTE]
-> **Windows (PowerShell):** the binary is `claw.exe`, not `claw-plus`. Use `.\target\debug\claw-plus.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
+> **Windows (PowerShell):** the binary is `claw.exe`. Use `.\target\release\claw.exe serve --port 8787`.
 
 ### Windows setup
 
@@ -279,12 +278,12 @@ The common manual onboarding issues on Windows are:
    ```powershell
    git clone https://github.com/dong382258137/claw-code
    cd claw-code/rust
-   cargo build --workspace
+   cargo build --release -p claw-server
    ```
 4. **Run** (PowerShell — note `.exe` and backslash):
    ```powershell
    $env:ANTHROPIC_API_KEY = "sk-ant-..."
-   .\target\debug\claw-plus.exe prompt "say hello"
+   .\target\release\claw.exe serve --port 8787
    ```
 
 For release ZIPs, PATH setup, provider switching, and notification smoke checks, see [`docs/windows-install-release.md`](./docs/windows-install-release.md).
@@ -293,19 +292,21 @@ For release ZIPs, PATH setup, provider switching, and notification smoke checks,
 
 ## Post-build: locate the binary and verify
 
-After running `cargo build --workspace`, the `claw-plus` binary is built but **not** automatically installed to your system. Here's where to find it and how to verify the build succeeded.
+After running `cargo build --release -p claw-server`, the `claw` binary is built but **not** automatically installed to your system. Here's where to find it and how to verify the build succeeded.
 
 ### Binary location
 
-After `cargo build --workspace` in `claw-code/rust/`:
+After `cargo build --release -p claw-server` in `claw-code/rust/`:
 
 **Debug build (default, faster compile):**
-- **macOS/Linux:** `rust/target/debug/claw-plus`
-- **Windows:** `rust/target/debug/claw-plus.exe`
+- **macOS/Linux:** `rust/target/debug/claw`
+- **Windows:** `rust/target/debug/claw.exe`
 
 **Release build (optimized, slower compile):**
-- **macOS/Linux:** `rust/target/release/claw-plus`
-- **Windows:** `rust/target/release/claw-plus.exe`
+- **macOS/Linux:** `rust/target/release/claw`
+- **Windows:** `rust/target/release/claw.exe`
+
+`claw-plus` / `claw-plus.exe` 是同 crate 的兼容产物，保留一个版本周期；新脚本请使用 `claw`。
 
 If you ran `cargo build` without `--release`, the binary is in the `debug/` folder.
 
@@ -336,11 +337,11 @@ If these commands succeed, the build is working. Web UI 首页与 `/api/sessions
 
 ### Optional: Add to PATH
 
-If you want to run `claw-plus` from any directory without the full path, choose one of these approaches:
+If you want to run `claw` from any directory without the full path, choose one of these approaches:
 
 **Option 1: Symlink (macOS/Linux)**
 ```bash
-ln -s $(pwd)/rust/target/debug/claw-plus /usr/local/bin/claw-plus
+ln -s $(pwd)/rust/target/release/claw /usr/local/bin/claw
 ```
 Then reload your shell and test:
 ```bash
@@ -373,9 +374,9 @@ claw --help
 
 ### Troubleshooting
 
-- **"command not found: claw"** — The binary is in `rust/target/debug/claw-plus`, but it's not on your PATH. Use the full path `./rust/target/debug/claw-plus` or symlink/install as above.
-- **"permission denied"** — On macOS/Linux, you may need `chmod +x rust/target/debug/claw-plus` if the executable bit isn't set (rare).
-- **Debug vs. release** — If the build is slow, you're in debug mode (default). Add `--release` to `cargo build` for faster runtime, but the build itself will take 5–10 minutes.
+- **"command not found: claw"** — The binary is in `rust/target/release/claw`, but it's not on your PATH. Use the full path `./rust/target/release/claw` or symlink/install as above.
+- **"permission denied"** — On macOS/Linux, you may need `chmod +x rust/target/release/claw` if the executable bit isn't set (rare).
+- **Debug vs. release** — If the build is slow, you're in debug mode (default). Add `--release` to `cargo build -p claw-server` for faster runtime, but the build itself will take 5–10 minutes.
 
 > [!NOTE]
 > **Auth:** claw requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
@@ -389,15 +390,13 @@ cargo test --workspace
 
 ## Documentation map
 
-- [`USAGE.md`](./USAGE.md) — quick commands, auth, sessions, config, parity harness
-- [`docs/navigation-file-context.md`](./docs/navigation-file-context.md) — terminal navigation, scrollback, `@path` file context, attachments, and secret-safety guidance
+- [`USAGE.md`](./USAGE.md) — Web 启动、配置层级、权限、定时任务、语义检索与排障
 - [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md) — Ollama/llama.cpp/vLLM setup, Claw multi-provider positioning, and local skills install checks
 - [`docs/windows-install-release.md`](./docs/windows-install-release.md) — PowerShell-first install, release artifact, provider switching, and Windows/WSL notification smoke paths
 - [`install.ps1`](./install.ps1) — Windows one-click installer (mirrors `install.sh`)
 - [`CHANGELOG.md`](./CHANGELOG.md) — version history and notable changes
-- [`rust/README.md`](./rust/README.md) — crate map, CLI surface, features, workspace layout
+- [`rust/README.md`](./rust/README.md) — crate map, features, workspace layout
 - [`PARITY.md`](./PARITY.md) — parity status for the Rust port
-- [`rust/MOCK_PARITY_HARNESS.md`](./rust/MOCK_PARITY_HARNESS.md) — deterministic mock-service harness details
 - [`ROADMAP.md`](./ROADMAP.md) — active roadmap and open cleanup work
 - [`docs/g004-events-reports-contract.md`](./docs/g004-events-reports-contract.md) — Stream 2 lane event/report contract guidance for consumers
 - [`PHILOSOPHY.md`](./PHILOSOPHY.md) — why the project exists and how it is operated

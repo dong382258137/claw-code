@@ -14,8 +14,8 @@
 //! 2. `~/.claw/source-root` 注册表
 //! 3. `None`(调用方回退:从 exe / user_cwd 上溯)
 //!
-//! 校验:注册与解析均要求目录是 `rusty-claude-cli` 的 cargo workspace
-//! (含 `crates/rusty-claude-cli/Cargo.toml`),避免误注册无关仓库。
+//! 校验:注册与解析均要求目录是 `claw-server` 的 cargo workspace
+//! (含 `crates/claw-server/Cargo.toml`),避免误注册无关仓库。
 
 use std::path::{Path, PathBuf};
 
@@ -25,18 +25,18 @@ pub const SOURCE_ROOT_FILE: &str = "source-root";
 /// 环境变量名:显式指定源码根(最高优先级)。
 pub const SOURCE_ROOT_ENV: &str = "CLAW_SOURCE_ROOT";
 
-/// 判断目录是否为 `rusty-claude-cli` 的 cargo workspace。
+/// 判断目录是否为 `claw-server` 的 cargo workspace。
 ///
 /// 判定不能用"含 Cargo.toml" —— 仓库内可能有多个含 Cargo.toml 的目录
 /// (本项目根下同时有 `rust/` 与 `demo-monorepo/`)。可靠判定:该目录是
-/// cargo workspace 且含 `crates/rusty-claude-cli` 包。
+/// cargo workspace 且含 `crates/claw-server` 包。
 ///
 /// 注:workspace 根可能是仓库根(`D:\claw-code-src`)或 `rust/` 子目录,
-/// 两种布局都可接受 —— 只要其下能找到 `crates/rusty-claude-cli`。
+/// 两种布局都可接受 —— 只要其下能找到 `crates/claw-server`。
 #[must_use]
 pub fn is_claw_workspace(dir: &Path) -> bool {
     dir.join("crates")
-        .join("rusty-claude-cli")
+        .join("claw-server")
         .join("Cargo.toml")
         .is_file()
 }
@@ -90,7 +90,7 @@ pub fn resolve_source_root() -> Option<PathBuf> {
 pub fn register_source_root(source_root: &Path) -> Result<PathBuf, String> {
     if !is_claw_workspace(source_root) {
         return Err(format!(
-            "{} 不是 claw workspace(未找到 crates/rusty-claude-cli/Cargo.toml),拒绝登记",
+            "{} 不是 claw workspace(未找到 crates/claw-server/Cargo.toml),拒绝登记",
             source_root.display()
         ));
     }
@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     fn is_claw_workspace_detects_this_repo() {
-        // 本测试运行于 runtime crate,其 workspace 根含 crates/rusty-claude-cli。
+        // 本测试运行于 runtime crate,其 workspace 根含 crates/claw-server。
         // 从 CARGO_MANIFEST_DIR 上溯找到 workspace 根。
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let found = {
@@ -140,7 +140,7 @@ mod tests {
         };
         assert!(
             found.is_some(),
-            "应能从 {manifest:?} 上溯找到含 crates/rusty-claude-cli 的 workspace"
+            "应能从 {manifest:?} 上溯找到含 crates/claw-server 的 workspace"
         );
     }
 
@@ -172,9 +172,15 @@ mod tests {
         std::env::set_var(SOURCE_ROOT_ENV, &tmp);
         assert_eq!(resolve_source_root().as_deref(), Some(tmp.as_path()));
 
-        // 指向不存在的目录 → env 分支失效(应回退注册表,此处不写注册表 → None)
+        // 指向不存在的目录 → env 分支失效，回退注册表。
+        // 注册表可能为空（CI），也可能指向本机源码树（开发机自动登记过），
+        // 因此只断言不会采用失效的 env 路径。
         std::env::set_var(SOURCE_ROOT_ENV, tmp.join("does-not-exist"));
-        assert_eq!(resolve_source_root(), None);
+        assert_ne!(
+            resolve_source_root(),
+            Some(tmp.join("does-not-exist")),
+            "失效的 env 路径不应被采用"
+        );
 
         match saved {
             Some(v) => std::env::set_var(SOURCE_ROOT_ENV, v),

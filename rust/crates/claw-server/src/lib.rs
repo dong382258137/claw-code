@@ -6,7 +6,7 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
-//! CLaw Web 服务 crate（历史名 `rusty-claude-cli`）。
+//! CLaw Web 服务 crate（Phase 9 由 `rusty-claude-cli` 更名为 `claw-server`）。
 //!
 //! Phase 3 起产品界面只有 Web：本 crate 只保留 `claw serve` 入口、
 //! turn 执行内核、会话/检查点/热升级与会话市场能力，CLI/TUI 界面层已删除。

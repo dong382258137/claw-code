@@ -24,8 +24,8 @@ $releaseDir = Join-Path $rustDir "target\release"
 $exe = Join-Path $releaseDir "claw.exe"
 
 if (-not $SkipBuild) {
-    Write-Host "▶ cargo build --release -p rusty-claude-cli"
-    & cargo build --release -p rusty-claude-cli --manifest-path (Join-Path $rustDir "Cargo.toml")
+    Write-Host "▶ cargo build --release -p claw-server"
+    & cargo build --release -p claw-server --manifest-path (Join-Path $rustDir "Cargo.toml")
     if ($LASTEXITCODE -ne 0) { throw "release 构建失败" }
 }
 if (-not (Test-Path $exe)) { throw "未找到 $exe,请先构建 release" }

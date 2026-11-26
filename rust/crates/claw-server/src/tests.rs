@@ -47,7 +47,7 @@ fn temp_dir() -> PathBuf {
         .expect("time should be after epoch")
         .as_nanos();
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("rusty-claude-cli-{nanos}-{unique}"))
+    std::env::temp_dir().join(format!("claw-server-{nanos}-{unique}"))
 }
 
 fn env_lock() -> MutexGuard<'static, ()> {
