@@ -634,6 +634,52 @@ mod tests {
     }
 
     #[test]
+    fn render_skeleton_omits_task_line_to_avoid_duplicate_with_current_task_slot() {
+        // 尾部槽位 4「Current Task」已逐字渲染 task_summary；骨架再发一份
+        // 等于同一段文本每轮付两次全价。故骨架不得包含 `Task:` 行。
+        let artifact = PlanArtifact::new("唯一任务摘要", sample_steps());
+        let rendered = artifact.render_skeleton();
+        assert!(
+            !rendered.contains("Task: 唯一任务摘要"),
+            "Active Plan 骨架不得重复渲染 task_summary: {rendered}"
+        );
+        // 步骤正文仍需完整（模型靠它判断当前做什么、怎样算完成）。
+        assert!(rendered.contains("Read file"));
+        assert!(rendered.contains("acceptance: file read"));
+    }
+
+    #[test]
+    fn render_skeleton_emits_precommitment_once_for_multiple_high_risk_steps() {
+        // 原实现每个 high-risk step 各发一份 3 行协议正文（4 步 ≈360 tok 纯重复）。
+        // 去重后正文只出现一次，high-risk 归属由每步的 ⚠ 标签表达。
+        let mut s1 = PlanStep::new("s1", "删库", "已删");
+        s1.risk_level = StepRisk::High;
+        let mut s2 = PlanStep::new("s2", "改配置", "已改");
+        s2.risk_level = StepRisk::High;
+        let artifact = PlanArtifact::new("高危任务", vec![s1, s2]);
+
+        let rendered = artifact.render_skeleton();
+        assert_eq!(
+            rendered.matches("PRE-COMMITMENT REQUIRED").count(),
+            1,
+            "协议正文必须只出现一次: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches("⚠ high-risk").count(),
+            2,
+            "每个 high-risk step 仍须带归属标签: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_skeleton_omits_precommitment_when_no_high_risk_step() {
+        let artifact = PlanArtifact::new("安全任务", sample_steps());
+        let rendered = artifact.render_skeleton();
+        assert!(!rendered.contains("PRE-COMMITMENT REQUIRED"));
+        assert!(!rendered.contains("high-risk"));
+    }
+
+    #[test]
     fn render_skeleton_folds_succeeded_steps() {
         let mut artifact = PlanArtifact::new("fold task", sample_steps());
         artifact.steps[0].mark_succeeded();
