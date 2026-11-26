@@ -1,0 +1,103 @@
+{
+  "model": "demo",
+  "system": [
+    {
+      "type": "text",
+      "text": "# System\nYou are an agent.\nstatic filler line\nstatic filler line\nstatic filler line\nstatic filler line\nstatic filler line\nstatic filler line\nstatic filler line\nstatic filler line\nstatic filler line\nstatic filler line\nstatic filler line\nstatic filler line\nstatic filler line\nstatic filler line\nstatic filler line\nstatic filler line\nstatic filler line\nstatic filler line\nstatic filler line\nstatic filler line\n",
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    },
+    {
+      "type": "text",
+      "text": "# Environment context\n - cwd: /tmp/demo\n - shell: bash\n"
+    }
+  ],
+  "tools": [
+    {
+      "name": "bash",
+      "description": "Run a shell command.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "read_file",
+      "description": "Read a file.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "# 设计决策与实验证据(前缀冻结)\n- [dl-1] frozen section\n"
+    },
+    {
+      "role": "user",
+      "content": "turn 0 user message"
+    },
+    {
+      "role": "assistant",
+      "content": "turn 0 assistant reply"
+    },
+    {
+      "role": "user",
+      "content": "turn 1 user message"
+    },
+    {
+      "role": "assistant",
+      "content": "turn 1 assistant reply"
+    },
+    {
+      "role": "user",
+      "content": "turn 2 user message"
+    },
+    {
+      "role": "assistant",
+      "content": "turn 2 assistant reply"
+    },
+    {
+      "role": "user",
+      "content": "turn 3 user message"
+    },
+    {
+      "role": "assistant",
+      "content": "turn 3 assistant reply"
+    },
+    {
+      "role": "user",
+      "content": "turn 4 user message"
+    },
+    {
+      "role": "assistant",
+      "content": "turn 4 assistant reply"
+    },
+    {
+      "role": "user",
+      "content": "# 固定记忆(任务简报)\n- goal: 示例目标\n"
+    },
+    {
+      "role": "user",
+      "content": "# Project context\n - Claude instruction files discovered: 1.\n\nGit status snapshot:\n## main\n"
+    },
+    {
+      "role": "user",
+      "content": "# Runtime Context\n\n以下为系统自动注入的运行时上下文\n\n## Notebook(工作记忆)\n示例笔记内容\n\n## Active Plan\n# Active Plan\n\nTask: 示例任务摘要\n\nSteps:\n1. 第一步\n   acceptance: 通过\n   verify: cargo test\n   ⚠ PRE-COMMITMENT REQUIRED: This step is high-risk.\n   Before implementing, generate 2+ candidate approaches.\n   Only commit after explicit comparison.\n2. 第二步\n   acceptance: 通过\n   verify: cargo test\n   ⚠ PRE-COMMITMENT REQUIRED: This step is high-risk.\n   Before implementing, generate 2+ candidate approaches.\n   Only commit after explicit comparison.\n\n## Step Status\n[plan status] 1=done 2=pending\n\n## Current Task\n示例任务摘要\n"
+    }
+  ]
+}
