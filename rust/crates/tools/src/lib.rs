@@ -1163,7 +1163,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
-            description: "Replace text in a workspace file. The result includes startLine/endLine/affectedLineCount/newTotalLines telling where the replacement landed and the file's new total line count, so you can compute line offsets for subsequent edits without re-reading the file. Line endings are normalized to the file's own style (CRLF/LF) before matching.",
+            description: "Replace text in a workspace file. IMPORTANT: read_file the exact target lines first to confirm the precise bytes (indentation, quotes, line endings) — never construct old_string from memory; that causes `old_string not found` retries. If a match fails, correct old_string once using the error's line-count/line-ending hint instead of retrying identical parameters. The result includes startLine/endLine/affectedLineCount/newTotalLines telling where the replacement landed and the file's new total line count, so you can compute line offsets for subsequent edits without re-reading the file. Line endings are normalized to the file's own style (CRLF/LF) before matching.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1510,12 +1510,12 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             description: "Request a hot upgrade: the running claw rebuilds itself and restarts, \
                           then automatically resumes this session and continues the task. Call this \
                           after you have changed claw's own source code and want the changes to take \
-                          effect in the running process. This works in both TUI/CLI and Web \
-                          (`claw serve`) sessions. In Web mode the replacement server reuses the \
+                          effect in the running process. This works in Web (`claw serve`) sessions. \
+                          In Web mode the replacement server reuses the \
                           same port and access token, so open pages reconnect and reload \
                           automatically. If you changed Web frontend sources under \
-                          `rust/crates/rusty-claude-cli/web/src`, run `npm run build` in \
-                          `rust/crates/rusty-claude-cli/web` BEFORE calling this tool: the UI is \
+                          `rust/crates/claw-server/web/src`, run `npm run build` in \
+                          `rust/crates/claw-server/web` BEFORE calling this tool: the UI is \
                           embedded from `web/dist` at compile time, so skipping that build upgrades \
                           the backend but keeps the old frontend. The request only takes effect \
                           after the current turn finishes; the process then exits and a new one \
@@ -1759,7 +1759,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskGet",
-            description: "Get the status and details of a background task by ID.",
+            description: "Get the status and details of a background task by ID. The task_id must be the value returned by TaskCreate or RunTaskPacket — a bash backgroundPid is an OS process number, not a task_id (passing it fails with 'task not found').",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1782,7 +1782,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskStop",
-            description: "Stop a running background task by ID.",
+            description: "Stop a running background task by ID. The task_id must be the value returned by TaskCreate or RunTaskPacket — a bash backgroundPid is an OS process number, not a task_id (passing it fails with 'task not found').",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1795,7 +1795,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskUpdate",
-            description: "Send a message or update to a running background task.",
+            description: "Send a message or update to a running background task. The task_id must be the value returned by TaskCreate or RunTaskPacket — a bash backgroundPid is an OS process number, not a task_id (passing it fails with 'task not found').",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -6283,7 +6283,7 @@ fn preview_text(input: &str, max_chars: usize) -> String {
 
 /// 单条调研结果(标题 + URL + 内容片段)。
 ///
-/// 由 [`research_topic`] 返回,供上层(rusty-claude-cli 的 WebResearchClient)
+/// 由 [`research_topic`] 返回,供上层(claw-server 的 WebResearchClient)
 /// 拼接成 LLM 摘要 prompt。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ResearchHit {
@@ -8130,7 +8130,7 @@ fn load_provider_fallback_config(workspace: &Path) -> ProviderFallbackConfig {
 }
 
 /// Build a [`SystemContent`] from a [`SystemPromptSplit`] with prompt-caching
-/// markers, mirroring `build_system_blocks` in `rusty-claude-cli/src/streaming.rs`.
+/// markers, mirroring `build_system_blocks` in `rust/crates/runtime/src/`.
 ///
 /// Uses tiered cache breakpoints (up to 3) computed by
 /// [`SystemPromptSplit::static_cache_breakpoints`] to enable layered caching.
