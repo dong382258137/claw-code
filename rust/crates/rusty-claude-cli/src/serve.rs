@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
+use std::io::{Read, Seek, SeekFrom};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -73,6 +74,25 @@ struct AppState {
     plugin_install_locks: Arc<Mutex<BTreeSet<String>>>,
     /// 定时任务存储的读改写串行化（每个工作区一个 `.claw/crons.json`）。
     crons_lock: Arc<Mutex<()>>,
+    /// Phase 5：每工作区会话读取索引（`.claw/sessions.db`），按 canonical workspace 缓存。
+    session_indexes: Arc<Mutex<HashMap<PathBuf, Arc<runtime::SessionIndex>>>>,
+    /// Phase 5：流式快照缓存，按会话文件缓存已解析内容与增量偏移。
+    session_views: Arc<Mutex<HashMap<PathBuf, CachedSessionView>>>,
+}
+
+/// 一次完整解析的会话视图缓存。
+///
+/// `parsed_bytes` 是已消费到的文件偏移；只有文件变长且头部/边界指纹一致时
+/// 才走增量解析，否则整份重读。
+struct CachedSessionView {
+    session: runtime::Session,
+    parsed_bytes: u64,
+    size: u64,
+    mtime_ms: u64,
+    head_hash: u64,
+    boundary_hash: u64,
+    payload: String,
+    last_used: Instant,
 }
 
 #[derive(Clone)]
@@ -1266,6 +1286,8 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             plugin_market,
             plugin_install_locks: Arc::new(Mutex::new(BTreeSet::new())),
             crons_lock: Arc::new(Mutex::new(())),
+            session_indexes: Arc::new(Mutex::new(HashMap::new())),
+            session_views: Arc::new(Mutex::new(HashMap::new())),
         };
         spawn_session_watchdog(state.clone());
         let app = Router::new()
@@ -1538,7 +1560,7 @@ async fn api_sessions(
                 continue;
             };
             if let Ok(Value::Object(map)) =
-                list_sessions(store.sessions_dir(), &root, 0, per_workspace)
+                list_sessions_cached(&state, store.sessions_dir(), &root, 0, per_workspace)
             {
                 total += map.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
                 if let Some(items) = map.get("sessions").and_then(Value::as_array) {
@@ -1565,7 +1587,7 @@ async fn api_sessions(
     let Ok(store) = runtime::SessionStore::from_cwd(&workspace) else {
         return (StatusCode::BAD_REQUEST, "无法读取该工作区的会话目录").into_response();
     };
-    match list_sessions(store.sessions_dir(), &workspace, offset, limit) {
+    match list_sessions_cached(&state, store.sessions_dir(), &workspace, offset, limit) {
         Ok(mut value) => {
             if let Some(items) = value.get_mut("sessions").and_then(Value::as_array_mut) {
                 decorate(items);
@@ -1669,6 +1691,10 @@ fn remove_session(state: &AppState, id: &str) -> Result<(), (StatusCode, String)
     state.events.forget(id);
     remove_session_title(&workspace, id);
     let _ = std::fs::remove_file(web_todos_path(&workspace, id));
+    // Phase 5：同步清理读取索引，避免列表里残留已删除的会话。
+    if let Some((index, _canonical)) = session_index_for(state, &workspace) {
+        let _ = index.remove_session(id);
+    }
     Ok(())
 }
 
@@ -1794,7 +1820,7 @@ async fn api_session_compact(
     if !authorize(&state, &auth) {
         return unauthorized();
     }
-    let (path, _workspace) = match resolve_session(&state, &id) {
+    let (path, workspace) = match resolve_session(&state, &id) {
         Ok(found) => found,
         Err((code, message)) => return (code, message).into_response(),
     };
@@ -1855,6 +1881,14 @@ async fn api_session_compact(
     }
     // 热 worker 的 LiveCli 里还是压缩前的会话：提升代际，下一轮按文件重建。
     state.scheduler.bump_epoch(&id);
+    // 压缩是整份重写：重建该会话的索引（消息条数/字节区间都变了）。
+    if let Some((index, canonical)) = session_index_for(&state, &workspace) {
+        let _ = runtime::session_index::index_session_file(
+            &index,
+            &path,
+            &canonical.display().to_string(),
+        );
+    }
     state.events.emit(&id, json!({ "kind": "reset" }));
     Json(json!({
         "session": id,
@@ -1903,10 +1937,19 @@ async fn api_block(State(state): State<AppState>, Query(query): Query<BlockQuery
         )
             .into_response();
     };
-    let path = match resolve_session(&state, session_id) {
-        Ok((path, _workspace)) => path,
+    let (path, workspace) = match resolve_session(&state, session_id) {
+        Ok((path, workspace)) => (path, workspace),
         Err((code, message)) => return (code, message).into_response(),
     };
+    // Phase 5：优先按索引里的字节区间只读这一条消息，避免为查看全文
+    // 重新解析整个会话。
+    if let Some((index, _canonical)) = session_index_for(&state, &workspace) {
+        if let Ok(Some((start, end))) = index.message_span(session_id, message_index) {
+            if let Some(value) = read_block_from_span(&path, start, end, block_index) {
+                return Json(value).into_response();
+            }
+        }
+    }
     let session = match runtime::Session::load_from_path(&path) {
         Ok(session) => session,
         Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
@@ -1940,6 +1983,41 @@ async fn api_block(State(state): State<AppState>, Query(query): Query<BlockQuery
     Json(value).into_response()
 }
 
+/// 按字节区间读取一条消息并取出指定 block；格式不符时由调用方回退整份加载。
+fn read_block_from_span(
+    path: &Path,
+    byte_start: u64,
+    byte_end: u64,
+    block_index: usize,
+) -> Option<Value> {
+    if byte_end <= byte_start {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(byte_start)).ok()?;
+    let mut buffer = vec![0u8; usize::try_from(byte_end - byte_start).ok()?];
+    file.read_exact(&mut buffer).ok()?;
+    let value: Value = serde_json::from_slice(&buffer).ok()?;
+    let block = value
+        .get("message")?
+        .get("blocks")?
+        .as_array()?
+        .get(block_index)?;
+    let text = |key: &str| block.get(key).and_then(Value::as_str).unwrap_or_default();
+    Some(match block.get("type")?.as_str()? {
+        "text" => json!({ "kind": "text", "text": text("text") }),
+        "thinking" => json!({ "kind": "thinking", "text": text("thinking") }),
+        "tool_use" => json!({ "kind": "tool_use", "name": text("name"), "input": text("input") }),
+        "tool_result" => json!({
+            "kind": "tool_result",
+            "name": text("tool_name"),
+            "output": text("output"),
+            "is_error": block.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+        }),
+        _ => return None,
+    })
+}
+
 async fn api_stream(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
@@ -1956,22 +2034,39 @@ async fn api_stream(
         return (StatusCode::NOT_FOUND, "会话不存在").into_response();
     }
 
-    let stream = futures_util::stream::unfold((path, String::new()), |(path, last)| async move {
-        tokio::time::sleep(STREAM_INTERVAL).await;
-        let payload = session_view(&path)
-            .map(|value| serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string()))
-            .unwrap_or_else(|error| json!({ "error": error }).to_string());
-        if payload == last {
-            return Some((
-                Ok::<Event, Infallible>(Event::default().event("keepalive").data("")),
-                (path, last),
-            ));
-        }
-        Some((
-            Ok::<Event, Infallible>(Event::default().event("snapshot").data(payload.clone())),
-            (path, payload),
-        ))
-    });
+    let stream = futures_util::stream::unfold(
+        (state.clone(), path, None::<String>),
+        |(state, path, last_error)| async move {
+            tokio::time::sleep(STREAM_INTERVAL).await;
+            match session_view_cached(&state, &path) {
+                Ok((payload, changed)) => {
+                    let event = if changed {
+                        Event::default().event("snapshot").data(payload)
+                    } else {
+                        Event::default().event("keepalive").data("")
+                    };
+                    Some((Ok::<Event, Infallible>(event), (state, path, None)))
+                }
+                Err(error) => {
+                    // 同一个错误只推一次；后续轮询保持 keepalive，避免刷屏。
+                    if last_error.as_deref() == Some(error.as_str()) {
+                        Some((
+                            Ok::<Event, Infallible>(Event::default().event("keepalive").data("")),
+                            (state, path, last_error),
+                        ))
+                    } else {
+                        let payload = json!({ "error": error }).to_string();
+                        Some((
+                            Ok::<Event, Infallible>(
+                                Event::default().event("snapshot").data(payload),
+                            ),
+                            (state, path, Some(error)),
+                        ))
+                    }
+                }
+            }
+        },
+    );
 
     Sse::new(stream).into_response()
 }
@@ -5762,6 +5857,136 @@ fn unauthorized() -> Response {
     (StatusCode::UNAUTHORIZED, "缺少或无效的访问令牌").into_response()
 }
 
+fn file_mtime_ms(metadata: &std::fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// Phase 5：取工作区的会话读取索引；首次访问时按目录内容补齐/清理。
+///
+/// 索引打不开（磁盘/权限）时返回 None，调用方回退到原来的逐文件扫描，
+/// 保证功能不因缓存失效而不可用。
+fn session_index_for(
+    state: &AppState,
+    workspace: &Path,
+) -> Option<(Arc<runtime::SessionIndex>, PathBuf)> {
+    let store = runtime::SessionStore::from_cwd(workspace).ok()?;
+    let canonical = store.workspace_root().to_path_buf();
+    let db_path = canonical.join(".claw").join("sessions.db");
+    let mut indexes = state
+        .session_indexes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(index) = indexes.get(&db_path) {
+        return Some((Arc::clone(index), canonical));
+    }
+    let index = Arc::new(runtime::SessionIndex::open(&db_path).ok()?);
+    sync_session_index(&index, &canonical, store.sessions_dir());
+    indexes.insert(db_path, Arc::clone(&index));
+    Some((index, canonical))
+}
+
+/// 首次访问时对账：新增/变化的文件懒建索引，已删除的文件清掉记录。
+fn sync_session_index(index: &runtime::SessionIndex, workspace: &Path, dir: &Path) {
+    let workspace_label = workspace.display().to_string();
+    let known: HashMap<String, (String, i64, i64)> = index
+        .known_files()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, path, size, mtime)| (id, (path, size, mtime)))
+        .collect();
+    let mut seen = BTreeSet::new();
+    for path in session_files(dir) {
+        if is_rotated_session_file(&path) {
+            continue;
+        }
+        let Some(id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+        let mtime = file_mtime_ms(&metadata);
+        let path_text = path.display().to_string();
+        seen.insert(id.clone());
+        if let Some((known_path, known_size, known_mtime)) = known.get(&id) {
+            if *known_size == size && *known_mtime == mtime && *known_path == path_text {
+                continue;
+            }
+        }
+        if !is_session_file(&path) {
+            continue;
+        }
+        let _ = runtime::session_index::index_session_file(index, &path, &workspace_label);
+    }
+    for id in known.keys() {
+        if !seen.contains(id) {
+            let _ = index.remove_session(id);
+        }
+    }
+}
+
+/// 用索引查询会话列表；索引不可用时返回 None，由调用方回退扫描。
+fn list_sessions_indexed(
+    state: &AppState,
+    workspace: &Path,
+    offset: usize,
+    limit: usize,
+) -> Option<Value> {
+    let (index, canonical) = session_index_for(state, workspace)?;
+    let (entries, total) = index
+        .list_sessions(&canonical.display().to_string(), offset, limit)
+        .ok()?;
+    let titles = load_session_titles(workspace);
+    let workspace_label = workspace.display().to_string();
+    let sessions: Vec<Value> = entries
+        .into_iter()
+        .map(|entry| {
+            let title = titles
+                .get(&entry.id)
+                .cloned()
+                .or(entry.title)
+                .unwrap_or_else(|| entry.id.clone());
+            json!({
+                "id": entry.id,
+                "modified": u64::try_from(entry.jsonl_mtime_ms / 1000).unwrap_or(0),
+                "size": entry.jsonl_size,
+                "title": title,
+                "workspace": workspace_label,
+            })
+        })
+        .collect();
+    Some(json!({
+        "sessions": sessions,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    }))
+}
+
+fn list_sessions_cached(
+    state: &AppState,
+    dir: &Path,
+    workspace: &Path,
+    offset: usize,
+    limit: usize,
+) -> Result<Value, String> {
+    if let Some(value) = list_sessions_indexed(state, workspace, offset, limit) {
+        return Ok(value);
+    }
+    list_sessions(dir, workspace, offset, limit)
+}
+
 fn list_sessions(
     dir: &Path,
     workspace: &Path,
@@ -6030,6 +6255,11 @@ fn session_title(path: &Path) -> String {
 
 fn session_view(path: &Path) -> Result<Value, String> {
     let session = runtime::Session::load_from_path(path).map_err(|error| error.to_string())?;
+    session_view_from(&session, path)
+}
+
+/// 由已解析的会话构建前端快照；流式缓存与首次加载共用这一份逻辑。
+fn session_view_from(session: &runtime::Session, path: &Path) -> Result<Value, String> {
     let session_id = session.session_id.clone();
     let messages: Vec<Value> = session
         .messages
@@ -6142,7 +6372,7 @@ fn session_view(path: &Path) -> Result<Value, String> {
     });
     let context_window =
         api::model_token_limit(&model_hint).map_or(0, |limit| limit.context_window_tokens);
-    let estimated_tokens = runtime::estimate_session_tokens(&session);
+    let estimated_tokens = runtime::estimate_session_tokens(session);
 
     Ok(json!({
         "id": session.session_id,
@@ -6167,6 +6397,110 @@ fn session_view(path: &Path) -> Result<Value, String> {
             "context_window": context_window,
         },
     }))
+}
+
+/// 中间截断：保留头尾，避免长工具输出把 SSE 帧撑爆。
+const SESSION_VIEW_CACHE_MAX: usize = 8;
+const SESSION_VIEW_HEAD_BYTES: u64 = 4096;
+const SESSION_VIEW_BOUNDARY_BYTES: u64 = 128;
+
+/// 取会话快照：文件未变时直接用缓存（只 stat，不解析），变长且
+/// 头部/边界指纹一致时从上次偏移继续解析，否则整份重读。
+fn session_view_cached(state: &AppState, path: &Path) -> Result<(String, bool), String> {
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    let size = metadata.len();
+    let mtime_ms = u64::try_from(file_mtime_ms(&metadata)).unwrap_or(0);
+    let mut cache = state
+        .session_views
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = cache.get_mut(path) {
+        if entry.size == size && entry.mtime_ms == mtime_ms {
+            entry.last_used = Instant::now();
+            return Ok((entry.payload.clone(), false));
+        }
+        if size > entry.parsed_bytes {
+            let head = hash_prefix(path, SESSION_VIEW_HEAD_BYTES).unwrap_or(0);
+            let boundary =
+                hash_range(path, entry.parsed_bytes, SESSION_VIEW_BOUNDARY_BYTES).unwrap_or(0);
+            if head == entry.head_hash && boundary == entry.boundary_hash {
+                if let Ok(consumed) = entry
+                    .session
+                    .append_jsonl_tail_from(path, entry.parsed_bytes)
+                {
+                    entry.parsed_bytes = consumed.min(size);
+                    entry.size = size;
+                    entry.mtime_ms = mtime_ms;
+                    entry.boundary_hash =
+                        hash_range(path, entry.parsed_bytes, SESSION_VIEW_BOUNDARY_BYTES)
+                            .unwrap_or(0);
+                    let view = session_view_from(&entry.session, path)?;
+                    entry.payload =
+                        serde_json::to_string(&view).map_err(|error| error.to_string())?;
+                    entry.last_used = Instant::now();
+                    return Ok((entry.payload.clone(), true));
+                }
+            }
+        }
+    }
+    // 头部变化（turn 结束后整份重写）或增量解析失败：完整重读一次。
+    let session = runtime::Session::load_from_path(path).map_err(|error| error.to_string())?;
+    let view = session_view_from(&session, path)?;
+    let payload = serde_json::to_string(&view).map_err(|error| error.to_string())?;
+    let entry = CachedSessionView {
+        session,
+        parsed_bytes: size,
+        size,
+        mtime_ms,
+        head_hash: hash_prefix(path, SESSION_VIEW_HEAD_BYTES).unwrap_or(0),
+        boundary_hash: hash_range(path, size, SESSION_VIEW_BOUNDARY_BYTES).unwrap_or(0),
+        payload: payload.clone(),
+        last_used: Instant::now(),
+    };
+    if cache.len() >= SESSION_VIEW_CACHE_MAX {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, value)| value.last_used)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(path.to_path_buf(), entry);
+    Ok((payload, true))
+}
+
+fn hash_prefix(path: &Path, limit: u64) -> Option<u64> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let size = file.metadata().ok()?.len();
+    let take = limit.min(size);
+    if take == 0 {
+        return Some(0);
+    }
+    let mut buffer = vec![0u8; usize::try_from(take).ok()?];
+    file.read_exact(&mut buffer).ok()?;
+    Some(hash_bytes(&buffer))
+}
+
+/// 读取 `[end - limit, end)` 的指纹：用于确认上次解析边界附近没有变化。
+fn hash_range(path: &Path, end: u64, limit: u64) -> Option<u64> {
+    let start = end.saturating_sub(limit);
+    let take = end - start;
+    if take == 0 {
+        return Some(0);
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buffer = vec![0u8; usize::try_from(take).ok()?];
+    file.read_exact(&mut buffer).ok()?;
+    Some(hash_bytes(&buffer))
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// 中间截断：保留头尾，避免长工具输出把 SSE 帧撑爆。

@@ -85,6 +85,7 @@ mod policy_engine;
 pub mod poor_mode;
 mod prompt;
 pub mod session_bus;
+pub mod session_index;
 pub mod subworkspace;
 pub mod tool_result_archive;
 // Harness L(生命周期)层接入:在 run_turn 失败分支提供"最多 1 次自动恢复后升级"机制。
@@ -373,6 +374,7 @@ pub use session_bus::{
     global as global_session_bus, now_ms as bus_now_ms, BusMessage, BusMessageKind, BusPeer,
     PeerKind, PeerStatus, SessionBus, BUS_MAX_HOP,
 };
+pub use session_index::{MessageSpan, SessionIndex, SessionIndexEntry, SessionIndexError};
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{
     check_base_commit, format_stale_base_warning, read_claw_base_file, resolve_expected_base,

@@ -708,7 +708,9 @@ mod tests {
         assert!(!registry.get(&entry.cron_id).expect("entry").enabled);
 
         // when
-        registry.enable(&entry.cron_id).expect("enable should succeed");
+        registry
+            .enable(&entry.cron_id)
+            .expect("enable should succeed");
 
         // then
         assert!(registry.get(&entry.cron_id).expect("entry").enabled);

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::history_search::HistoryIndex;
 use crate::json::{JsonError, JsonValue};
+use crate::session_index::{MessageSpan, SessionIndex, SessionIndexEntry};
 use crate::usage::TokenUsage;
 use serde::{Deserialize, Serialize};
 
@@ -262,6 +263,9 @@ pub struct Session {
     /// callers can recall past turns via full-text search. The `Arc` allows
     /// the index to be shared between the session and external readers.
     pub history_index: Option<Arc<HistoryIndex>>,
+    /// Phase 5：会话列表/字节区间索引。与 `history_index` 一样是可选的旁路缓存，
+    /// 写入失败不影响 JSONL 持久化，删除 DB 后可重建。
+    pub session_index: Option<Arc<SessionIndex>>,
 }
 
 impl PartialEq for Session {
@@ -334,6 +338,7 @@ impl Session {
             model: None,
             persistence: None,
             history_index: None,
+            session_index: None,
         }
     }
 
@@ -434,6 +439,14 @@ impl Session {
         self
     }
 
+    /// 挂上会话读取索引（Phase 5）：后续 `push_message` / `save_to_path`
+    /// 会同步维护列表元数据与消息字节区间。失败只丢索引，不影响会话本身。
+    #[must_use]
+    pub fn with_session_index(mut self, index: Arc<SessionIndex>) -> Self {
+        self.session_index = Some(index);
+        self
+    }
+
     /// 添加一个额外的工作区根目录（来自 `--add-dir` CLI flag）。
     /// 重复的根会被 `WorkspacePathScope::from_roots` 去重，这里无需手动检查。
     #[must_use]
@@ -473,11 +486,81 @@ impl Session {
 
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), SessionError> {
         let path = path.as_ref();
-        let snapshot = self.render_jsonl_snapshot()?;
+        let (lines, first_message_line) = self.jsonl_snapshot_lines()?;
+        let mut snapshot = lines.join("\n");
+        snapshot.push('\n');
         rotate_session_file_if_needed(path)?;
         write_atomic(path, &snapshot)?;
         cleanup_rotated_logs(path)?;
+        self.sync_index_snapshot(path, &lines, first_message_line);
         Ok(())
+    }
+
+    /// 整份重写后重建索引：文件是原子替换，旧字节区间全部失效。
+    fn sync_index_snapshot(&self, path: &Path, lines: &[String], first_message_line: usize) {
+        let Some(session_index) = &self.session_index else {
+            return;
+        };
+        let Ok(metadata) = fs::metadata(path) else {
+            return;
+        };
+        let entry = self.index_entry(path, metadata.len(), file_mtime_ms(&metadata));
+        let mut spans = Vec::with_capacity(self.messages.len());
+        let mut offset = 0u64;
+        for (line_index, line) in lines.iter().enumerate() {
+            let line_len = u64::try_from(line.len()).unwrap_or(u64::MAX) + 1;
+            if line_index >= first_message_line {
+                if let Some(message) = self.messages.get(line_index - first_message_line) {
+                    spans.push(MessageSpan {
+                        idx: spans.len(),
+                        byte_start: offset,
+                        byte_end: offset + line_len,
+                        role: role_label(message.role).to_string(),
+                        timestamp_ms: i64::try_from(message.created_at_ms).unwrap_or(0),
+                    });
+                }
+            }
+            offset += line_len;
+        }
+        let _ = session_index.replace_messages(&entry, &spans);
+    }
+
+    fn index_entry(&self, path: &Path, size: u64, mtime_ms: i64) -> SessionIndexEntry {
+        let workspace = crate::session_index::workspace_label_for_session_path(path)
+            .or_else(|| {
+                self.workspace_root
+                    .as_ref()
+                    .map(|root| root.display().to_string())
+            })
+            .unwrap_or_default();
+        SessionIndexEntry {
+            id: self.session_id.clone(),
+            workspace,
+            path: path.display().to_string(),
+            title: self.index_title(),
+            created_at_ms: i64::try_from(self.created_at_ms).unwrap_or(0),
+            updated_at_ms: i64::try_from(self.updated_at_ms).unwrap_or(0),
+            message_count: i64::try_from(self.messages.len()).unwrap_or(i64::MAX),
+            jsonl_size: i64::try_from(size).unwrap_or(i64::MAX),
+            jsonl_mtime_ms: mtime_ms,
+        }
+    }
+
+    /// 列表标题的兜底：首条用户文本的前 80 个字符（侧栏重命名优先于它）。
+    fn index_title(&self) -> Option<String> {
+        self.messages
+            .iter()
+            .find(|message| message.role == MessageRole::User)?
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::Text { text } => {
+                    let title: String =
+                        text.lines().next().unwrap_or("").chars().take(80).collect();
+                    (!title.is_empty()).then_some(title)
+                }
+                _ => None,
+            })
     }
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, SessionError> {
@@ -494,6 +577,63 @@ impl Session {
             Err(_) | Ok(_) => Self::from_jsonl(&contents)?,
         };
         Ok(session.with_persistence_path(path.to_path_buf()))
+    }
+
+    /// Phase 5：从 JSONL 的 `offset` 继续解析，把新增消息追加到当前会话。
+    ///
+    /// 只消费以换行结尾的完整行（半行留给下一次轮询），返回新的已消费偏移。
+    /// 解析失败时调用方应退回整份 `load_from_path`，避免视图与磁盘不一致。
+    pub fn append_jsonl_tail_from(
+        &mut self,
+        path: impl AsRef<Path>,
+        offset: u64,
+    ) -> Result<u64, SessionError> {
+        let path = path.as_ref();
+        let mut file = fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        if offset > size {
+            return Err(SessionError::Format(
+                "append offset is beyond the session file".to_string(),
+            ));
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut reader = BufReader::new(file);
+        let mut consumed = offset;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line)?;
+            if read == 0 {
+                break;
+            }
+            if !line.ends_with('\n') {
+                break;
+            }
+            consumed += u64::try_from(read).unwrap_or(u64::MAX);
+            let text = line.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let value = JsonValue::parse(text).map_err(|error| {
+                SessionError::Format(format!("invalid jsonl tail record: {error}"))
+            })?;
+            let record_type = value
+                .as_object()
+                .and_then(|object| object.get("type"))
+                .and_then(JsonValue::as_str);
+            if record_type == Some("message") {
+                let message = value
+                    .as_object()
+                    .and_then(|object| object.get("message"))
+                    .ok_or_else(|| {
+                        SessionError::Format(
+                            "message record is missing the message field".to_string(),
+                        )
+                    })?;
+                self.messages.push(ConversationMessage::from_json(message)?);
+            }
+        }
+        Ok(consumed)
     }
 
     pub fn push_message(&mut self, message: ConversationMessage) -> Result<(), SessionError> {
@@ -576,6 +716,7 @@ impl Session {
             model: self.model.clone(),
             persistence: None,
             history_index: None,
+            session_index: None,
         }
     }
 
@@ -726,6 +867,7 @@ impl Session {
             model,
             persistence: None,
             history_index: None,
+            session_index: None,
         })
     }
 
@@ -839,6 +981,7 @@ impl Session {
             model,
             persistence: None,
             history_index: None,
+            session_index: None,
         })
     }
 
@@ -857,7 +1000,11 @@ impl Session {
         self.append_persisted_prompt_entry(entry_ref)
     }
 
-    fn render_jsonl_snapshot(&self) -> Result<String, SessionError> {
+    /// JSONL 的完整行序列，以及第一条 message 在 `lines` 中的下标。
+    ///
+    /// 下标用于把每条消息映射回文件字节区间（Phase 5 索引），其余记录
+    /// （meta/compaction/prompt_history）不进入 messages 表。
+    fn jsonl_snapshot_lines(&self) -> Result<(Vec<String>, usize), SessionError> {
         let mut lines = vec![self.meta_record()?.render()];
         if let Some(compaction) = &self.compaction {
             lines.push(compaction.to_jsonl_record()?.render());
@@ -867,14 +1014,13 @@ impl Session {
                 .iter()
                 .map(|entry| entry.to_jsonl_record().render()),
         );
+        let first_message_line = lines.len();
         lines.extend(
             self.messages
                 .iter()
                 .map(|message| message_record(message).render()),
         );
-        let mut rendered = lines.join("\n");
-        rendered.push('\n');
-        Ok(rendered)
+        Ok((lines, first_message_line))
     }
 
     fn append_persisted_message(&self, message: &ConversationMessage) -> Result<(), SessionError> {
@@ -888,8 +1034,28 @@ impl Session {
             return Ok(());
         }
 
+        let record = message_record(message).render();
+        let byte_start = fs::metadata(path)?.len();
         let mut file = OpenOptions::new().append(true).open(path)?;
-        writeln!(file, "{}", message_record(message).render())?;
+        writeln!(file, "{record}")?;
+
+        // Phase 5：把消息的文件字节区间写进 sessions.db；失败只丢索引，
+        // 不影响已经成功的 JSONL 追加。
+        if let Some(session_index) = &self.session_index {
+            let (size, mtime_ms) = file.metadata().map_or(
+                (byte_start + u64::try_from(record.len()).unwrap_or(0) + 1, 0),
+                |metadata| (metadata.len(), file_mtime_ms(&metadata)),
+            );
+            let entry = self.index_entry(path, size, mtime_ms);
+            let span = MessageSpan {
+                idx: self.messages.len().saturating_sub(1),
+                byte_start,
+                byte_end: size,
+                role: role_label(message.role).to_string(),
+                timestamp_ms: i64::try_from(message.created_at_ms).unwrap_or(0),
+            };
+            let _ = session_index.append_message(&entry, &span);
+        }
 
         // FTS5 history index hook: mirror the message into the full-text
         // index so it can be recalled later via `HistoryIndex::search`.
@@ -898,12 +1064,7 @@ impl Session {
         // succeeded).
         if let Some(history_index) = &self.history_index {
             let content = extract_indexable_text(message);
-            let role = match message.role {
-                MessageRole::System => "system",
-                MessageRole::User => "user",
-                MessageRole::Assistant => "assistant",
-                MessageRole::Tool => "tool",
-            };
+            let role = role_label(message.role);
             let message_index = self.messages.len().saturating_sub(1);
             let timestamp_ms = self.updated_at_ms;
             let _ = history_index.index_message(
@@ -1082,7 +1243,7 @@ impl ConversationMessage {
         JsonValue::Object(object)
     }
 
-    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+    pub fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
         let object = value
             .as_object()
             .ok_or_else(|| SessionError::Format("message must be an object".to_string()))?;
@@ -1664,6 +1825,25 @@ fn generate_session_id() -> String {
     format!("session-{millis}-{counter}")
 }
 
+fn role_label(role: MessageRole) -> &'static str {
+    match role {
+        MessageRole::System => "system",
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::Tool => "tool",
+    }
+}
+
+fn file_mtime_ms(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
 fn write_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1903,6 +2083,77 @@ mod tests {
                 signature: Some("sig-123".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn append_jsonl_tail_from_reads_only_new_complete_lines() {
+        use std::io::Write;
+
+        // given: 一份已落盘的会话，记下当前文件末尾偏移
+        let mut session = Session::new();
+        session.push_user_text("first").expect("append");
+        let path = temp_session_path("tail-jsonl");
+        session.save_to_path(&path).expect("save");
+        let mut loaded = Session::load_from_path(&path).expect("load");
+        let offset = fs::metadata(&path).expect("metadata").len();
+
+        // when: 追加一条完整消息 + 一条半行
+        let complete = "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"blocks\":[{\"type\":\"text\",\"text\":\"tail\"}],\"ts\":123}}";
+        let partial = "{\"type\":\"message\",\"message\":{\"role\":\"user\"";
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open for append");
+        writeln!(file, "{complete}").expect("write complete line");
+        write!(file, "{partial}").expect("write partial line");
+        file.flush().expect("flush");
+        drop(file);
+
+        let consumed = loaded
+            .append_jsonl_tail_from(&path, offset)
+            .expect("tail parse");
+
+        // then: 只消费完整行，半行留到下一次轮询
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.messages[1].role, MessageRole::Assistant);
+        assert_eq!(
+            loaded.messages[1].blocks[0],
+            ContentBlock::Text {
+                text: "tail".to_string()
+            }
+        );
+        assert_eq!(consumed, offset + complete.len() as u64 + 1);
+
+        // when: 补齐半行为合法记录
+        let rest = ",\"blocks\":[{\"type\":\"text\",\"text\":\"later\"}],\"ts\":124}}\n";
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open for append");
+        write!(file, "{rest}").expect("write rest");
+        file.flush().expect("flush");
+        drop(file);
+        let consumed = loaded
+            .append_jsonl_tail_from(&path, consumed)
+            .expect("tail parse again");
+
+        // then: 第三条消息可读，偏移推进到文件末尾
+        assert_eq!(loaded.messages.len(), 3);
+        assert_eq!(loaded.messages[2].role, MessageRole::User);
+        assert_eq!(consumed, fs::metadata(&path).expect("metadata").len());
+        fs::remove_file(&path).expect("temp file should be removable");
+    }
+
+    #[test]
+    fn append_jsonl_tail_from_rejects_offset_beyond_file() {
+        let mut session = Session::new();
+        let path = temp_session_path("tail-bad-offset");
+        session.save_to_path(&path).expect("save");
+
+        let result = session.append_jsonl_tail_from(&path, u64::MAX);
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert!(result.is_err());
     }
 
     #[test]

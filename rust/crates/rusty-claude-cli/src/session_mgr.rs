@@ -133,14 +133,19 @@ pub(crate) fn new_cli_session_with_roots_in(
     additional_roots: Vec<PathBuf>,
 ) -> Result<Session, Box<dyn std::error::Error>> {
     let cwd = workspace.to_path_buf();
-    let mut session = Session::new()
+    let session = Session::new()
         .with_workspace_root(cwd.clone())
         .with_additional_workspace_roots(additional_roots);
-    // Attach a SQLite FTS5 history index so the `session_search` tool can
-    // recall past messages. Best-effort: if the DB cannot be opened (e.g.
-    // permission denied), the session still works — only search is disabled.
-    let db_path = cwd.join(".claw").join("history.db");
-    if let Ok(mut index) = HistoryIndex::open(&db_path) {
+    Ok(attach_session_indexes(&cwd, session))
+}
+
+/// 给会话挂上旁路索引：FTS5 历史检索 + Phase 5 会话读取索引。
+///
+/// 两类索引都是 best-effort：打不开（权限/磁盘）时只禁用对应能力，
+/// 会话本身仍可正常读写。
+pub(crate) fn attach_session_indexes(workspace: &Path, mut session: Session) -> Session {
+    let history_db = workspace.join(".claw").join("history.db");
+    if let Ok(mut index) = HistoryIndex::open(&history_db) {
         // v4:注入进程级共享 embedding provider(BGE-small 单例)启用稠密检索;
         // 未编译 embedding feature 时返回 None,索引保持纯 FTS5 行为。
         if let Some(provider) = runtime::build_embedding_provider() {
@@ -148,7 +153,11 @@ pub(crate) fn new_cli_session_with_roots_in(
         }
         session = session.with_history_index(std::sync::Arc::new(index));
     }
-    Ok(session)
+    let session_db = workspace.join(".claw").join("sessions.db");
+    if let Ok(index) = runtime::SessionIndex::open(&session_db) {
+        session = session.with_session_index(std::sync::Arc::new(index));
+    }
+    session
 }
 
 pub(crate) fn create_managed_session_handle_in(
@@ -171,12 +180,15 @@ pub(crate) fn load_session_reference_in(
     let loaded = session_store_for(workspace)?
         .load_session(reference)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    // Phase 5：Web 恢复会话与新建会话一致，挂上 history.db 与 sessions.db，
+    // 否则恢复后的 `session_search` 与列表索引都不会更新。
+    let session = attach_session_indexes(workspace, loaded.session);
     Ok((
         SessionHandle {
             id: loaded.handle.id,
             path: loaded.handle.path,
         },
-        loaded.session,
+        session,
     ))
 }
 
