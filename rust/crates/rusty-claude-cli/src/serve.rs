@@ -2013,7 +2013,6 @@ impl SessionWorker {
                 None,
                 job.permission,
                 Vec::new(),
-                crate::render::OutputVerbosity::default(),
                 &job.workspace,
             )
             .map_err(|error| error.to_string())?;

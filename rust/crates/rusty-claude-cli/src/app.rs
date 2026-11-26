@@ -1,5 +1,8 @@
-//! LiveCli REPL core: REPL loop, runtime construction, broad-cwd policy,
-//! stale-base preflight, system prompt assembly, hook/permission prompters.
+//! LiveCli 执行内核：turn 执行、运行时构建、系统提示装配。
+//!
+//! Phase 3 起 CLI 界面层（REPL、斜杠命令、终端渲染）已删除，
+//! 本模块只保留 `claw serve` 依赖的执行内核：构造会话与运行时、
+//! 装配系统提示、执行单轮 turn，以及 Web SSE 需要的状态/取消接口。
 
 #![allow(
     dead_code,
@@ -13,3120 +16,28 @@
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::env;
-use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
-use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use crate::commands_handler::*;
-use crate::doctor::*;
-use crate::format::*;
-use crate::init::initialize_repo;
-use crate::input;
-use crate::paste::{
-    expand_paste_placeholders, fold_pasted_input, format_pasted_text_ref, paste_cache_path,
-    paste_cache_root, pasted_text_ref_num_lines, read_clipboard_text, should_fold_paste,
-    store_paste_and_make_placeholder, try_auto_expand_clipboard, PASTE_FOLD_CHAR_THRESHOLD,
-    PASTE_FOLD_LINE_THRESHOLD,
-};
-use crate::plugin_state::{
-    build_plugin_manager, build_runtime_mcp_state, build_runtime_plugin_state,
-    build_runtime_plugin_state_for, build_runtime_plugin_state_with_loader, mcp_annotation_flag,
-    mcp_runtime_tool_definition, mcp_wrapper_tool_definitions, permission_mode_for_mcp_tool,
-    plugins_command_payload_for, plugins_command_payload_from_result, resolve_plugin_path,
-    runtime_hook_config_from_plugin_hooks, RuntimeMcpState, RuntimePluginState,
-    RuntimePluginStateBuildOutput,
-};
-use crate::render::{MarkdownStreamState, OutputVerbosity, Spinner, TerminalRenderer};
-use crate::session_mgr::{
-    civil_from_days, clear_upgrade_request, collect_session_prompt_history,
-    confirm_session_deletion, create_managed_session_handle, create_managed_session_handle_in,
-    current_session_store, default_export_filename, delete_managed_session,
-    format_history_timestamp, format_session_modified_age, interactive_session_pick,
-    latest_managed_session, list_managed_sessions, load_session_reference,
-    load_session_reference_in, looks_like_slash_command_token, new_cli_session, new_cli_session_in,
-    new_cli_session_with_roots, new_cli_session_with_roots_in, parse_history_count,
-    read_upgrade_request, recent_user_context, render_prompt_history_report, render_session_list,
-    render_session_markdown, resolve_export_path, resolve_managed_session_path,
-    resolve_session_reference, resume_command_can_absorb_token, resume_session, run_export,
-    run_resume_command, run_resumed_session_command, session_clear_backup_path,
-    session_details_json, session_exists_json, session_reference_exists, sessions_dir,
-    summarize_tool_payload_for_markdown, write_session_clear_backup, write_upgrade_exited,
-    write_upgrade_request, ManagedSessionSummary, PromptHistoryEntry, ResumeCommandOutcome,
-    SessionHandle, SessionLifecycleKind, SessionLifecycleSummary, UpgradeRequest,
-    DEFAULT_HISTORY_LIMIT, LATEST_SESSION_REFERENCE, LEGACY_SESSION_EXTENSION,
-    PRIMARY_SESSION_EXTENSION, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT, SESSION_REFERENCE_ALIASES,
-};
-use crate::streaming::{
-    build_system_blocks, collect_prompt_cache_events, collect_tool_results, collect_tool_uses,
-    compact_tool_output_for_model, convert_messages, extract_system_messages, final_assistant_text,
-    format_context_window_blocked_error, format_user_visible_api_error,
-    mark_last_tool_with_cache_control, permission_policy, push_output_block,
-    render_thinking_block_summary, request_ends_with_tool_result, response_to_events,
-    AnthropicRuntimeClient, HookAbortMonitor, NETWORK_ERROR_KEYWORDS, POST_TOOL_STALL_TIMEOUT,
-};
-use crate::suggestion::{
-    common_prefix_len, levenshtein_distance, looks_like_subcommand_typo, ranked_suggestions,
-    render_suggestion_line, suggest_closest_term, suggest_similar_subcommand,
-    suggest_slash_commands, CLI_OPTION_SUGGESTIONS,
-};
-use crate::tool_display::{
-    clear_rustyline_echo, estimate_display_width, extract_tool_path, first_visible_line,
-    format_bash_call, format_bash_result, format_edit_result, format_generic_tool_result,
-    format_glob_result, format_grep_result, format_patch_preview, format_read_result,
-    format_search_start, format_structured_patch_preview, format_tool_call_start,
-    format_tool_result, format_tool_result_card_close, format_tool_result_compact,
-    format_user_message_card, format_write_result, indent_with_card_prefix, is_wide_char,
-    print_user_card, short_tool_id, summarize_tool_payload, truncate_for_summary,
-    truncate_output_for_display, CliToolExecutor, ListMcpResourcesRequest, McpToolRequest,
-    ReadMcpResourceRequest, ToolSearchRequest, DISPLAY_TRUNCATION_NOTICE, READ_DISPLAY_MAX_CHARS,
-    READ_DISPLAY_MAX_LINES, TOOL_CARD_PREFIX, TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-    TOOL_OUTPUT_DISPLAY_MAX_LINES, USER_CARD_PREFIX,
-};
-use crate::ultraplan::{
-    describe_tool_progress, format_internal_prompt_progress_line, InternalPromptProgressEvent,
-    InternalPromptProgressReporter, InternalPromptProgressRun, InternalPromptProgressShared,
-    InternalPromptProgressState, INTERNAL_PROGRESS_HEARTBEAT_INTERVAL,
-};
-use api::{
-    detect_provider_kind, model_family_identity_for, model_requires_reasoning_content_in_history,
-    model_token_limit, CacheControl, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient as ApiProviderClient,
-    ProviderKind, StreamEvent as ApiStreamEvent, SystemBlock, SystemContent, ToolChoice,
-    ToolDefinition, ToolResultContentBlock,
-};
-use commands::{
-    classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
-    handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
-    handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
-    render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
-    slash_command_specs, validate_slash_command_input, PluginsCommandResult, SkillSlashDispatch,
-    SlashCommand,
-};
-use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
+use api::model_token_limit;
+use plugins::PluginRegistry;
 use runtime::{
-    check_base_commit, format_stale_base_warning, format_usd, load_system_prompt,
-    load_system_prompt_with_extras, pricing_for_model, resolve_expected_base,
-    resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, BaseCommitState,
-    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
-    ConversationRuntime, HistoryIndex, McpServer, McpServerManager, McpServerSpec, McpTool,
-    MessageRole, ModelPricing, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    RepoMap, ResolvedPermissionMode, RuntimeError, Session, SystemPromptExtras, SystemPromptSplit,
-    TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    ConfigLoader, ConversationRuntime, PermissionMode, RepoMap, Session, SystemPromptExtras,
 };
-use serde::Deserialize;
-use serde_json::{json, Map, Value};
 use telemetry::{JsonlTelemetrySink, SessionTracer};
-use tools::{
-    execute_tool, init_lsp_from_config, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition,
-    ToolSearchOutput,
+use tools::{init_lsp_from_config, GlobalToolRegistry};
+
+use crate::api_client::{permission_policy, AnthropicRuntimeClient, HookAbortMonitor};
+use crate::plugin_state::{build_runtime_plugin_state_for, RuntimeMcpState, RuntimePluginState};
+use crate::session_mgr::{
+    create_managed_session_handle_in, load_session_reference_in, new_cli_session_with_roots_in,
+    SessionHandle,
 };
+use crate::tool_executor::CliToolExecutor;
+use crate::AllowedToolSet;
 
-// 从 crate root 引入共享符号（CliOutputFormat、ModelProvenance、共享 helper 等）
-use crate::{
-    classify_error_kind, command_exists, config_alias_for_current_dir,
-    config_model_for_current_dir, config_permission_mode_for_current_dir, current_tool_registry,
-    default_permission_mode, filter_tool_specs, format_connected_line, git_output, git_status_ok,
-    merge_prompt_with_stdin, normalize_allowed_tools, parse_export_args, parse_permission_mode_arg,
-    parse_resume_args, parse_system_prompt_args, permission_mode_from_label,
-    permission_mode_from_resolved, plugin_command_json, plugin_load_failure_json,
-    plugin_summary_json, provider_label, read_piped_stdin, resolve_model_alias,
-    resolve_model_alias_with_config, resolve_repl_model, split_error_hint, validate_model_syntax,
-    write_temp_text_file, AllowedToolSet, CliOutputFormat, ModelProvenance, ModelSource,
-    BUILD_TARGET, DEFAULT_DATE, DEFAULT_MODEL, DEPRECATED_INSTALL_COMMAND, GIT_SHA,
-    OFFICIAL_REPO_SLUG, OFFICIAL_REPO_URL,
-};
-
-// ===== Block A: detect_broad_cwd .. impl LiveCli (main.rs lines 987-2584) =====
-/// Detect if the current working directory is "broad" (home directory or
-/// filesystem root). Returns the cwd path if broad, None otherwise.
-pub(crate) fn detect_broad_cwd() -> Option<PathBuf> {
-    let Ok(cwd) = env::current_dir() else {
-        return None;
-    };
-    let is_home = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .is_some_and(|h| Path::new(&h) == cwd);
-    let is_root = cwd.parent().is_none();
-    if is_home || is_root {
-        Some(cwd)
-    } else {
-        None
-    }
-}
-
-/// Detect if cwd is inside a `target/debug` or `target/release` directory
-/// and walk up to the project root (parent of `target/`). This prevents
-/// workspace-boundary errors when the binary is launched from its build output.
-///
-/// Returns the corrected path if a fix-up was applied, `None` otherwise.
-pub(crate) fn correct_cwd_from_target_dir() -> Option<PathBuf> {
-    let cwd = env::current_dir().ok()?;
-
-    // Check if the last two components are target/<profile>
-    let components: Vec<&std::ffi::OsStr> = cwd
-        .components()
-        .map(std::path::Component::as_os_str)
-        .collect();
-    let n = components.len();
-    if n < 2 {
-        return None;
-    }
-    let parent = components[n - 2];
-    let leaf = components[n - 1];
-    if parent == std::ffi::OsStr::new("target")
-        && (leaf == std::ffi::OsStr::new("debug") || leaf == std::ffi::OsStr::new("release"))
-    {
-        // Walk up to the directory containing `target/`
-        let project_root = cwd
-            .ancestors()
-            .nth(2) // skip leaf + "target"
-            .map(Path::to_path_buf);
-        if let Some(ref root) = project_root {
-            if root.join("Cargo.toml").exists() || root.join(".git").exists() {
-                let _ = env::set_current_dir(root);
-                return Some(root.clone());
-            }
-        }
-    }
-    None
-}
-
-/// Enforce the broad-CWD policy: when running from home or root, either
-/// require the --allow-broad-cwd flag, or prompt for confirmation (interactive),
-/// or exit with an error (non-interactive).
-pub(crate) fn enforce_broad_cwd_policy(
-    allow_broad_cwd: bool,
-    output_format: CliOutputFormat,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if allow_broad_cwd {
-        return Ok(());
-    }
-    let Some(cwd) = detect_broad_cwd() else {
-        return Ok(());
-    };
-
-    let is_interactive = io::stdin().is_terminal();
-
-    if is_interactive {
-        println!(
-            "Warning: claw is running from a very broad directory ({}).\n\
-             The agent can read and search everything under this path.\n\
-             Consider running from inside your project: cd /path/to/project && claw",
-            cwd.display()
-        );
-        print!("Continue anyway? [y/N]: ");
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let trimmed = input.trim().to_lowercase();
-        if trimmed != "y" && trimmed != "yes" {
-            println!("Aborted.");
-            std::process::exit(0);
-        }
-        Ok(())
-    } else {
-        // Non-interactive mode: exit with error (JSON or text)
-        let message = format!(
-            "claw is running from a very broad directory ({}). \
-             The agent can read and search everything under this path. \
-             Use --allow-broad-cwd to proceed anyway, \
-             or run from inside your project: cd /path/to/project && claw",
-            cwd.display()
-        );
-        match output_format {
-            CliOutputFormat::Json => {
-                eprintln!("{}", json_error_envelope(&message));
-            }
-            CliOutputFormat::Text => {}
-        }
-        std::process::exit(1);
-    }
-}
-
-pub(crate) fn stale_base_state_for(cwd: &Path, flag_value: Option<&str>) -> BaseCommitState {
-    let source = resolve_expected_base(flag_value, cwd);
-    check_base_commit(cwd, source.as_ref())
-}
-
-pub(crate) fn stale_base_json_value(state: &BaseCommitState) -> serde_json::Value {
-    match state {
-        BaseCommitState::Matches => json!({"status": "matches", "fresh": true}),
-        BaseCommitState::Diverged { expected, actual } => json!({
-            "status": "diverged",
-            "fresh": false,
-            "expected": expected,
-            "actual": actual,
-        }),
-        BaseCommitState::NoExpectedBase => json!({"status": "no_expected_base", "fresh": null}),
-        BaseCommitState::NotAGitRepo => json!({"status": "not_git_repo", "fresh": null}),
-    }
-}
-
-pub(crate) fn run_stale_base_preflight(flag_value: Option<&str>) {
-    let Ok(cwd) = env::current_dir() else {
-        return;
-    };
-    let state = stale_base_state_for(&cwd, flag_value);
-    if let Some(warning) = format_stale_base_warning(&state) {
-        eprintln!("{warning}");
-    }
-}
-
-/// Shared LiveCli construction for both inline REPL and TUI modes.
-/// Returns the constructed LiveCli with reasoning effort set.
-pub(crate) fn build_live_cli_for_repl(
-    model: String,
-    allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
-    additional_workspace_roots: Vec<PathBuf>,
-    output_verbosity: OutputVerbosity,
-    reasoning_effort: Option<String>,
-    thinking_mode: Option<bool>,
-) -> Result<LiveCli, Box<dyn std::error::Error>> {
-    let resolved_model = resolve_repl_model(model);
-    let workspace = env::current_dir()?;
-    let mut cli = LiveCli::new(
-        resolved_model,
-        true,
-        allowed_tools,
-        permission_mode,
-        additional_workspace_roots,
-        output_verbosity,
-        &workspace,
-    )?;
-    cli.set_reasoning_effort(reasoning_effort);
-    cli.set_thinking_mode(thinking_mode);
-    // 会话互通(Session Bus,设计文档 2026-08-11-session-bus-design.md §2.2):
-    // 主会话注册为 Main peer(REPL 与 TUI 共用此构造路径);子代理在
-    // conversation.rs 派发时自动注册 Subagent peer。
-    {
-        let bus = runtime::global_session_bus();
-        let _ = bus.register(runtime::BusPeer {
-            session_id: cli.session.id.clone(),
-            label: "主会话".to_string(),
-            kind: runtime::PeerKind::Main,
-            status: runtime::PeerStatus::Idle,
-            unread: 0,
-            last_seen_ms: runtime::bus_now_ms(),
-            config_path: None,
-        });
-        // Epic 1:应用 `session_bus.allow` 配置(设计文档 §2.5,deny by default)。
-        // 未配置时仅默认 Main→*、Subagent→Main/Subagent 放行。
-        let loader = runtime::ConfigLoader::default_for(
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        );
-        if let Ok(cfg) = loader.load() {
-            bus.apply_allow_rules(cfg.feature_config().session_bus_allow());
-        }
-        // Epic 2:跨进程文件事件队列(设计文档 §2.4)。
-        // 启用 `.claw/bus/` 邮箱:远端会话可经文件投递消息到本会话,本会话
-        // 轮询线程消费邮箱并注入本地总线(子代理 Handoff/watch 照常走进程内)。
-        if let Ok(cwd) = std::env::current_dir() {
-            let bus_root = cwd.join(".claw").join("bus");
-            let own_id = cli.session.id.clone();
-            if runtime::SessionBus::ensure_mailbox(&bus_root, &own_id).is_ok() {
-                bus.set_bus_root(bus_root.clone());
-                runtime::SessionBus::start_mailbox_poller(bus_root, own_id);
-            }
-        }
-    }
-    Ok(cli)
-}
-
-/// 会话互通(Session Bus)：drain 主会话未读 bus 消息并打印为 PeerMessage 行。
-/// REPL 模式在主循环顶部调用；TUI 模式由 tui/app.rs 的事件循环处理。
-fn drain_bus_unread_repl(session_id: &str, cli: &LiveCli) {
-    let bus = runtime::global_session_bus();
-    let msgs = bus.unread_messages(session_id);
-    if msgs.is_empty() {
-        return;
-    }
-    bus.mark_read(session_id);
-    for m in msgs {
-        let line = format!(
-            "\x1b[36m[来自 {} · {}]\x1b[0m {}",
-            m.from,
-            m.kind.as_str(),
-            render_bus_message_line(&m)
-        );
-        if !cli.tui_println(&line) {
-            println!("{line}");
-        }
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-#[allow(clippy::too_many_arguments)] // Stage 1 验收:9 参数超 clippy 默认上限 7,重构参数到 struct 待 Stage 2 处理。
-pub(crate) fn run_repl(
-    model: String,
-    allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
-    base_commit: Option<String>,
-    reasoning_effort: Option<String>,
-    thinking_mode: Option<bool>,
-    allow_broad_cwd: bool,
-    additional_workspace_roots: Vec<PathBuf>,
-    output_verbosity: OutputVerbosity,
-    enable_plan_mode: bool,
-    enable_policy_engine: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
-    correct_cwd_from_target_dir();
-    run_stale_base_preflight(base_commit.as_deref());
-    // P3 多行粘贴折叠：本会话的 paste id 自增生成器。
-    // 每次超阈值粘贴时 +1，用于 paste-cache 文件名和占位符编号。
-    let mut paste_id_gen: u32 = 0;
-    // P3 自动剪贴板检测：当检测到右键粘贴多行内容时，把剩余行存入此 Vec。
-    // conhost 右键粘贴会逐行发送，第一行 Submit 后，后续行会快速触发 Submit。
-    // claw 用此 Vec 丢弃后续行（与剪贴板剩余行匹配）。
-    let mut pending_paste_lines: Vec<String> = Vec::new();
-    let t0 = std::time::Instant::now();
-    let mut cli = build_live_cli_for_repl(
-        model,
-        allowed_tools,
-        permission_mode,
-        additional_workspace_roots,
-        output_verbosity,
-        reasoning_effort,
-        thinking_mode,
-    )?;
-    // Harness O(编排)层:Plan/Execute/Review 三段循环接入(Step 2.1)。
-    // `--enable-plan-mode` 时启用,默认关闭。详见
-    // `docs/harness-engineering-optimization-plan.md` Step 2.1。
-    // P3-1:settings.json `planMode: true` 也能启用(在 LiveCli::new 内部处理),
-    // CLI flag 优先级更高(此处覆盖)。
-    // workspace_root 对所有工具路径都需要(notebook_update/recall_full/subagent 等),
-    // 不应仅绑定在 plan_mode 内。
-    cli.runtime.set_workspace_root(std::env::current_dir()?);
-    if enable_plan_mode {
-        cli.runtime.set_plan_mode_enabled(true);
-    }
-    // 热升级启动检测(双大脑收官基石):新进程启动时若存在升级标记,
-    // 自动 resume 旧会话 + 恢复活跃计划 + 清理标记。
-    // 返回 Some(notice) 时,**主动开跑一轮**把 notice 作为首轮输入交给
-    // run_turn —— 这才是"无缝续跑"的兑现;旧实现只 push 通知就返回,
-    // 通知排进 session 却无人消费,进程落入下面的 read_line() 阻塞。
-    // 失败静默降级为普通启动。
-    let resume_notice = cli.maybe_resume_from_upgrade()?;
-    // P1-1:PolicyEngine 策略引擎 flag。
-    // 当前 lane_completion 模块已实现 PolicyEngine 调用(tools/lane_completion.rs),
-    // 但生产路径未接入。flag 用于控制后续 lane 完成时是否调用策略评估。
-    // 实际接入在 P1-2/P1-3 中完成(green_contract 桥接 + g004 校验闭环)。
-    if enable_policy_engine {
-        eprintln!("[policy] PolicyEngine enabled (lane completion policy evaluation active)");
-    }
-    let t_cli = t0.elapsed();
-    let mut editor = input::LineEditor::new_with_mode(
-        "> ",
-        cli.repl_completion_candidates().unwrap_or_default(),
-        crate::settings::load().vim,
-    );
-    let t_editor = t0.elapsed();
-    println!("{}", cli.startup_banner());
-    let t_banner = t0.elapsed();
-    println!("{}", format_connected_line(&cli.model));
-    let t_total = t0.elapsed();
-    eprintln!(
-        "[timing] LiveCli::new={:?} editor={:?} banner={:?} total={:?}",
-        t_cli, t_editor, t_banner, t_total
-    );
-
-    // 热升级自动续跑(兑现承诺):resume 成功时立即把 notice 作为首轮输入
-    // 交给 run_turn,主动开跑那一轮。run_turn 内部会 push_user_text(notice),
-    // 故此处仅传文本、不预先注入 session,避免双重 push。
-    if let Some(notice) = resume_notice {
-        print_user_card(&notice);
-        if let Err(e) = cli.run_turn(&notice) {
-            eprintln!("[upgrade] 自动续跑失败(降级为等待用户输入): {e}");
-        }
-    }
-
-    loop {
-        // 会话互通(Session Bus):drain 主会话未读 bus 消息(子代理 Handoff /
-        // watch 镜像)到 stdout,使 REPL 也能看到对等会话消息。
-        drain_bus_unread_repl(&cli.session.id, &cli);
-        editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
-        match editor.read_line()? {
-            input::ReadOutcome::Submit(input) => {
-                let trimmed = input.trim().to_string();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if matches!(trimmed.as_str(), "/exit" | "/quit") {
-                    cli.persist_session()?;
-                    break;
-                }
-                // /vim：REPL 的编辑器在构造时决定键位，切换写盘后下次启动生效。
-                if trimmed == "/vim" {
-                    let mut settings = crate::settings::load();
-                    settings.vim = !settings.vim;
-                    let saved = crate::settings::save(&settings).is_ok();
-                    println!(
-                        "vim 模式已{}（{}）",
-                        if settings.vim { "开启" } else { "关闭" },
-                        if saved {
-                            "已写入 ~/.claw/settings.json，下次启动生效"
-                        } else {
-                            "写入设置失败，仅内存生效到本次退出"
-                        }
-                    );
-                    continue;
-                }
-                // P3 自动剪贴板检测：如果 pending_paste_lines 非空，说明上一次检测到
-                // 右键粘贴多行内容，此行是 conhost 逐行发送的后续行之一。
-                // 如果匹配 pending_paste_lines 的第一行，丢弃此行；否则清空并正常处理。
-                if !pending_paste_lines.is_empty() {
-                    if pending_paste_lines[0] == trimmed {
-                        pending_paste_lines.remove(0);
-                        continue;
-                    } else {
-                        // 不匹配，说明用户开始输入新内容，清空 pending 列表
-                        pending_paste_lines.clear();
-                    }
-                }
-                // P3 多行粘贴模式：/paste 直接读取 Windows 剪贴板内容。
-                // 绕过终端粘贴机制（conhost 右键粘贴会逐行触发 AcceptLine，无法可靠收集多行）。
-                // 用户先 Ctrl+C 复制内容到剪贴板，然后在 claw 里输入 /paste。
-                // claw 用 PowerShell Get-Clipboard 读取剪贴板原始文本。
-                if trimmed == "/paste" {
-                    println!("\x1b[2m--- 从剪贴板读取 ---\x1b[0m");
-                    let pasted = match read_clipboard_text() {
-                        Ok(text) if !text.trim().is_empty() => text,
-                        Ok(_) => {
-                            println!("\x1b[2m（剪贴板为空，请先 Ctrl+C 复制内容）\x1b[0m");
-                            continue;
-                        }
-                        Err(error) => {
-                            eprintln!("\x1b[31m读取剪贴板失败: {error}\x1b[0m");
-                            continue;
-                        }
-                    };
-                    let (display, expanded) =
-                        fold_pasted_input(&pasted, &cli.session.id, &mut paste_id_gen);
-                    editor.push_history(&display);
-                    cli.record_prompt_history(&display);
-                    print_user_card(&display);
-                    cli.run_turn(&expanded)?;
-                    continue;
-                }
-                match SlashCommand::parse(&trimmed) {
-                    Ok(Some(command)) => {
-                        if cli.handle_repl_command(command)? {
-                            cli.persist_session()?;
-                        }
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        eprintln!("{error}");
-                        continue;
-                    }
-                }
-                // P3 自动剪贴板检测：如果用户输入是单行（conhost 右键粘贴的第一行），
-                // 且不以 / 开头（slash 命令不检测），检查剪贴板是否有多行内容。
-                // 如果剪贴板第一行等于用户输入，则用剪贴板完整内容替换，并设置
-                // pending_paste_lines 以丢弃后续被 conhost 逐行发送的行。
-                let (display, expanded) = if !trimmed.contains('\n')
-                    && !trimmed.starts_with('/')
-                    && pending_paste_lines.is_empty()
-                {
-                    // P0-1 适配：try_auto_expand_clipboard 现在返回三元组
-                    // (display, expanded, raw_clipboard)。CLI 路径不需要 raw_clipboard，
-                    // 用 _ 丢弃（TUI 路径会复用以避免第二次 PowerShell 调用）。
-                    try_auto_expand_clipboard(
-                        &trimmed,
-                        &cli.session.id,
-                        &mut paste_id_gen,
-                        &mut pending_paste_lines,
-                    )
-                    .map(|(display, expanded, _clipboard)| (display, expanded))
-                    .unwrap_or_else(|| {
-                        fold_pasted_input(&trimmed, &cli.session.id, &mut paste_id_gen)
-                    })
-                } else {
-                    fold_pasted_input(&trimmed, &cli.session.id, &mut paste_id_gen)
-                };
-                // Bare-word skill dispatch: if the first token of the input
-                // matches a known skill name, invoke it as `/skills <input>`
-                // rather than forwarding raw text to the LLM (ROADMAP #36).
-                let cwd = std::env::current_dir().unwrap_or_default();
-                if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &display) {
-                    editor.push_history(&display);
-                    cli.record_prompt_history(&display);
-                    // 卡片显示用户原始输入 display（而非 skill 展开后的 prompt）
-                    print_user_card(&display);
-                    cli.run_turn(&prompt)?;
-                    continue;
-                }
-                editor.push_history(&display);
-                cli.record_prompt_history(&display);
-                print_user_card(&display);
-                cli.run_turn(&expanded)?;
-            }
-            input::ReadOutcome::Cancel => {}
-            input::ReadOutcome::Exit => {
-                cli.persist_session()?;
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-pub(crate) struct LiveCli {
-    model: String,
-    allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
-    system_prompt: Vec<String>,
-    runtime: BuiltRuntime,
-    session: SessionHandle,
-    /// 本 CLI 绑定的工作区根；所有需要 cwd 的内部路径都从这里派生，
-    /// 不读取进程级当前目录（Web 多工作区下进程 cwd 是中性临时目录）。
-    workspace: PathBuf,
-    prompt_history: Vec<PromptHistoryEntry>,
-    output_verbosity: OutputVerbosity,
-    // P2 富状态栏：累计本会话所有回合的 token usage，用于状态栏持续显示 cost/token。
-    // 在 run_turn / run_prompt_* 成功路径里累加 summary.usage。
-    cumulative_usage: runtime::TokenUsage,
-    // Tier S #1 Goal 持续驱动：外挂式 GoalManager，跨轮 prompt 注入。
-    // 在 run_turn 调 runtime.run_turn 之前 prepend goal 前缀；
-    // 网络错误时 pause；GoalTool 失败时 record_blocked。
-    goal_manager: runtime::GoalManager,
-    // 流式状态事件出口：TUI 与 Web 共用（Web 在 serve.rs 中挂载，
-    // 驱动 SSE 文本/工具事件）。不再按特性门控。
-    status_emitter: Option<crate::streaming::StatusEmitter>,
-    /// 热升级优雅中断信号(双大脑收官基石)。
-    ///
-    /// `/upgrade` 命令置位后,当前正在执行的 turn 在下一次 run_turn 迭代
-    /// 顶部检测到 → 注入"暂停通知"给 LLM → turn 自然收尾。因
-    /// `prepare_turn_runtime` 每轮重建 runtime,信号必须存于此字段并在
-    /// 重建时经 `with_upgrade_signal` 注入,否则每轮新 runtime 的
-    /// upgrade_pending 都是默认 false,信号丢失。
-    upgrade_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// 主会话 mid-turn steering 收件箱（inject 模式）。
-    ///
-    /// 与 `upgrade_signal` 同构：TUI/CLI 在 turn 执行期间（busy）把用户输入投入
-    /// 此队列，`run_turn` 每次迭代顶部取出并注入为 user 消息（折叠进下一轮模型
-    /// 调用，不中断当前流）。因 `prepare_turn_runtime` 每轮重建 runtime，队列必须
-    /// 存于此字段并在重建时经 `with_steer_inbox` 注入，否则每轮新 runtime 的队列
-    /// 都是空的、插话丢失。
-    steer_inbox: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    /// TUI 中断支持：当前 turn 的 abort signal handle。
-    /// run_turn 开始时设置，turn 结束（成功/失败/中断）时清空。
-    /// TUI 层 Ctrl+C（busy 时）通过此 handle 取消当前 turn。
-    current_abort_signal: Option<runtime::HookAbortSignal>,
-    /// 外部注入的 abort signal。
-    /// TUI / Web 层在启动本轮执行前设置（保留 clone 用于「停止」），
-    /// prepare_turn_runtime 优先使用此 signal（而非创建新的），
-    /// 让调用方能在 turn 执行期间取消当前轮。
-    external_abort_signal: Option<runtime::HookAbortSignal>,
-    /// S3-M2:会话级子进程登记表（Web worker 每会话一份，跨轮复用）。
-    /// prepare_turn_runtime 注入到本轮工具注册表，worker 退出 / 看门狗回收 /
-    /// 会话删除时由调度器统一终止登记的进程树。
-    session_processes: Option<std::sync::Arc<runtime::process_registry::SessionProcesses>>,
-}
-
-pub(crate) struct BuiltRuntime {
-    /// `Box<dyn runtime::ApiClient>`:允许 `--model deepseek-web` 时注入
-    /// web-bridge 的网页版客户端(登录态、零 Token),与默认 API 后端运行时
-    /// 切换,无需改动 ConversationRuntime 泛型约束。
-    runtime: Option<ConversationRuntime<Box<dyn runtime::ApiClient>, CliToolExecutor>>,
-    plugin_registry: PluginRegistry,
-    plugins_active: bool,
-    mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
-    mcp_active: bool,
-}
-
-impl BuiltRuntime {
-    /// 会话边界：通知记忆 worker 收尾（0 等待，失败静默）。
-    pub(crate) fn on_memory_boundary(
-        &mut self,
-        boundary: runtime::memory_extract::MemorySessionBoundary,
-    ) {
-        if let Some(runtime) = self.runtime.as_mut() {
-            runtime.on_memory_boundary(boundary);
-        }
-    }
-
-    fn new(
-        runtime: ConversationRuntime<Box<dyn runtime::ApiClient>, CliToolExecutor>,
-        plugin_registry: PluginRegistry,
-        mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
-    ) -> Self {
-        Self {
-            runtime: Some(runtime),
-            plugin_registry,
-            plugins_active: true,
-            mcp_state,
-            mcp_active: true,
-        }
-    }
-
-    fn with_hook_abort_signal(mut self, hook_abort_signal: runtime::HookAbortSignal) -> Self {
-        // 同一份令牌同时驱动 agent loop 检查点与 bash 轮询循环：
-        // 「停止」不再依赖进程级全局标志，且按 turn 隔离（并发会话互不影响）。
-        let token = hook_abort_signal.token();
-        let mut runtime = self
-            .runtime
-            .take()
-            .expect("runtime should exist before installing hook abort signal")
-            .with_hook_abort_signal(hook_abort_signal);
-        runtime.tool_executor_mut().set_turn_cancel(token);
-        self.runtime = Some(runtime);
-        self
-    }
-
-    /// S3-M2:注入会话级子进程登记表（Web worker 跨轮复用的同一份）。
-    fn with_session_processes(
-        mut self,
-        processes: Option<std::sync::Arc<runtime::process_registry::SessionProcesses>>,
-    ) -> Self {
-        if let Some(processes) = processes {
-            if let Some(runtime) = self.runtime.as_mut() {
-                runtime.tool_executor_mut().set_session_processes(processes);
-            }
-        }
-        self
-    }
-
-    /// 注入热升级优雅中断信号(双大脑收官基石)。
-    ///
-    /// 与 [`with_hook_abort_signal`](Self::with_hook_abort_signal) 同构:
-    /// 把 LiveCli 持有的 `upgrade_signal`(跨 `prepare_turn_runtime` 重建
-    /// 持久)注入 runtime,使 `/upgrade` 命令置位后,当前正在执行的 turn
-    /// 在 run_turn 循环顶部检测到并优雅收尾。
-    fn with_upgrade_signal(
-        mut self,
-        upgrade_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> Self {
-        let runtime = self
-            .runtime
-            .take()
-            .expect("runtime should exist before installing upgrade signal");
-        self.runtime = Some(runtime.with_upgrade_signal(upgrade_signal));
-        self
-    }
-
-    /// 注入主会话 mid-turn steering 收件箱（inject 模式）。
-    ///
-    /// 与 [`with_upgrade_signal`](Self::with_upgrade_signal) 同构：把 LiveCli
-    /// 持有的 `steer_inbox`（跨 `prepare_turn_runtime` 重建持久）注入 runtime，
-    /// 使 busy 期间用户投入的插话能在下一次迭代被取出并折叠进模型调用。
-    fn with_steer_inbox(
-        mut self,
-        steer_inbox: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    ) -> Self {
-        let runtime = self
-            .runtime
-            .take()
-            .expect("runtime should exist before installing steer inbox");
-        self.runtime = Some(runtime.with_steer_inbox(steer_inbox));
-        self
-    }
-
-    fn set_tool_verbosity(&mut self, verbosity: OutputVerbosity) {
-        if let Some(ref mut rt) = self.runtime {
-            rt.tool_executor_mut().output_verbosity = verbosity;
-        }
-    }
-
-    pub(crate) fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.plugins_active {
-            self.plugin_registry.shutdown()?;
-            self.plugins_active = false;
-        }
-        Ok(())
-    }
-
-    fn shutdown_mcp(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.mcp_active {
-            if let Some(mcp_state) = &self.mcp_state {
-                mcp_state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .shutdown()?;
-            }
-            self.mcp_active = false;
-        }
-        Ok(())
-    }
-}
-
-impl Deref for BuiltRuntime {
-    type Target = ConversationRuntime<Box<dyn runtime::ApiClient>, CliToolExecutor>;
-
-    fn deref(&self) -> &Self::Target {
-        self.runtime
-            .as_ref()
-            .expect("runtime should exist while built runtime is alive")
-    }
-}
-
-impl DerefMut for BuiltRuntime {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.runtime
-            .as_mut()
-            .expect("runtime should exist while built runtime is alive")
-    }
-}
-
-impl Drop for BuiltRuntime {
-    fn drop(&mut self) {
-        let _ = self.shutdown_mcp();
-        let _ = self.shutdown_plugins();
-    }
-}
-
-impl Drop for LiveCli {
-    fn drop(&mut self) {
-        // 会话/进程收尾（REPL 退出、TUI 退出、serve worker 回收）：
-        // 通知记忆 worker 做边界巩固（0 等待，失败静默）。
-        self.runtime
-            .on_memory_boundary(runtime::memory_extract::MemorySessionBoundary::Exited);
-    }
-}
-
-impl LiveCli {
-    pub(crate) fn new(
-        model: String,
-        enable_tools: bool,
-        allowed_tools: Option<AllowedToolSet>,
-        permission_mode: PermissionMode,
-        additional_workspace_roots: Vec<PathBuf>,
-        output_verbosity: OutputVerbosity,
-        workspace: &Path,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        crate::diag_log(&format!("[LiveCli::new] start, model={model}"));
-        let t0 = std::time::Instant::now();
-        crate::diag_log("[LiveCli::new] calling build_system_prompt");
-        let system_prompt = build_system_prompt(&model, workspace)?;
-        crate::diag_log("[LiveCli::new] build_system_prompt OK");
-        let t_sp = t0.elapsed();
-        let session_state = new_cli_session_with_roots_in(workspace, additional_workspace_roots)?;
-        crate::diag_log("[LiveCli::new] new_cli_session_with_roots OK");
-        let t_sess = t0.elapsed();
-        let session = create_managed_session_handle_in(workspace, &session_state.session_id)?;
-        crate::diag_log("[LiveCli::new] create_managed_session_handle OK");
-        let t_handle = t0.elapsed();
-        crate::diag_log("[LiveCli::new] calling build_runtime");
-        let mut runtime = build_runtime(
-            session_state.with_persistence_path(session.path.clone()),
-            &session.id,
-            model.clone(),
-            system_prompt.clone(),
-            enable_tools,
-            true,
-            allowed_tools.clone(),
-            permission_mode,
-            None,
-            workspace,
-        )?;
-        let t_rt = t0.elapsed();
-        eprintln!(
-            "[timing] build_system_prompt={:?} new_cli_session={:?} create_handle={:?} build_runtime={:?} total={:?}",
-            t_sp, t_sess, t_handle, t_rt, t_rt
-        );
-        // Tier S #3 穷鬼模式：从 settings.json 的 `poorMode` 字段读取初始值，
-        // 写入进程级全局 AtomicBool。运行时通过 `/poor` 命令可立即切换。
-        // 加载失败时保持默认（inactive），不阻断启动。
-        // Tier S #1 Goal 持续驱动：从 `<cwd>/.claw/goal.json` 加载已持久化的 goal，
-        // 恢复上次会话的 goal 状态。文件不存在或解析失败时为空管理器。
-        let goal_manager = {
-            let cwd = workspace.to_path_buf();
-            // workspace_root 对所有工具路径都需要(notebook_update/recall_full/
-            // subagent 等),且与 config 解析正交——config 解析失败时不应导致
-            // workspace_root 缺失。因此无条件设置,不嵌套在 loader.load() 分支内。
-            runtime.set_workspace_root(cwd.clone());
-            let loader = ConfigLoader::default_for(&cwd);
-            if let Ok(config) = loader.load() {
-                if let Some(poor) = config.feature_config().poor_mode() {
-                    runtime::poor_mode::set_active(poor);
-                }
-                // P3-1:从 settings.json `planMode` 控制 Plan/Execute/Review。
-                // 默认启用(true),CLI flag `--enable-plan-mode` 在 run_repl 中覆盖。
-                match config.feature_config().plan_mode() {
-                    Some(true) => runtime.set_plan_mode_enabled(true),
-                    Some(false) => runtime.set_plan_mode_enabled(false),
-                    None => {} // 保持默认(true)
-                }
-                // SP4.2-B3:从配置初始化 LSP servers(best-effort,失败不阻断启动)
-                let _ = init_lsp_from_config(&config, &cwd);
-            }
-            runtime::GoalManager::load(runtime::goal_json_path(&cwd))
-        };
-        let cli = Self {
-            model,
-            allowed_tools,
-            permission_mode,
-            output_verbosity,
-            system_prompt,
-            runtime,
-            session,
-            workspace: workspace.to_path_buf(),
-            prompt_history: Vec::new(),
-            cumulative_usage: runtime::TokenUsage::default(),
-            goal_manager,
-            upgrade_signal: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            steer_inbox: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            status_emitter: None,
-            current_abort_signal: None,
-            external_abort_signal: None,
-            session_processes: None,
-        };
-        cli.persist_session()?;
-        Ok(cli)
-    }
-
-    pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) {
-        if let Some(rt) = self.runtime.runtime.as_mut() {
-            rt.api_client_mut().set_reasoning_effort(effort);
-        }
-    }
-
-    /// 设置 DeepSeek 思考模式开关(Some(true)=开启,Some(false)=关闭,None=模型默认)。
-    pub(crate) fn set_thinking_mode(&mut self, thinking: Option<bool>) {
-        if let Some(rt) = self.runtime.runtime.as_mut() {
-            rt.api_client_mut().set_thinking_mode(thinking);
-        }
-    }
-
-    /// 读取当前 thinking_mode 设置(供 TUI 侧栏显示)。
-    pub(crate) fn thinking_mode(&self) -> Option<bool> {
-        if let Some(rt) = self.runtime.runtime.as_ref() {
-            rt.api_client().thinking_mode()
-        } else {
-            None
-        }
-    }
-
-    /// 读取当前 reasoning_effort 设置（供 TUI 侧栏显示）。
-    pub(crate) fn reasoning_effort(&self) -> Option<String> {
-        if let Some(rt) = self.runtime.runtime.as_ref() {
-            rt.api_client().reasoning_effort()
-        } else {
-            None
-        }
-    }
-
-    /// P2 状态栏：累加本次回合的 usage 到 cumulative_usage。
-    /// 在 run_turn / run_prompt_* 成功路径调用。
-    fn accumulate_usage(&mut self, usage: runtime::TokenUsage) {
-        self.cumulative_usage.input_tokens += usage.input_tokens;
-        self.cumulative_usage.output_tokens += usage.output_tokens;
-        self.cumulative_usage.cache_creation_input_tokens += usage.cache_creation_input_tokens;
-        self.cumulative_usage.cache_read_input_tokens += usage.cache_read_input_tokens;
-    }
-
-    /// P2 状态栏：打印当前会话的累计状态栏。
-    /// 在每次回合完成后（run_turn 成功路径末尾）调用。
-    /// Tier S #1 Goal 持续驱动：追加 goal 徽章（🎯 active 绿色 / ⚠ blocked 橙色 / paused 不显示）。
-    fn print_status_bar(&self) {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let short_cwd = shorten_cwd_for_statusbar(&cwd);
-        let base = format_status_bar(&self.model, &short_cwd, self.cumulative_usage);
-        // Tier S #1 Goal 徽章：在状态栏末尾追加 goal 状态。
-        let goal_badge = self.render_goal_badge();
-        if let Some(badge) = goal_badge {
-            // 把 badge 插到末尾 `│` 之前。
-            let trimmed = base.trim_end_matches("\x1b[0m");
-            println!("{trimmed}{badge}\x1b[0m");
-        } else {
-            println!("{base}");
-        }
-    }
-
-    /// 渲染 goal 徽章字符串（不含 ANSI reset 后缀）。无 goal 或 paused 状态返回 None。
-    fn render_goal_badge(&self) -> Option<String> {
-        let goal = self.goal_manager.active()?;
-        match &goal.state {
-            runtime::GoalState::Active => {
-                Some("\x1b[38;5;240m │ \x1b[32m🎯 goal\x1b[0;38;5;240m".to_string())
-            }
-            runtime::GoalState::Blocked { .. } => Some(format!(
-                "\x1b[38;5;240m │ \x1b[33m⚠ goal ({}/3)\x1b[0;38;5;240m",
-                goal.blocked_count
-            )),
-            runtime::GoalState::Paused { .. } => None,
-        }
-    }
-
-    pub(crate) fn startup_banner(&self) -> String {
-        let cwd = env::current_dir().map_or_else(
-            |_| "<unknown>".to_string(),
-            |path| path.display().to_string(),
-        );
-        let status = status_context(None).ok();
-        let git_branch = status
-            .as_ref()
-            .and_then(|context| context.git_branch.as_deref())
-            .unwrap_or("unknown");
-        let workspace = status.as_ref().map_or_else(
-            || "unknown".to_string(),
-            |context| context.git_summary.headline(),
-        );
-        let session_path = self.session.path.strip_prefix(Path::new(&cwd)).map_or_else(
-            |_| self.session.path.display().to_string(),
-            |path| path.display().to_string(),
-        );
-        format!(
-            "\x1b[38;5;196m\
- ██████╗██╗      █████╗ ██╗    ██╗\n\
-██╔════╝██║     ██╔══██╗██║    ██║\n\
-██║     ██║     ███████║██║ █╗ ██║\n\
-██║     ██║     ██╔══██║██║███╗██║\n\
-╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
- ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
-  \x1b[2mModel\x1b[0m            {}\n\
-  \x1b[2mPermissions\x1b[0m      {}\n\
-  \x1b[2mBranch\x1b[0m           {}\n\
-  \x1b[2mWorkspace\x1b[0m        {}\n\
-  \x1b[2mDirectory\x1b[0m        {}\n\
-  \x1b[2mSession\x1b[0m          {}\n\
-  \x1b[2mAuto-save\x1b[0m        {}\n\n\
-  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
-            self.model,
-            self.permission_mode.as_str(),
-            git_branch,
-            workspace,
-            cwd,
-            self.session.id,
-            session_path,
-        )
-    }
-
-    fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        Ok(slash_command_completion_candidates_with_sessions(
-            &self.model,
-            Some(&self.session.id),
-            list_managed_sessions()?
-                .into_iter()
-                .map(|session| session.id)
-                .collect(),
-        ))
-    }
-
-    fn prepare_turn_runtime(
-        &mut self,
-        emit_output: bool,
-    ) -> Result<
-        (BuiltRuntime, HookAbortMonitor, runtime::HookAbortSignal),
-        Box<dyn std::error::Error>,
-    > {
-        // 中断支持（TUI 与 Web 共用）：优先使用外部注入的 abort signal
-        // （由调用方在 spawn worker / 入队前设置），让主线程/HTTP 层能通过
-        // 保留的 clone 取消当前 turn。非中断模式（CLI/JSON 等）创建新的 signal。
-        let hook_abort_signal = self.external_abort_signal.clone().unwrap_or_default();
-        let mut runtime = build_runtime(
-            self.runtime.session().clone(),
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            emit_output,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            &self.workspace,
-        )?
-        .with_hook_abort_signal(hook_abort_signal.clone())
-        .with_session_processes(self.session_processes.clone())
-        .with_upgrade_signal(self.upgrade_signal.clone())
-        .with_steer_inbox(self.steer_inbox.clone());
-        runtime.set_tool_verbosity(self.output_verbosity);
-        // 推理状态同步：AnthropicRuntimeClient 每轮 turn 都会在
-        // prepare_turn_runtime 中重建(见 run_turn → replace_runtime 生命周期),
-        // 新 client 上 reasoning_effort / thinking_mode 均为默认值。
-        // /effort 与 /thinking 只写入了旧 client,若不显式注入,每轮请求都会
-        // 退化为模型默认(线上实测:--reasoning-effort low 与 --no-thinking
-        // 均未出现在请求体中,2026-09-01)。从 LiveCli 持有的旧 client 读取
-        // 并同步到本轮新建的 client。
-        {
-            let effort = self.reasoning_effort();
-            let thinking = self.thinking_mode();
-            if let Some(rt) = runtime.runtime.as_mut() {
-                let client = rt.api_client_mut();
-                client.set_reasoning_effort(effort);
-                client.set_thinking_mode(thinking);
-            }
-        }
-        // 把状态事件出口注入本轮新建的 client 与工具执行器：
-        // Web SSE 依赖它输出文本与工具事件。
-        if let Some(emitter) = &self.status_emitter {
-            if let Some(rt) = runtime.runtime.as_mut() {
-                rt.api_client_mut().set_status_emitter(Arc::clone(emitter));
-                // Also inject into CliToolExecutor so ToolResult events are emitted
-                rt.tool_executor_mut()
-                    .set_status_emitter(Arc::clone(emitter));
-            }
-        }
-        let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal.clone());
-
-        Ok((runtime, hook_abort_monitor, hook_abort_signal))
-    }
-
-    fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
-        self.runtime.shutdown_plugins()?;
-        self.runtime = runtime;
-        Ok(())
-    }
-
-    pub(crate) fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        // REPL 路径:emit_output=true,consume_stream 写入 stdout,
-        // spinner/println/print_status_bar 直接输出到终端。
-        // TUI 路径请用 run_turn_tui(分离自原 tui_mode gating)。
-        let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(true)?;
-        let mut spinner = Spinner::new();
-        let mut stdout = io::stdout();
-        spinner.tick(
-            "🦀 Thinking...",
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
-        let mut permission_prompter: Box<dyn runtime::PermissionPrompter> =
-            Box::new(CliPermissionPrompter::new(self.permission_mode));
-        // Tier S #1 Goal 持续驱动：在调 runtime.run_turn 之前 prepend goal 前缀。
-        // 前缀包含 goal 文本、状态（active/blocked）、blocked 计数、token 用量。
-        // LLM 每轮都看到 goal 上下文，驱动持续工作。Paused 状态不注入。
-        let goal_prefix = self.goal_manager.render_prompt_prefix();
-        let full_input = match &goal_prefix {
-            Some(prefix) => format!("{prefix}{input}"),
-            None => input.to_string(),
-        };
-        let result = runtime.run_turn(&full_input, Some(&mut *permission_prompter));
-        hook_abort_monitor.stop();
-        match result {
-            Ok(summary) => {
-                self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
-                let final_text = final_assistant_text(&summary);
-                if !final_text.is_empty() {
-                    println!("{final_text}");
-                }
-                println!();
-                if let Some(event) = summary.auto_compaction {
-                    println!(
-                        "{}",
-                        format_auto_compaction_notice(event.removed_message_count)
-                    );
-                }
-                // P2 富状态栏：累加本次 usage 并打印状态行。
-                self.accumulate_usage(summary.usage);
-                // Tier S #1 Goal 持续驱动：累加本次回合的 token 用量到 goal_manager。
-                let turn_tokens = u64::from(summary.usage.total_tokens());
-                let _ = self.goal_manager.record_tokens(turn_tokens);
-                self.print_status_bar();
-                println!();
-                self.persist_session()?;
-                // Agent 自触发热升级:若本 turn 调用了 `HotUpgrade` 工具,状态已全部
-                // 落盘,此刻执行升级(重建 → 重启 → 新进程 resume 本会话并续跑)。
-                // run_upgrade 内部会 std::process::exit(0),故放在 turn 成功收尾之后。
-                if tools::take_hot_upgrade_request() {
-                    self.run_upgrade()?;
-                }
-                Ok(())
-            }
-            Err(error) => {
-                runtime.shutdown_plugins()?;
-                spinner.fail(
-                    "❌ Request failed",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
-                // Tier S #1 Goal 持续驱动：检测网络错误关键词，自动 pause goal。
-                let error_str = error.to_string().to_ascii_lowercase();
-                let is_network_error = NETWORK_ERROR_KEYWORDS
-                    .iter()
-                    .any(|kw| error_str.contains(kw));
-                if is_network_error {
-                    let _ = self.goal_manager.pause("network error");
-                    eprintln!(
-                        "\x1b[33m⚠ Goal auto-paused due to network error. Use /goal resume when network is restored.\x1b[0m"
-                    );
-                }
-                Err(Box::new(error))
-            }
-        }
-    }
-
-    pub(crate) fn run_turn_with_output(
-        &mut self,
-        input: &str,
-        output_format: CliOutputFormat,
-        compact: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        match output_format {
-            CliOutputFormat::Json if compact => self.run_prompt_compact_json(input),
-            CliOutputFormat::Text if compact => self.run_prompt_compact(input),
-            CliOutputFormat::Text => self.run_turn(input),
-            CliOutputFormat::Json => self.run_prompt_json(input),
-        }
-    }
-
-    fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(false)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
-        hook_abort_monitor.stop();
-        let summary = result?;
-        self.replace_runtime(runtime)?;
-        self.persist_session()?;
-        let final_text = final_assistant_text(&summary);
-        println!("{final_text}");
-        Ok(())
-    }
-
-    /// Web（`claw serve`）用：跑一轮但不写终端输出；审批由调用方提供的 prompter 决定，
-    /// 流式事件通过 `set_status_emitter` 注入的回调输出。
-    pub(crate) fn run_turn_silent_with(
-        &mut self,
-        input: &str,
-        prompter: &mut dyn runtime::PermissionPrompter,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(false)?;
-        let result = runtime.run_turn(input, Some(prompter));
-        hook_abort_monitor.stop();
-        let _summary = result?;
-        self.replace_runtime(runtime)?;
-        self.persist_session()?;
-        Ok(())
-    }
-
-    fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(false)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
-        hook_abort_monitor.stop();
-        let summary = result?;
-        self.replace_runtime(runtime)?;
-        self.persist_session()?;
-        println!(
-            "{}",
-            json!({
-                "message": final_assistant_text(&summary),
-                "compact": true,
-                "model": self.model,
-                "usage": {
-                    "input_tokens": summary.usage.input_tokens,
-                    "output_tokens": summary.usage.output_tokens,
-                    "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
-                    "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
-                },
-            })
-        );
-        Ok(())
-    }
-
-    fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(false)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
-        hook_abort_monitor.stop();
-        let summary = result?;
-        self.replace_runtime(runtime)?;
-        self.persist_session()?;
-        println!(
-            "{}",
-            json!({
-                "message": final_assistant_text(&summary),
-                "model": self.model,
-                "iterations": summary.iterations,
-                "auto_compaction": summary.auto_compaction.map(|event| json!({
-                    "removed_messages": event.removed_message_count,
-                    "notice": format_auto_compaction_notice(event.removed_message_count),
-                })),
-                "tool_uses": collect_tool_uses(&summary),
-                "tool_results": collect_tool_results(&summary),
-                "prompt_cache_events": collect_prompt_cache_events(&summary),
-                "usage": {
-                    "input_tokens": summary.usage.input_tokens,
-                    "output_tokens": summary.usage.output_tokens,
-                    "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
-                    "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
-                },
-                "estimated_cost": format_usd(
-                    summary.usage.estimate_cost_usd_with_pricing(
-                        pricing_for_model(&self.model)
-                            .unwrap_or_else(runtime::ModelPricing::default_sonnet_tier)
-                    ).total_cost_usd()
-                )
-            })
-        );
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_lines)]
-    pub(crate) fn handle_repl_command(
-        &mut self,
-        command: SlashCommand,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        Ok(match command {
-            SlashCommand::Help => {
-                let mut help = render_repl_help();
-                let plugin_commands = commands::discover_plugin_commands(&self.workspace);
-                if !plugin_commands.is_empty() {
-                    help.push_str("\n\nPlugin commands (from enabled plugins)\n");
-                    for plugin_command in &plugin_commands {
-                        help.push_str(&format!(
-                            "  /{}  {}\n",
-                            plugin_command.name,
-                            plugin_command.description.as_deref().unwrap_or("")
-                        ));
-                    }
-                }
-                if !self.tui_println(&help) {
-                    println!("{help}");
-                }
-                false
-            }
-            SlashCommand::Status => {
-                self.print_status();
-                false
-            }
-            SlashCommand::Bughunter { scope } => {
-                self.run_bughunter(scope.as_deref())?;
-                false
-            }
-            SlashCommand::Commit => {
-                self.run_commit(None)?;
-                false
-            }
-            SlashCommand::Pr { context } => {
-                self.run_pr(context.as_deref())?;
-                false
-            }
-            SlashCommand::Issue { context } => {
-                self.run_issue(context.as_deref())?;
-                false
-            }
-            SlashCommand::Ultraplan { task } => {
-                // Step 2.1:对接 runtime planner。
-                // 返回 true 表示 plan mode 状态变更,需要 persist session。
-                self.run_ultraplan(task.as_deref())?;
-                true
-            }
-            SlashCommand::Upgrade => {
-                // 热升级(双大脑收官基石):优雅中断当前 turn + 写升级标记。
-                // 设 upgrade_pending 信号 → run_turn 循环检测后注入暂停通知,
-                // turn 自然收尾(状态已实时落盘)→ persist plan + 写标记。
-                // 用户随后执行:mv claw.exe claw.exe.old → cargo build → 启动新进程。
-                self.run_upgrade()?;
-                false
-            }
-            SlashCommand::Teleport { target } => {
-                Self::run_teleport(target.as_deref())?;
-                false
-            }
-            SlashCommand::DebugToolCall => {
-                self.run_debug_tool_call(None)?;
-                false
-            }
-            SlashCommand::Sandbox => {
-                self.print_sandbox_status();
-                false
-            }
-            SlashCommand::Voice { mode } => {
-                crate::voice::run_voice_input(self, mode.as_deref())?;
-                false
-            }
-            SlashCommand::Listen { duration } => {
-                crate::voice::run_voice_input(self, duration.as_deref())?;
-                false
-            }
-            SlashCommand::Compact => {
-                self.compact()?;
-                false
-            }
-            SlashCommand::Model { model } => self.set_model(model)?,
-            SlashCommand::DetectionStrategy {
-                strategy,
-                dry_run,
-                verify,
-            } => self.set_detection_strategy(strategy, dry_run, verify)?,
-            SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
-            SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
-            SlashCommand::Cost => {
-                self.print_cost();
-                false
-            }
-            SlashCommand::Resume { session_path } => self.resume_session(session_path)?,
-            SlashCommand::Config { section } => {
-                self.print_config(section.as_deref())?;
-                false
-            }
-            SlashCommand::Mcp { action, target } => {
-                let args = match (action.as_deref(), target.as_deref()) {
-                    (None, None) => None,
-                    (Some(action), None) => Some(action.to_string()),
-                    (Some(action), Some(target)) => Some(format!("{action} {target}")),
-                    (None, Some(target)) => Some(target.to_string()),
-                };
-                self.print_mcp(args.as_deref(), CliOutputFormat::Text)?;
-                false
-            }
-            SlashCommand::Memory { action, target } => {
-                self.print_memory(action.as_deref(), target.as_deref())?;
-                false
-            }
-            SlashCommand::Init => {
-                let cwd = env::current_dir()?;
-                let report = initialize_repo(&cwd, false)?;
-                let message = report.render();
-                if !self.tui_println(&message) {
-                    println!("{message}");
-                }
-                false
-            }
-            SlashCommand::InitForce => {
-                let cwd = env::current_dir()?;
-                let report = initialize_repo(&cwd, true)?;
-                let message = report.render();
-                if !self.tui_println(&message) {
-                    println!("{message}");
-                }
-                false
-            }
-            SlashCommand::Diff => {
-                self.print_diff()?;
-                false
-            }
-            SlashCommand::Search { query } => {
-                let q = query.as_deref().unwrap_or("");
-                let session = self.runtime.session();
-                let results = crate::session_mgr::search_session_history(session, q);
-                let output = if results.is_empty() {
-                    format!("Search\n  Query           {q}\n  Result           no matches found")
-                } else {
-                    let mut s = format!(
-                        "Search\n  Query           {q}\n  Matches          {}\n\n",
-                        results.len()
-                    );
-                    for (i, (idx, preview)) in results.iter().take(20).enumerate() {
-                        s.push_str(&format!("  {}. [msg {idx}] {preview}\n", i + 1));
-                    }
-                    if results.len() > 20 {
-                        s.push_str(&format!("\n  ... and {} more matches", results.len() - 20));
-                    }
-                    s
-                };
-                if !self.tui_println(&output) {
-                    println!("{output}");
-                }
-                false
-            }
-            SlashCommand::Undo => {
-                let session = self.runtime.session();
-                let message = crate::session_mgr::undo_last_file_edit(session);
-                if !self.tui_println(&message) {
-                    println!("{message}");
-                }
-                // Persist session so any subsequent re-loads see a consistent
-                // state (the undo wrote to disk; nothing changes in the
-                // session history itself, but saving keeps timestamps fresh).
-                let _ = self.persist_session();
-                false
-            }
-            SlashCommand::Version => {
-                Self::print_version(CliOutputFormat::Text);
-                false
-            }
-            SlashCommand::Export { path } => {
-                self.export_session(path.as_deref())?;
-                false
-            }
-            SlashCommand::Session { action, target } => {
-                self.handle_session_command(action.as_deref(), target.as_deref())?
-            }
-            SlashCommand::Plugins { action, target } => {
-                self.handle_plugins_command(action.as_deref(), target.as_deref())?
-            }
-            SlashCommand::Agents { args } => {
-                self.print_agents(args.as_deref(), CliOutputFormat::Text)?;
-                false
-            }
-            SlashCommand::Skills { args } => {
-                match classify_skills_slash_command(args.as_deref()) {
-                    SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt)?,
-                    SkillSlashDispatch::Local => {
-                        self.print_skills(args.as_deref(), CliOutputFormat::Text)?;
-                    }
-                }
-                false
-            }
-            SlashCommand::Doctor => {
-                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                let content = render_doctor_report()?.render();
-                if !self.tui_println(&content) {
-                    println!("{content}");
-                }
-                false
-            }
-            SlashCommand::History { count } => {
-                self.print_prompt_history(count.as_deref());
-                false
-            }
-            SlashCommand::Stats => {
-                let usage = UsageTracker::from_session(self.runtime.session()).cumulative_usage();
-                let report = format_cost_report(usage);
-                if !self.tui_println(&report) {
-                    println!("{report}");
-                }
-                false
-            }
-            SlashCommand::Summary => {
-                let report =
-                    crate::session_mgr::render_session_summary_text(self.runtime.session());
-                if !self.tui_println(&report) {
-                    println!("{report}");
-                }
-                false
-            }
-            SlashCommand::Context { action } => {
-                // /context [clear]:仅支持查看;clear 提示使用 /clear。
-                if let Some(action) = action.as_deref() {
-                    let msg = if action == "clear" {
-                        "Context\n  Hint             use /clear to reset the session transcript"
-                            .to_string()
-                    } else {
-                        format!("Context\n  Unsupported action {action}")
-                    };
-                    if !self.tui_println(&msg) {
-                        println!("{msg}");
-                    }
-                    return Ok(false);
-                }
-                let report = crate::session_mgr::render_context_report(self.runtime.session());
-                if !self.tui_println(&report) {
-                    println!("{report}");
-                }
-                false
-            }
-            SlashCommand::Usage { .. } => {
-                let usage = self.runtime.usage();
-                let report = crate::session_mgr::render_usage_report(
-                    Some(&self.model),
-                    usage.cumulative_usage(),
-                    usage.current_turn_usage(),
-                    usage.turns(),
-                );
-                if !self.tui_println(&report) {
-                    println!("{report}");
-                }
-                false
-            }
-            SlashCommand::Poor { action } => {
-                let (_, message) = handle_poor_mode_action(action.as_deref());
-                if !self.tui_println(&message) {
-                    println!("{message}");
-                }
-                false
-            }
-            SlashCommand::Goal { args } => {
-                let message = handle_goal_command(&mut self.goal_manager, args.as_deref());
-                if !self.tui_println(&message) {
-                    println!("{message}");
-                }
-                false
-            }
-            SlashCommand::Bg { args } => {
-                // Tier S #2 后台会话：REPL 模式下查询/管理后台进程。
-                // 与 resume 模式共用 handle_bg_command，通过文件系统通信。
-                let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                let (message, _json) = handle_bg_command(args.as_deref(), &cwd);
-                if !self.tui_println(&message) {
-                    println!("{message}");
-                }
-                false
-            }
-            SlashCommand::Im { args } => {
-                // IM Bridge: show status, config, or startup instructions.
-                let (message, _json) = handle_im_command(args.as_deref());
-                if !self.tui_println(&message) {
-                    println!("{message}");
-                }
-                false
-            }
-            SlashCommand::Bus { args } => {
-                // 会话互通：列出 Session Bus 对等会话与状态 / 发送 / 订阅。
-                let message = handle_bus_command(args.as_deref(), &self.session.id);
-                if !self.tui_println(&message) {
-                    println!("{message}");
-                }
-                false
-            }
-            // /effort [low|medium|high|off] — 运行时调整 reasoning effort。
-            // 无参数：显示当前值；off：清除（恢复默认）；low/medium/high：设置。
-            // 设置后立即生效于下一次 API 请求，TUI 侧栏会同步显示。
-            SlashCommand::Effort { level } => {
-                let msg = match level.as_deref().map(str::trim) {
-                    None => {
-                        let current = self
-                            .reasoning_effort()
-                            .map(|v| format!("当前思考强度: {v}"))
-                            .unwrap_or_else(|| "当前思考强度: 默认（未设置）".to_string());
-                        format!("{current}\n用法: /effort low|medium|high|off")
-                    }
-                    Some("") => {
-                        let current = self
-                            .reasoning_effort()
-                            .map(|v| format!("当前思考强度: {v}"))
-                            .unwrap_or_else(|| "当前思考强度: 默认（未设置）".to_string());
-                        format!("{current}\n用法: /effort low|medium|high|off")
-                    }
-                    Some("off") | Some("default") | Some("none") => {
-                        self.set_reasoning_effort(None);
-                        "思考强度已清除（恢复默认）".to_string()
-                    }
-                    Some("low") | Some("medium") | Some("high") => {
-                        self.set_reasoning_effort(level.clone());
-                        format!(
-                            "思考强度已设置为: {}",
-                            level.as_ref().expect("match arm guarantees Some")
-                        )
-                    }
-                    Some(other) => {
-                        format!(
-                            "无效的思考强度: '{other}'\n有效值: low | medium | high | off\n用法: /effort low|medium|high|off"
-                        )
-                    }
-                };
-                if !self.tui_println(&msg) {
-                    println!("{msg}");
-                }
-                false
-            }
-            // /thinking [on|off] — DeepSeek 思考模式开关。
-            // on  → 发送 thinking: {"type":"enabled"}
-            // off → 发送 thinking: {"type":"disabled"} (非思考模式,省输出 token)
-            // 无参 → 显示当前状态。
-            SlashCommand::Thinking { enabled } => {
-                let msg = match enabled {
-                    None => {
-                        let current = self
-                            .thinking_mode()
-                            .map(|v| if v { "开启" } else { "关闭" });
-                        match current {
-                            Some(state) => format!("当前思考模式: {state}\n用法: /thinking on|off"),
-                            None => {
-                                "当前思考模式: 默认（跟随模型，DeepSeek 默认开启）\n用法: /thinking on|off"
-                                    .to_string()
-                            }
-                        }
-                    }
-                    Some(true) => {
-                        self.set_thinking_mode(Some(true));
-                        "思考模式已开启 (thinking: enabled)".to_string()
-                    }
-                    Some(false) => {
-                        self.set_thinking_mode(Some(false));
-                        "思考模式已关闭 (thinking: disabled)，后续请求将节省输出 token".to_string()
-                    }
-                };
-                if !self.tui_println(&msg) {
-                    println!("{msg}");
-                }
-                false
-            }
-            SlashCommand::Keybindings => {
-                let text = keybindings_help();
-                if !self.tui_println(&text) {
-                    println!("{text}");
-                }
-                false
-            }
-            SlashCommand::Files => {
-                let text = list_workspace_files();
-                if !self.tui_println(&text) {
-                    println!("{text}");
-                }
-                false
-            }
-            SlashCommand::Tasks { args } => {
-                let text = list_tasks(args.as_deref());
-                if !self.tui_println(&text) {
-                    println!("{text}");
-                }
-                false
-            }
-            SlashCommand::Exit => {
-                // REPL/TUI 的输入层直接拦截 /exit；这里是脚本或降级路径。
-                let msg = "退出：REPL 用 /exit 或 Ctrl+D，TUI 用 Esc（空输入）/ Ctrl+D。";
-                if !self.tui_println(msg) {
-                    println!("{msg}");
-                }
-                false
-            }
-            SlashCommand::Vim => {
-                // 正常路径由 REPL/TUI 输入层拦截（需要就地切换编辑器状态）。
-                let msg =
-                    "vim 模式：直接输入 /vim 切换（TUI 即时生效，REPL 写入设置后下次启动生效）。";
-                if !self.tui_println(msg) {
-                    println!("{msg}");
-                }
-                false
-            }
-            SlashCommand::Copy { target } => {
-                let mode = target.as_deref().unwrap_or("last").trim();
-                let text = if mode == "all" {
-                    render_export_text(self.runtime.session())
-                } else {
-                    last_assistant_text(self.runtime.session())
-                };
-                let msg = deliver_to_clipboard(&text);
-                if !self.tui_println(&msg) {
-                    println!("{msg}");
-                }
-                false
-            }
-            SlashCommand::Fast => {
-                let target = if self.model.contains("flash") {
-                    "pro"
-                } else {
-                    "flash"
-                };
-                self.set_model(Some(target.to_string()))?;
-                false
-            }
-            SlashCommand::Feedback => {
-                let last_user = last_user_text(self.runtime.session());
-                let msg = write_feedback_entry(&self.session.id, &self.model, &last_user);
-                if !self.tui_println(&msg) {
-                    println!("{msg}");
-                }
-                false
-            }
-            SlashCommand::Login
-            | SlashCommand::Logout
-            | SlashCommand::Share
-            | SlashCommand::Desktop
-            | SlashCommand::Brief
-            | SlashCommand::Advisor
-            | SlashCommand::Stickers
-            | SlashCommand::Insights
-            | SlashCommand::Thinkback
-            | SlashCommand::ReleaseNotes
-            | SlashCommand::SecurityReview
-            | SlashCommand::PrivacySettings
-            | SlashCommand::Plan { .. }
-            | SlashCommand::Review { .. }
-            | SlashCommand::Theme { .. }
-            | SlashCommand::Rename { .. }
-            | SlashCommand::Hooks { .. }
-            | SlashCommand::Color { .. }
-            | SlashCommand::Branch { .. }
-            | SlashCommand::Rewind { .. }
-            | SlashCommand::Ide { .. }
-            | SlashCommand::Tag { .. }
-            | SlashCommand::AddDir { .. } => {
-                let cmd_name = command.slash_name();
-                let msg =
-                    format!("{cmd_name} 在本构建未启用（单人自用精简版）；/help 查看已支持命令。");
-                if !self.tui_println(&msg) {
-                    eprintln!("{msg}");
-                }
-                false
-            }
-            SlashCommand::OutputStyle { style } => {
-                if let Some(verbosity) = style.as_deref().and_then(OutputVerbosity::from_style_arg)
-                {
-                    self.output_verbosity = verbosity;
-                    let msg = format!("Output style set to: {}", verbosity.label());
-                    if !self.tui_println(&msg) {
-                        println!("{msg}");
-                    }
-                } else {
-                    let current = self.output_verbosity.label();
-                    let msg = format!(
-                        "Current output style: {current}\nAvailable styles: full, compact, silent, minimal\nUsage: /output-style [style]"
-                    );
-                    if !self.tui_println(&msg) {
-                        println!("Current output style: {current}");
-                        println!(
-                            "Available styles: full, compact, silent, minimal\nUsage: /output-style [style]"
-                        );
-                    }
-                }
-                false
-            }
-            SlashCommand::Unknown { name, arguments } => {
-                // 插件命令：命中就渲染成普通回合执行；未命中仍是未知命令。
-                if let Some(plugin_command) = commands::find_plugin_command(&self.workspace, &name)
-                {
-                    let prompt = commands::render_plugin_command(
-                        &plugin_command,
-                        arguments.as_deref(),
-                        &self.workspace,
-                    );
-                    let previous_model = self.model.clone();
-                    let previous_tools = self.allowed_tools.clone();
-                    if let Some(model) = &plugin_command.model {
-                        self.model = resolve_model_alias(model).to_string();
-                    }
-                    if !plugin_command.allowed_tools.is_empty() {
-                        self.allowed_tools = Some(AllowedToolSet::from_iter(
-                            plugin_command.allowed_tools.iter().cloned(),
-                        ));
-                    }
-                    let result = self.run_turn(&prompt);
-                    self.model = previous_model;
-                    self.allowed_tools = previous_tools;
-                    result?;
-                    return Ok(false);
-                }
-                let msg = format_unknown_slash_command(&name);
-                if !self.tui_println(&msg) {
-                    eprintln!("{msg}");
-                }
-                false
-            }
-        })
-    }
-
-    pub(crate) fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.runtime.session().save_to_path(&self.session.path)?;
-        Ok(())
-    }
-
-    /// 当前会话的持久化文件路径（session JSONL）。
-    /// 供 TUI 历史回看从文件流式重放。
-    pub(crate) fn session_file_path(&self) -> std::path::PathBuf {
-        self.session.path.clone()
-    }
-
-    fn print_status(&self) {
-        let cumulative = self.runtime.usage().cumulative_usage();
-        let latest = self.runtime.usage().current_turn_usage();
-        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-        let content = format_status_report(
-            &self.model,
-            StatusUsage {
-                message_count: self.runtime.session().messages.len(),
-                turns: self.runtime.usage().turns(),
-                latest,
-                cumulative,
-                estimated_tokens: self.runtime.estimated_tokens(),
-            },
-            self.permission_mode.as_str(),
-            &status_context(Some(&self.session.path)).expect("status context should load"),
-            None, // #148: REPL /status doesn't carry flag provenance
-        );
-        if !self.tui_println(&content) {
-            println!("{content}");
-        }
-    }
-
-    fn record_prompt_history(&mut self, prompt: &str) {
-        let timestamp_ms = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .map_or(self.runtime.session().updated_at_ms, |duration| {
-                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-            });
-        let entry = PromptHistoryEntry {
-            timestamp_ms,
-            text: prompt.to_string(),
-        };
-        self.prompt_history.push(entry);
-        if let Err(error) = self.runtime.session_mut().push_prompt_entry(prompt) {
-            eprintln!("warning: failed to persist prompt history: {error}");
-        }
-    }
-
-    fn print_prompt_history(&self, count: Option<&str>) {
-        let limit = match parse_history_count(count) {
-            Ok(limit) => limit,
-            Err(message) => {
-                eprintln!("{message}");
-                return;
-            }
-        };
-        let session_entries = &self.runtime.session().prompt_history;
-        let entries = if session_entries.is_empty() {
-            if self.prompt_history.is_empty() {
-                collect_session_prompt_history(self.runtime.session())
-            } else {
-                self.prompt_history
-                    .iter()
-                    .map(|entry| PromptHistoryEntry {
-                        timestamp_ms: entry.timestamp_ms,
-                        text: entry.text.clone(),
-                    })
-                    .collect()
-            }
-        } else {
-            session_entries
-                .iter()
-                .map(|entry| PromptHistoryEntry {
-                    timestamp_ms: entry.timestamp_ms,
-                    text: entry.text.clone(),
-                })
-                .collect()
-        };
-        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-        let content = render_prompt_history_report(&entries, limit);
-        if !self.tui_println(&content) {
-            println!("{content}");
-        }
-    }
-
-    fn print_sandbox_status(&self) {
-        let cwd = env::current_dir().expect("current dir");
-        let loader = ConfigLoader::default_for(&cwd);
-        let runtime_config = loader
-            .load()
-            .unwrap_or_else(|_| runtime::RuntimeConfig::empty());
-        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-        let content =
-            format_sandbox_report(&resolve_sandbox_status(runtime_config.sandbox(), &cwd));
-        if !self.tui_println(&content) {
-            println!("{content}");
-        }
-    }
-
-    fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
-        let Some(model) = model else {
-            let message = format_model_report(
-                &self.model,
-                self.runtime.session().messages.len(),
-                self.runtime.usage().turns(),
-            );
-            self.print_out(&message);
-            return Ok(false);
-        };
-
-        let model = resolve_model_alias_with_config(&model);
-
-        if model == self.model {
-            let message = format_model_report(
-                &self.model,
-                self.runtime.session().messages.len(),
-                self.runtime.usage().turns(),
-            );
-            self.print_out(&message);
-            return Ok(false);
-        }
-
-        let previous = self.model.clone();
-        let session = self.runtime.session().clone();
-        let message_count = session.messages.len();
-        let runtime = build_runtime(
-            session,
-            &self.session.id,
-            model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            &self.workspace,
-        )?;
-        self.replace_runtime(runtime)?;
-        self.model.clone_from(&model);
-        self.print_out(&format_model_switch_report(
-            &previous,
-            &model,
-            message_count,
-        ));
-        Ok(true)
-    }
-
-    /// 输出一条提示：TUI 下走面板，非 TUI 下回落 stdout。
-    fn print_out(&self, message: &str) {
-        if !self.tui_println(message) {
-            println!("{message}");
-        }
-    }
-
-    fn set_permissions(
-        &mut self,
-        mode: Option<String>,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        let Some(mode) = mode else {
-            println!(
-                "{}",
-                format_permissions_report(self.permission_mode.as_str())
-            );
-            return Ok(false);
-        };
-
-        let normalized = normalize_permission_mode(&mode).ok_or_else(|| {
-            format!(
-                "unsupported permission mode '{mode}'. Use read-only, workspace-write, or danger-full-access."
-            )
-        })?;
-
-        if normalized == self.permission_mode.as_str() {
-            println!("{}", format_permissions_report(normalized));
-            return Ok(false);
-        }
-
-        let previous = self.permission_mode.as_str().to_string();
-        let session = self.runtime.session().clone();
-        self.permission_mode = permission_mode_from_label(normalized);
-        let runtime = build_runtime(
-            session,
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            &self.workspace,
-        )?;
-        self.replace_runtime(runtime)?;
-        println!(
-            "{}",
-            format_permissions_switch_report(&previous, normalized)
-        );
-        Ok(true)
-    }
-
-    /// v3 §4.7:`/detection-strategy` 命令处理 — 运行时切换决策检测策略。
-    ///
-    /// - 无参数:打印当前策略
-    /// - `heuristic`:切换为启发式(零成本)
-    /// - `llm`:切换为 LLM 提取(使用默认 flash 模型)
-    /// - `llm:<model>`:切换为 LLM 提取并指定模型
-    /// - `--dry-run`:预览切换结果而不实际应用(可与 strategy 组合)
-    /// - `--verify`:校验 DecisionExtractorClient 注册状态
-    ///
-    /// flag 组合行为见 `parse_detection_strategy_args` 文档。
-    /// 采用方案 A(直接 setter),不重建 runtime,因 `detection_strategy` 是简单字段。
-    /// 切换到 `LlmExtract` 但未注册 client 时,提取逻辑会自动 3 路降级为 Heuristic。
-    fn set_detection_strategy(
-        &mut self,
-        strategy: Option<String>,
-        dry_run: bool,
-        verify: bool,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        let Some(rt) = self.runtime.runtime.as_mut() else {
-            return Err("runtime not initialized".into());
-        };
-
-        let current = rt.detection_strategy().clone();
-        let client_registered = runtime::is_decision_extractor_client_registered();
-
-        // --verify 单独或组合使用:打印 client 注册校验报告
-        // 若同时指定了 strategy,verify 在 dry-run/实际切换前先报告
-        if verify && strategy.is_none() && !dry_run {
-            // 仅 --verify:只校验当前 client
-            let report = format_detection_strategy_verify_report(&current, client_registered);
-            if !self.tui_println(&report) {
-                println!("{report}");
-            }
-            return Ok(false);
-        }
-
-        let Some(strategy_arg) = strategy else {
-            // 无 strategy 且无 verify:打印当前策略
-            if !verify {
-                let report = format_detection_strategy_report(&current);
-                if !self.tui_println(&report) {
-                    println!("{report}");
-                }
-                return Ok(false);
-            }
-            // --verify + --dry-run 但无 strategy:打印当前策略 + verify
-            let report = format_detection_strategy_report(&current);
-            let verify_report =
-                format_detection_strategy_verify_report(&current, client_registered);
-            let combined = format!("{report}\n\n{verify_report}");
-            if !self.tui_println(&combined) {
-                println!("{combined}");
-            }
-            return Ok(false);
-        };
-
-        let new_strategy = parse_detection_strategy(&strategy_arg).ok_or_else(|| {
-            format!(
-                "unsupported detection strategy '{strategy_arg}'. Use heuristic, llm, or llm:<model>."
-            )
-        })?;
-
-        // --dry-run:仅预览,不应用
-        if dry_run {
-            let report = format_detection_strategy_dry_run_report(
-                &current,
-                &new_strategy,
-                client_registered,
-            );
-            // 若同时 --verify,追加 verify 报告
-            let final_report = if verify {
-                let verify_report =
-                    format_detection_strategy_verify_report(&new_strategy, client_registered);
-                format!("{report}\n\n{verify_report}")
-            } else {
-                report
-            };
-            if !self.tui_println(&final_report) {
-                println!("{final_report}");
-            }
-            return Ok(false);
-        }
-
-        // 实际切换
-        if new_strategy == current {
-            let report = format_detection_strategy_report(&new_strategy);
-            if !self.tui_println(&report) {
-                println!("{report}");
-            }
-            return Ok(false);
-        }
-
-        rt.set_detection_strategy(new_strategy.clone());
-        let switch_report = format_detection_strategy_switch_report(&current, &new_strategy);
-        if !self.tui_println(&switch_report) {
-            println!("{switch_report}");
-        }
-        Ok(true)
-    }
-
-    fn clear_session(&mut self, confirm: bool) -> Result<bool, Box<dyn std::error::Error>> {
-        if !confirm {
-            // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-            let content =
-                "clear: confirmation required; run /clear --confirm to start a fresh session.";
-            if !self.tui_println(content) {
-                println!("{content}");
-            }
-            return Ok(false);
-        }
-
-        let previous_session = self.session.clone();
-        let session_state = new_cli_session_in(&self.workspace)?;
-        self.session =
-            create_managed_session_handle_in(&self.workspace, &session_state.session_id)?;
-        let runtime = build_runtime(
-            session_state.with_persistence_path(self.session.path.clone()),
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            &self.workspace,
-        )?;
-        // 会话切换边界：旧会话记忆先收尾（0 等待），再替换 runtime。
-        self.runtime
-            .on_memory_boundary(runtime::memory_extract::MemorySessionBoundary::Switched);
-        self.replace_runtime(runtime)?;
-        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-        let content = format!(
-            "Session cleared\n  Mode             fresh session\n  Previous session {}\n  Resume previous  /resume {}\n  Preserved model  {}\n  Permission mode  {}\n  New session      {}\n  Session file     {}",
-            previous_session.id,
-            previous_session.id,
-            self.model,
-            self.permission_mode.as_str(),
-            self.session.id,
-            self.session.path.display(),
-        );
-        if !self.tui_println(&content) {
-            println!("{content}");
-        }
-        Ok(true)
-    }
-
-    fn print_cost(&self) {
-        let cumulative = self.runtime.usage().cumulative_usage();
-        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-        let content = format_cost_report(cumulative);
-        if !self.tui_println(&content) {
-            println!("{content}");
-        }
-    }
-
-    /// Web 写入通道（`claw serve` 子进程）用：从磁盘会话恢复后继续跑。
-    pub(crate) fn resume_from_path(
-        &mut self,
-        session_path: &std::path::Path,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        self.resume_session(Some(session_path.to_string_lossy().to_string()))
-    }
-
-    fn resume_session(
-        &mut self,
-        session_path: Option<String>,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        let Some(session_ref) = session_path else {
-            let usage = render_resume_usage();
-            if !self.tui_println(&usage) {
-                println!("{usage}");
-            }
-            return Ok(false);
-        };
-
-        let (handle, mut session) = load_session_reference_in(&self.workspace, &session_ref)?;
-        // 上次 turn 若在工具执行中被中断（进程被杀/卡死），会话末尾会留下
-        // 没有 tool_result 的 tool_use，API 会以 400 拒绝续聊。恢复时补齐。
-        session.repair_dangling_tool_uses();
-        let message_count = session.messages.len();
-        let session_id = session.session_id.clone();
-        let runtime = build_runtime(
-            session,
-            &handle.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            &self.workspace,
-        )?;
-        self.runtime
-            .on_memory_boundary(runtime::memory_extract::MemorySessionBoundary::Switched);
-        self.replace_runtime(runtime)?;
-        self.session = SessionHandle {
-            id: session_id,
-            path: handle.path,
-        };
-        let report = format_resume_report(
-            &self.session.path.display().to_string(),
-            message_count,
-            self.runtime.usage().turns(),
-        );
-        if !self.tui_println(&report) {
-            println!("{report}");
-        }
-        Ok(true)
-    }
-
-    fn print_config(&self, section: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-        let content = render_config_report(section)?;
-        if !self.tui_println(&content) {
-            println!("{content}");
-        }
-        Ok(())
-    }
-
-    fn print_memory(
-        &self,
-        action: Option<&str>,
-        target: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let content = match action {
-            None | Some("") | Some("list") => render_memory_report()?,
-            Some("search") => {
-                let needle = target.unwrap_or("").trim();
-                if needle.is_empty() {
-                    "用法：/memory search <关键词>".to_string()
-                } else {
-                    render_memory_search(needle)?
-                }
-            }
-            Some("show") => {
-                let index = parse_memory_index(target);
-                render_memory_detail(index)?
-            }
-            Some("rm") | Some("delete") => {
-                let index = parse_memory_index(target);
-                if index == 0 {
-                    "用法：/memory rm <条目编号>".to_string()
-                } else {
-                    retract_memory_entry(index)?
-                }
-            }
-            Some("undo") => undo_memory_retraction()?,
-            Some("review") => {
-                let limit = target
-                    .and_then(|value| value.trim().parse::<usize>().ok())
-                    .filter(|&n| n > 0);
-                render_memory_review(limit)?
-            }
-            Some(other) => format!(
-                "未知 memory 子命令：{other}\n用法：/memory [list|review [n]|show <n>|search <kw>|rm <n>|undo]"
-            ),
-        };
-        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-        if !self.tui_println(&content) {
-            println!("{content}");
-        }
-        Ok(())
-    }
-
-    pub(crate) fn print_agents(
-        &self,
-        args: Option<&str>,
-        output_format: CliOutputFormat,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let cwd = env::current_dir()?;
-        match output_format {
-            CliOutputFormat::Text => {
-                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                let content = handle_agents_slash_command(args, &cwd)?;
-                if !self.tui_println(&content) {
-                    println!("{content}");
-                }
-            }
-            CliOutputFormat::Json => {
-                let content =
-                    serde_json::to_string_pretty(&handle_agents_slash_command_json(args, &cwd)?)?;
-                if !self.tui_println(&content) {
-                    println!("{content}");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn print_mcp(
-        &self,
-        args: Option<&str>,
-        output_format: CliOutputFormat,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // `claw mcp serve` starts a stdio MCP server exposing claw's built-in
-        // tools. All other `mcp` subcommands fall through to the existing
-        // configured-server reporter (`list`, `status`, ...).
-        if matches!(args.map(str::trim), Some("serve")) {
-            return run_mcp_serve();
-        }
-        let cwd = env::current_dir()?;
-        match output_format {
-            CliOutputFormat::Text => {
-                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                let content = handle_mcp_slash_command(args, &cwd)?;
-                if !self.tui_println(&content) {
-                    println!("{content}");
-                }
-            }
-            CliOutputFormat::Json => {
-                let value = handle_mcp_slash_command_json(args, &cwd)?;
-                // Propagate ok:false → non-zero exit so automation callers
-                // can rely on exit code instead of inspecting the envelope.
-                // (#68: mcp error envelopes previously always exited 0.)
-                let is_error = value.get("ok").and_then(|v| v.as_bool()) == Some(false);
-                let content = serde_json::to_string_pretty(&value)?;
-                if !self.tui_println(&content) {
-                    println!("{content}");
-                }
-                if is_error {
-                    std::process::exit(1);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn print_skills(
-        &self,
-        args: Option<&str>,
-        output_format: CliOutputFormat,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let cwd = env::current_dir()?;
-        match output_format {
-            CliOutputFormat::Text => {
-                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                let content = handle_skills_slash_command(args, &cwd)?;
-                if !self.tui_println(&content) {
-                    println!("{content}");
-                }
-            }
-            CliOutputFormat::Json => {
-                let content =
-                    serde_json::to_string_pretty(&handle_skills_slash_command_json(args, &cwd)?)?;
-                if !self.tui_println(&content) {
-                    println!("{content}");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn print_plugins(
-        action: Option<&str>,
-        target: Option<&str>,
-        output_format: CliOutputFormat,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let cwd = env::current_dir()?;
-        let payload = plugins_command_payload_for(&cwd, action, target)?;
-        match output_format {
-            CliOutputFormat::Text => println!("{}", payload.message),
-            CliOutputFormat::Json => println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "kind": "plugin",
-                    "action": action.unwrap_or("list"),
-                    "target": target,
-                    "status": payload.status,
-                    "config_load_error": payload.config_load_error,
-                    "message": payload.message,
-                    "reload_runtime": payload.reload_runtime,
-                    "plugins": payload.plugins,
-                    "load_failures": payload.load_failures,
-                }))?
-            ),
-        }
-        Ok(())
-    }
-
-    fn print_diff(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-        let content = render_diff_report()?;
-        if !self.tui_println(&content) {
-            println!("{content}");
-        }
-        Ok(())
-    }
-
-    fn print_version(output_format: CliOutputFormat) {
-        let _ = crate::print_version(output_format);
-    }
-
-    fn export_session(
-        &self,
-        requested_path: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let export_path = resolve_export_path(requested_path, self.runtime.session())?;
-        fs::write(&export_path, render_export_text(self.runtime.session()))?;
-        println!(
-            "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
-            export_path.display(),
-            self.runtime.session().messages.len(),
-        );
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn handle_session_command(
-        &mut self,
-        action: Option<&str>,
-        target: Option<&str>,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        match action {
-            None | Some("list") => {
-                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                let content = render_session_list(&self.session.id)?;
-                if !self.tui_println(&content) {
-                    println!("{content}");
-                }
-                Ok(false)
-            }
-            Some("pick") => {
-                // TUI 模式下不支持交互式 stdin 选择（会卡死 worker 线程），
-                // 回退为显示会话列表，提示用户用 /session switch <id> 切换。
-                if !io::stdin().is_terminal() {
-                    let content = render_session_list(&self.session.id)?;
-                    if !self.tui_println(&content) {
-                        println!("{content}");
-                    }
-                    return Ok(false);
-                }
-                match interactive_session_pick(&self.session.id)? {
-                    Some(picked) => {
-                        let target_id = picked.id.clone();
-                        let target_path = picked.path.clone();
-                        // Reuse the existing switch logic by delegating to
-                        // load_session_reference + replace_runtime.
-                        let (handle, session) = load_session_reference(&target_id)?;
-                        let message_count = session.messages.len();
-                        let session_id = session.session_id.clone();
-                        let runtime = build_runtime(
-                            session,
-                            &handle.id,
-                            self.model.clone(),
-                            self.system_prompt.clone(),
-                            true,
-                            true,
-                            self.allowed_tools.clone(),
-                            self.permission_mode,
-                            None,
-                            &self.workspace,
-                        )?;
-                        self.replace_runtime(runtime)?;
-                        self.session = SessionHandle {
-                            id: session_id,
-                            path: handle.path,
-                        };
-                        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                        let content = format!(
-                            "Session switched\n  Active session   {}\n  File             {}\n  Messages         {}",
-                            self.session.id,
-                            target_path.display(),
-                            message_count,
-                        );
-                        if !self.tui_println(&content) {
-                            println!("{content}");
-                        }
-                        Ok(true)
-                    }
-                    None => {
-                        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                        let content = "Session pick cancelled.";
-                        if !self.tui_println(content) {
-                            println!("{content}");
-                        }
-                        Ok(false)
-                    }
-                }
-            }
-            Some("exists") => {
-                let Some(target) = target else {
-                    // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                    let content = "Usage: /session exists <session-id>";
-                    if !self.tui_println(content) {
-                        println!("{content}");
-                    }
-                    return Ok(false);
-                };
-                let exists = session_reference_exists(target)?;
-                let handle = resolve_session_reference(target).ok();
-                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                let content = format!(
-                    "Session exists\n  Session          {target}\n  Exists           {exists}{}",
-                    handle
-                        .as_ref()
-                        .map(|handle| format!("\n  File             {}", handle.path.display()))
-                        .unwrap_or_default()
-                );
-                if !self.tui_println(&content) {
-                    println!("{content}");
-                }
-                Ok(false)
-            }
-            Some("switch") => {
-                let Some(target) = target else {
-                    // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                    let content = "Usage: /session switch <session-id>";
-                    if !self.tui_println(content) {
-                        println!("{content}");
-                    }
-                    return Ok(false);
-                };
-                let (handle, session) = load_session_reference(target)?;
-                let message_count = session.messages.len();
-                let session_id = session.session_id.clone();
-                let runtime = build_runtime(
-                    session,
-                    &handle.id,
-                    self.model.clone(),
-                    self.system_prompt.clone(),
-                    true,
-                    true,
-                    self.allowed_tools.clone(),
-                    self.permission_mode,
-                    None,
-                    &self.workspace,
-                )?;
-                self.replace_runtime(runtime)?;
-                self.session = SessionHandle {
-                    id: session_id,
-                    path: handle.path,
-                };
-                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                let content = format!(
-                    "Session switched\n  Active session   {}\n  File             {}\n  Messages         {}",
-                    self.session.id,
-                    self.session.path.display(),
-                    message_count,
-                );
-                if !self.tui_println(&content) {
-                    println!("{content}");
-                }
-                Ok(true)
-            }
-            Some("fork") => {
-                let forked = self.runtime.fork_session(target.map(ToOwned::to_owned));
-                let parent_session_id = self.session.id.clone();
-                let handle = create_managed_session_handle_in(&self.workspace, &forked.session_id)?;
-                let branch_name = forked
-                    .fork
-                    .as_ref()
-                    .and_then(|fork| fork.branch_name.clone());
-                let forked = forked.with_persistence_path(handle.path.clone());
-                let message_count = forked.messages.len();
-                forked.save_to_path(&handle.path)?;
-                let runtime = build_runtime(
-                    forked,
-                    &handle.id,
-                    self.model.clone(),
-                    self.system_prompt.clone(),
-                    true,
-                    true,
-                    self.allowed_tools.clone(),
-                    self.permission_mode,
-                    None,
-                    &self.workspace,
-                )?;
-                self.replace_runtime(runtime)?;
-                self.session = handle;
-                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                let content = format!(
-                    "Session forked\n  Parent session   {}\n  Active session   {}\n  Branch           {}\n  File             {}\n  Messages         {}",
-                    parent_session_id,
-                    self.session.id,
-                    branch_name.as_deref().unwrap_or("(unnamed)"),
-                    self.session.path.display(),
-                    message_count,
-                );
-                if !self.tui_println(&content) {
-                    println!("{content}");
-                }
-                Ok(true)
-            }
-            Some("delete") => {
-                let Some(target) = target else {
-                    // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                    let content = "Usage: /session delete <session-id> [--force]";
-                    if !self.tui_println(content) {
-                        println!("{content}");
-                    }
-                    return Ok(false);
-                };
-                let handle = resolve_session_reference(target)?;
-                if handle.id == self.session.id {
-                    // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                    let content = format!(
-                        "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
-                        handle.id
-                    );
-                    if !self.tui_println(&content) {
-                        println!("{content}");
-                    }
-                    return Ok(false);
-                }
-                if !confirm_session_deletion(&handle.id) {
-                    // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                    let content = "delete: cancelled.";
-                    if !self.tui_println(content) {
-                        println!("{content}");
-                    }
-                    return Ok(false);
-                }
-                delete_managed_session(&handle.path)?;
-                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                let content = format!(
-                    "Session deleted\n  Deleted session  {}\n  File             {}",
-                    handle.id,
-                    handle.path.display(),
-                );
-                if !self.tui_println(&content) {
-                    println!("{content}");
-                }
-                Ok(false)
-            }
-            Some("delete-force") => {
-                let Some(target) = target else {
-                    // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                    let content = "Usage: /session delete <session-id> [--force]";
-                    if !self.tui_println(content) {
-                        println!("{content}");
-                    }
-                    return Ok(false);
-                };
-                let handle = resolve_session_reference(target)?;
-                if handle.id == self.session.id {
-                    // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                    let content = format!(
-                        "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
-                        handle.id
-                    );
-                    if !self.tui_println(&content) {
-                        println!("{content}");
-                    }
-                    return Ok(false);
-                }
-                delete_managed_session(&handle.path)?;
-                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                let content = format!(
-                    "Session deleted\n  Deleted session  {}\n  File             {}",
-                    handle.id,
-                    handle.path.display(),
-                );
-                if !self.tui_println(&content) {
-                    println!("{content}");
-                }
-                Ok(false)
-            }
-            Some(other) => {
-                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-                let content = format!(
-                    "Unknown /session action '{other}'. Use /session list, /session exists <session-id>, /session switch <session-id>, /session fork [branch-name], or /session delete <session-id> [--force]."
-                );
-                if !self.tui_println(&content) {
-                    println!("{content}");
-                }
-                Ok(false)
-            }
-        }
-    }
-
-    fn handle_plugins_command(
-        &mut self,
-        action: Option<&str>,
-        target: Option<&str>,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        let cwd = env::current_dir()?;
-        let payload = plugins_command_payload_for(&cwd, action, target)?;
-        println!("{}", payload.message);
-        if payload.reload_runtime {
-            self.reload_runtime_features()?;
-        }
-        Ok(false)
-    }
-
-    fn reload_runtime_features(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let runtime = build_runtime(
-            self.runtime.session().clone(),
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            &self.workspace,
-        )?;
-        self.replace_runtime(runtime)?;
-        self.persist_session()
-    }
-
-    fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let result = self.runtime.compact(CompactionConfig::default());
-        let removed = result.removed_message_count;
-        let kept = result.compacted_session.messages.len();
-        let skipped = removed == 0;
-        let runtime = build_runtime(
-            result.compacted_session,
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            &self.workspace,
-        )?;
-        self.replace_runtime(runtime)?;
-        self.persist_session()?;
-        println!("{}", format_compact_report(removed, kept, skipped));
-        Ok(())
-    }
-
-    fn run_internal_prompt_text_with_progress(
-        &self,
-        prompt: &str,
-        enable_tools: bool,
-        progress: Option<InternalPromptProgressReporter>,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        let session = self.runtime.session().clone();
-        let mut runtime = build_runtime(
-            session,
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            enable_tools,
-            false,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            progress,
-            &self.workspace,
-        )?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
-        let text = final_assistant_text(&summary).trim().to_string();
-        runtime.shutdown_plugins()?;
-        Ok(text)
-    }
-
-    fn run_internal_prompt_text(
-        &self,
-        prompt: &str,
-        enable_tools: bool,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        self.run_internal_prompt_text_with_progress(prompt, enable_tools, None)
-    }
-
-    fn run_bughunter(&self, scope: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", format_bughunter_report(scope));
-        Ok(())
-    }
-
-    /// Step 2.1:对接 `/ultraplan` CLI 命令到 runtime planner。
-    ///
-    /// 行为:
-    /// - 启用 plan mode(本会话内生效,无需 `--enable-plan-mode` CLI flag)。
-    /// - 设置 workspace_root(若未设置),用于 PlanArtifact 持久化到
-    ///   `<workspace>/.claw/plans/<id>.json`。
-    /// - 若提供 `task` → 立即触发 `run_turn(task)`,让模型在执行过程中
-    ///   自主判断是否调用 `create_plan` 创建 PlanArtifact(2026-08-16 起
-    ///   不再用启发式规则自动创建)。PlanArtifact 通过末尾追加到
-    ///   dynamic_sections 注入,不污染缓存绝对/半稳定区(§5.2 缓存保护)。
-    /// - 若未提供 `task` → 仅打印提示信息,等用户后续输入触发 plan。
-    ///
-    /// 与 `--enable-plan-mode` CLI flag 的区别:
-    /// - `--enable-plan-mode`:整个会话启用 plan mode,所有复杂任务都触发。
-    /// - `/ultraplan`:本会话启用 plan mode,且若提供 task 则立即触发一次。
-    fn run_ultraplan(&mut self, task: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        // 启用 plan mode(若已启用则幂等)。
-        self.runtime.set_plan_mode_enabled(true);
-        // 设置 workspace_root(若未设置)— 用于 PlanArtifact 持久化。
-        if self.runtime.active_plan().is_none() {
-            // 只有 runtime 没有活跃 plan 时才设置,避免覆盖已有 workspace。
-            // 通过检查 workspace_root 是否已设置决定。
-            // 注意:runtime 没有公开 workspace_root() getter,这里保守地
-            // 总是设置(若已设置会被相同值覆盖,无副作用)。
-            let cwd = std::env::current_dir()?;
-            self.runtime.set_workspace_root(cwd);
-        }
-
-        let plan_enabled_msg = "Plan mode enabled. The model decides when to create a plan (via create_plan) for complex tasks, then follows the Plan→Execute→Review cycle.";
-        if !self.tui_println(plan_enabled_msg) {
-            println!("{plan_enabled_msg}");
-        }
-
-        if let Some(task) = task.map(str::trim).filter(|s| !s.is_empty()) {
-            // 有 task → 立即触发 run_turn。复杂任务判定交给模型:模型判断
-            // 需要时可调用 create_plan 创建 PlanArtifact,run_turn 会处理
-            // plan 的整个生命周期(Plan → Execute → Review → Replan/AllPassed/Failed)。
-            self.run_turn(task)?;
-        } else {
-            // 无 task → 仅启用 plan mode,提示用户后续输入。
-            let hint = "Now enter your task. The model will decide whether to create a plan (via create_plan) for complex tasks.";
-            if !self.tui_println(hint) {
-                println!("{hint}");
-            }
-        }
-        Ok(())
-    }
-
-    /// 热升级一键化(双大脑收官基石 + 任务 2):优雅中断 + 写标记 + 自动迁移。
-    ///
-    /// 流程(无感衔接,无需用户介入):
-    /// 1. 置位 `upgrade_pending` 信号 → 正在执行的 turn 收尾(状态已落盘)。
-    /// 2. persist 活跃计划 → `.claw/plans/<id>.json`。
-    /// 3. 写升级标记 `.claw/upgrade-request.json`(含 old_pid)。
-    /// 4. spawn 自身副本 `--upgrade-helper`(新终端)→ helper 负责:
-    ///    mv claw.exe → claw.exe.old → cargo build → 启动新 claw.exe。
-    /// 5. persist 会话 + shutdown MCP/plugins。
-    /// 6. 写 `.claw/upgrade-exited.json`(告知 helper 旧进程即将退出)。
-    /// 7. exit(0)—— 新进程检测到标记 → resume session → restore plan → 继续任务。
-    fn run_upgrade(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // 1. 置位优雅中断信号(正在执行的 turn 将收尾)。
-        self.upgrade_signal
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-
-        // 2. persist 活跃计划(供新进程恢复)。
-        let mut plan_id = None;
-        if let Some(plan) = self.runtime.active_plan() {
-            if let Ok(cwd) = std::env::current_dir() {
-                if let Ok(path) = runtime::planner::persist_plan_artifact(plan, &cwd) {
-                    plan_id = Some(plan.id.clone());
-                    eprintln!("[upgrade] plan persisted: {}", path.display());
-                }
-            }
-        }
-
-        // 3. 写升级标记(含 old_pid;新进程启动检测 + helper 迁移)。
-        let cwd = std::env::current_dir()?;
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let old_pid = std::process::id();
-        let req = UpgradeRequest {
-            session_id: self.session.id.clone(),
-            plan_id,
-            requested_at_ms: now_ms,
-            from_version: crate::version_label(),
-            old_pid,
-            web_port: None,
-            web_token: None,
-        };
-        write_upgrade_request(&cwd, &req)?;
-
-        // 4. spawn 升级助手(独立进程,新终端显示编译输出)。
-        //    助手负责:等 exited → mv exe.old → cargo build → 启动新 claw。
-        crate::upgrade_helper::spawn(&cwd)?;
-
-        // 5. persist 会话(兜底;消息本已实时落盘)。
-        self.persist_session()?;
-
-        // 6. shutdown MCP + plugins(释放子进程资源,准备退出)。
-        let _ = self.runtime.shutdown_mcp();
-        let _ = self.runtime.shutdown_plugins();
-
-        // 7. 写"已退出"标记(helper 确认可开始迁移 exe),然后退出。
-        //    注:Windows 允许重命名运行中的 exe,helper 收到 exited 后立即
-        //    mv claw.exe → claw.exe.old,即使本进程尚未完全退出也安全。
-        write_upgrade_exited(&cwd, old_pid)?;
-
-        let msg = format!(
-            "热升级已启动(自动,无需手动操作):\n\
-             - session={} plan={} old_pid={}\n\
-             - 升级助手已在独立窗口运行:备份 exe → cargo build → 启动新进程\n\
-             - 新进程将自动 resume 会话并继续任务(无感衔接)\n\
-             【本进程即将退出】",
-            req.session_id,
-            req.plan_id.as_deref().unwrap_or("(无活跃计划)"),
-            old_pid,
-        );
-        if !self.tui_println(&msg) {
-            println!("{msg}");
-        }
-        std::process::exit(0);
-    }
-
-    /// 新进程启动检测(双大脑收官基石):检测热升级标记并恢复旧任务。
-    ///
-    /// 新 claw.exe 启动时调用:若 `.claw/upgrade-request.json` 存在(且未过期),
-    /// 则:
-    /// 1. 用 `session_id` resume 旧会话(会话消息已在 jsonl 落盘)。
-    /// 2. 若标记含 `plan_id`,从 `.claw/plans/<plan_id>.json` 恢复活跃计划。
-    /// 3. 注入"继续任务通知"给 LLM(下一 turn 可见)。
-    /// 4. 清理升级标记(幂等)。
-    ///
-    /// 陈旧标记(> [`UPGRADE_REQUEST_STALE_MS`])视为崩溃残留,忽略并清理,
-    /// 降级为普通启动。返回是否成功恢复(供调用方打日志)。
-    /// 返回 `Some(notice)`:成功 resume,`notice` 是"继续任务"提示文本,**尚未**
-    /// 注入 session —— 由调用方作为首轮输入交给 `run_turn`(它内部会 push)。
-    /// 这样新进程才会**真正开跑新一轮**,而不是把通知排进队列却无人消费。
-    pub(crate) fn maybe_resume_from_upgrade(
-        &mut self,
-    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-        let cwd = std::env::current_dir()?;
-        let Some(req) = read_upgrade_request(&cwd) else {
-            return Ok(None); // 无升级标记,普通启动
-        };
-        // 陈旧标记(崩溃残留)→ 忽略并清理,降级为普通启动。
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        if now_ms.saturating_sub(req.requested_at_ms) > crate::session_mgr::UPGRADE_REQUEST_STALE_MS
-        {
-            eprintln!(
-                "[upgrade] stale upgrade request ignored (age {}ms > {}ms)",
-                now_ms.saturating_sub(req.requested_at_ms),
-                crate::session_mgr::UPGRADE_REQUEST_STALE_MS
-            );
-            clear_upgrade_request(&cwd);
-            return Ok(None);
-        }
-
-        // 1. 恢复旧会话(复用 load_session_reference:session_id 是合法 reference)。
-        //    热升级是"同会话进程切换",恢复的是旧会话完整消息;若直接全部塞回,
-        //    历史极长(尤其经历过多次热升级累积)时模型会倾向复述历史。因此这里
-        //    对超长会话先压缩(摘要 + 保留最近消息),与普通会话压缩行为一致:
-        //    避免无条件把全部历史塞回新 runtime 而引发历史复述刷屏。
-        let (handle, session) = load_session_reference(&req.session_id)?;
-        // 仅对超过压缩预算的会话做压缩;短会话(未达阈值)保持原样,行为与
-        // 普通恢复一致(compact_session_with_trigger 内部对未达阈值直接返回原 session)。
-        let compacted = runtime::compact::compact_session_with_trigger(
-            &session,
-            runtime::compact::CompactionConfig::default(),
-            runtime::compact::CompactTrigger::Reactive,
-        );
-        let session_for_runtime = compacted.compacted_session;
-        let session_id = session.session_id.clone();
-        let runtime = build_runtime(
-            session_for_runtime,
-            &handle.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            &self.workspace,
-        )?;
-        if compacted.removed_message_count > 0 {
-            crate::diag_log(&format!(
-                "[upgrade] resume session '{}' compacted {} old messages (kept tail): {}",
-                session_id,
-                compacted.removed_message_count,
-                compacted.summary.chars().count()
-            ));
-        }
-        self.runtime
-            .on_memory_boundary(runtime::memory_extract::MemorySessionBoundary::Switched);
-        self.replace_runtime(runtime)?;
-        self.session = SessionHandle {
-            id: session_id,
-            path: handle.path,
-        };
-
-        // 2. 恢复活跃计划(若有)。
-        let mut restored_plan_id = None;
-        if let Some(plan_id) = &req.plan_id {
-            let plan_path = cwd
-                .join(".claw")
-                .join("plans")
-                .join(format!("{plan_id}.json"));
-            match runtime::planner::load_plan_artifact(&plan_path) {
-                Ok(plan) => {
-                    self.runtime.restore_active_plan(plan);
-                    restored_plan_id = Some(plan_id.clone());
-                }
-                Err(e) => eprintln!(
-                    "[upgrade] plan '{plan_id}' load failed: {e}; continuing without plan"
-                ),
-            }
-        }
-
-        // 3. 构造"继续任务通知"。**不在此处注入 session** —— 若在此 push 成一条
-        //    user 消息就返回,新进程会落入 REPL 的 read_line / TUI 事件循环
-        //    阻塞等待用户输入,该通知永远无人消费,"自动续跑"从未发生。
-        //    改为把它**返回**给调用方,由启动路径作为首轮输入交给 run_turn
-        //    (run_turn 内部 conversation.rs:3837 会自行 push_user_text,
-        //    故此处绝不能再 push,否则双重注入)。
-        let notice = match (&restored_plan_id, &req.from_version) {
-            (Some(plan_id), _) => format!(
-                "[runtime] 热升级完成：新版本已接管此会话 ({from} → {current})，会话与计划已恢复 \
-                 (plan={plan_id})。请从上次收尾处继续执行当前任务。",
-                from = req.from_version,
-                current = crate::version_label()
-            ),
-            (None, _) => format!(
-                "[runtime] 热升级完成：新版本已接管此会话 ({from} → {current})，会话已恢复 \
-                 (旧进程无活跃计划)。请从上次收尾处继续执行当前任务。",
-                from = req.from_version,
-                current = crate::version_label()
-            ),
-        };
-
-        // 3b. 热升级是"同会话进程切换"而非"新会话开始":旧进程(含历史版本)
-        // 可能已在收尾时标记了 NOTEBOOK <plan> stale(见 run_turn 收尾段的
-        // mark_plan_stale_if_content)。该标记的语义是"下一**新会话**首 turn
-        // 提醒刷新 plan";热升级 resume 同一 session_id,模型上下文由历史消息
-        // 完整承载,plan 也由 restore_active_plan 恢复 —— 残留 stale 标记只会
-        // 让续跑会话每个 turn 注入 Session Handoff 刷新催促(纯冗余 token)。
-        // 此处清除标记(幂等),使热升级续跑与进程内继续等价。
-        // 失败静默:最坏情况是多提醒一次,无副作用。
-        runtime::notebook::clear_plan_stale(&cwd);
-
-        // 4. 清理升级标记(幂等)。
-        clear_upgrade_request(&cwd);
-
-        let report = format!(
-            "[upgrade] 热升级恢复完成：session={} plan={} (from {})。",
-            req.session_id,
-            restored_plan_id.as_deref().unwrap_or("(none)"),
-            req.from_version,
-        );
-        if !self.tui_println(&report) {
-            println!("{report}");
-        }
-        Ok(Some(notice))
-    }
-
-    fn run_teleport(target: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(target) = target.map(str::trim).filter(|value| !value.is_empty()) else {
-            println!("Usage: /teleport <symbol-or-path>");
-            return Ok(());
-        };
-
-        println!("{}", render_teleport_report(target)?);
-        Ok(())
-    }
-
-    fn run_debug_tool_call(&self, args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        validate_no_args("/debug-tool-call", args)?;
-        println!("{}", render_last_tool_debug_report(self.runtime.session())?);
-        Ok(())
-    }
-
-    fn run_commit(&mut self, args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        validate_no_args("/commit", args)?;
-        let status = git_output(&["status", "--short", "--branch"])?;
-        let summary = parse_git_workspace_summary(Some(&status));
-        let branch = parse_git_status_branch(Some(&status));
-        if summary.is_clean() {
-            println!("{}", format_commit_skipped_report());
-            return Ok(());
-        }
-
-        println!(
-            "{}",
-            format_commit_preflight_report(branch.as_deref(), summary)
-        );
-        Ok(())
-    }
-
-    fn run_pr(&self, context: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        let branch =
-            resolve_git_branch_for(&self.workspace).unwrap_or_else(|| "unknown".to_string());
-        println!("{}", format_pr_report(&branch, context));
-        Ok(())
-    }
-
-    fn run_issue(&self, context: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", format_issue_report(context));
-        Ok(())
-    }
-
-    /// 挂载状态事件出口，在后续每轮 prepare_turn_runtime 时注入新建的
-    /// client 与工具执行器（TUI 与 Web 共用）。
-    pub(crate) fn set_status_emitter(&mut self, emitter: crate::streaming::StatusEmitter) {
-        self.status_emitter = Some(emitter);
-    }
-
-    /// 解除已挂载的状态事件出口。
-    pub(crate) fn clear_status_emitter(&mut self) {
-        self.status_emitter = None;
-    }
-
-    /// 取消当前正在执行的 turn（TUI Ctrl+C / Web「停止」共用）。
-    /// 通过 abort hook_abort_signal，agent loop 在下一次迭代顶部检测到
-    /// 后退出；bash 轮询循环同时（≤100ms）终止子进程树。
-    /// 返回 true 表示已发送取消信号，false 表示当前没有正在执行的 turn。
-    pub(crate) fn abort_current_turn(&mut self) -> bool {
-        if let Some(signal) = &self.current_abort_signal {
-            signal.abort();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// 设置外部 abort signal。
-    /// 调用方在启动本轮执行前调用此方法，传入 abort signal 的 clone。
-    /// prepare_turn_runtime 会优先使用此 signal，让调用方在 turn 执行期间
-    /// 取消当前 turn。turn 结束后由 clear_external_abort_signal 清空。
-    pub(crate) fn set_external_abort_signal(&mut self, signal: runtime::HookAbortSignal) {
-        self.external_abort_signal = Some(signal);
-    }
-
-    /// S3-M2:设置会话级进程登记表（Web worker 每会话一份，跨轮复用）。
-    pub(crate) fn set_session_processes(
-        &mut self,
-        processes: std::sync::Arc<runtime::process_registry::SessionProcesses>,
-    ) {
-        self.session_processes = Some(processes);
-    }
-
-    /// 清空外部 abort signal（turn 结束后调用）。
-    pub(crate) fn clear_external_abort_signal(&mut self) {
-        self.external_abort_signal = None;
-    }
-
-    /// CLI 输出统一走 stdout：此方法恒返回 false，调用方回退到 `println!`。
-    pub(crate) fn tui_println(&self, _msg: &str) -> bool {
-        false
-    }
-}
-
-// ===== Block B: build_system_prompt / load_prompt_extras / is_broad_working_directory (main.rs lines 2626-2750) =====
+// ===== 系统提示装配 =====
 
 thread_local! {
     /// D1: 规范化 cwd → 共享 `ProjectTopology`。让 `build_system_prompt`
@@ -3162,8 +73,6 @@ pub(crate) fn build_system_prompt(
     // load_prompt_extras 里的 is_server_spawned("rust") 恒为 false,
     // render_with_lsp(跨模块语义重要性)永远不会生效。
     // best-effort:未配置 lspServers 或 spawn 失败时不阻断启动。
-    // 注:build_runtime 阶段会再次调用 init_lsp_from_config,
-    // 对已 spawn 的语言返回 "already spawned" 错误,被忽略,无害。
     let loader = ConfigLoader::default_for(&cwd);
     if let Ok(config) = loader.load() {
         let _ = init_lsp_from_config(&config, &cwd);
@@ -3182,12 +91,12 @@ pub(crate) fn build_system_prompt(
     // 系统提示词日期用启动时的真实日期(而非编译期 BUILD_DATE):
     // 编译期日期跨天后即失真;本函数仅在会话启动时调用一次,session 内字节稳定。
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let result = load_system_prompt_with_extras(
+    let result = runtime::load_system_prompt_with_extras(
         cwd,
         &today,
         env::consts::OS,
         "unknown",
-        model_family_identity_for(model),
+        api::model_family_identity_for(model),
         extras,
     )?;
     crate::diag_log("[build_system_prompt] load_system_prompt_with_extras OK");
@@ -3640,7 +549,7 @@ pub(crate) fn is_broad_working_directory(cwd: &Path) -> bool {
     !has_project_marker
 }
 
-// ===== Block C: build_runtime / build_runtime_with_plugin_state / CliHookProgressReporter / CliPermissionPrompter (main.rs lines 2761-2938) =====
+// ===== 运行时构建 =====
 
 /// design-gaps #5:从 `GlobalToolRegistry` 生成子 agent 工具签名目录。
 ///
@@ -3648,10 +557,6 @@ pub(crate) fn is_broad_working_directory(cwd: &Path) -> bool {
 /// `SubagentCapability::allowed_tools()`),与注册表一致,无需映射;
 /// `## Available Tools` 层展示的可调用名与 guard / API 工具定义全链路统一。
 /// 描述取自注册表(`mvp_tool_specs` 单源真值,避免静态表描述漂移)。
-///
-/// `ConversationRuntime::build_subagent_context` 随后再按 capability 过滤
-/// (ReadOnly 取只读子集,Execute 取全量)。`repomap` / `lsp_diagnostics` 未
-/// 在注册表注册,自然不会出现在目录中。
 fn subagent_tool_catalog(registry: &GlobalToolRegistry) -> Vec<runtime::ToolSummary> {
     let allowed: BTreeSet<String> = runtime::multi_agent::SubagentCapability::Execute
         .allowed_tools()
@@ -3676,10 +581,8 @@ pub(crate) fn build_runtime(
     model: String,
     system_prompt: Vec<String>,
     enable_tools: bool,
-    emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    progress_reporter: Option<InternalPromptProgressReporter>,
     workspace: &Path,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let runtime_plugin_state = build_runtime_plugin_state_for(workspace)?;
@@ -3689,75 +592,34 @@ pub(crate) fn build_runtime(
         model,
         system_prompt,
         enable_tools,
-        emit_output,
         allowed_tools,
         permission_mode,
-        progress_reporter,
         runtime_plugin_state,
         workspace,
     )
 }
 
-/// 构造主/子 agent 的 API client(**深度后端路由**)。
-///
-/// - `--model deepseek-web`:走 web-bridge 网页后端(登录态、零 Token)。
-///   复用 tools 注册表把可用工具渲染成增强提示,回复解析出的工具调用仍由
-///   runtime 的 agent 循环执行(工具/权限/MCP/斜杠命令全部复用)。
-/// - 其余模型:默认 API provider(`AnthropicRuntimeClient`)。
+/// 构造主/子 agent 的 API client。
 ///
 /// 返回 `Box<dyn runtime::ApiClient>`,`ConversationRuntime` 的泛型 slot
-/// 已 box 成 trait object,两种后端可在运行时切换。
+/// 已 box 成 trait object。
 fn build_api_client(
     session_id: &str,
     model: &str,
     enable_tools: bool,
-    emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
-    progress_reporter: Option<InternalPromptProgressReporter>,
 ) -> Result<Box<dyn runtime::ApiClient>, Box<dyn std::error::Error>> {
-    if model == crate::WEB_MODEL_NAME {
-        let auth = web_bridge::web_session::WebAuth::load()
-            .map_err(|e| format!("--model {} 需要已登录的网页凭证:{e}", crate::WEB_MODEL_NAME))?;
-        // TUI(emit_output=false)下必须 gate stderr:stray write 会打到
-        // alternate screen,输出被 crossterm 读回输入行,污染用户消息
-        // (2026-09-18 TUI 实测:用户输入前缀被混入"[deepseek-web] ..."碎片)。
-        if emit_output {
-            eprintln!("[deepseek-web] 使用 chat.deepseek.com 登录态凭证(零 Token)");
-        }
-        return Ok(Box::new(web_bridge::WebApiClient::new(Box::new(
-            web_bridge::deepseek_web::DeepseekWebClient::new(auth),
-        ))));
-    }
-    // 混合分工已停用(2026-10-03):曾把轻量回合路由到网页端零 token,但网页端
-    // 高频调用被 DeepSeek 官方风控、账号被禁两天。所有请求一律走 API 端;
-    // `--model deepseek-web` 仍为显式完整网页模式(见上分支)。
     let mut client = AnthropicRuntimeClient::new(
         session_id,
         model.to_string(),
         enable_tools,
-        emit_output,
         allowed_tools,
         tool_registry,
-        progress_reporter,
     )?;
     // P0-2:上游不返回 prompt cache 时,全量工具 schema 会在每次迭代重复
-    // prefill。实测(2026-11-20):主会话静态前缀 = 85 个工具 / 58 667 字符,
-    // 而 `.claw/telemetry.jsonl` 的 7 779 次 tool_execution_finished 中,
-    // **36 个工具从未被调用过**(Config/Cron*/Worker*/Team*/Mcp* 等),
-    // 49 个被用过。即固定前缀里约 42% 的体积对应零使用工具。
-    //
-    // 原实现仅对 `trae/` 前缀模型开启,但实跑模型经 alias 解析后是
-    // `deepseek-flash`(见 prompt-cache dumps 的 model 字段),该门恒不成立
-    // ⇒ 渐进式加载对当前 provider 从未生效,85 个工具全额注入。
-    //
-    // 改为:**默认对主会话开启**,`RUSTY_CLAUDE_PROGRESSIVE_TOOLS=0` 显式关闭。
-    // 安全性由两点保证:
-    //  1. `progressive_always_injected_tool_names()` 已包含 prompt 明文要求的
-    //     记忆/计划类工具与 ToolSearch,不存在"看到指引却调不到工具";
-    //  2. ToolSearch 是常驻出口,长尾工具可按需发现后激活(见
-    //     conversation.rs 的 activate_tool 链路)。
-    // 子智能体不受影响:其 client 以 `enable_tools=false` 构造,本门不进入。
+    // prefill。改为:**默认对主会话开启**,
+    // `RUSTY_CLAUDE_PROGRESSIVE_TOOLS=0` 显式关闭。
     if enable_tools
         && std::env::var("RUSTY_CLAUDE_PROGRESSIVE_TOOLS").map_or(true, |value| {
             !(value == "0" || value.eq_ignore_ascii_case("false"))
@@ -3809,10 +671,8 @@ pub(crate) fn build_runtime_with_plugin_state(
     model: String,
     mut system_prompt: Vec<String>,
     enable_tools: bool,
-    emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    progress_reporter: Option<InternalPromptProgressReporter>,
     runtime_plugin_state: RuntimePluginState,
     workspace: &Path,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
@@ -3845,9 +705,6 @@ pub(crate) fn build_runtime_with_plugin_state(
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
     // Phase 4：提前创建 ProjectTopology 实例，供 CliToolExecutor 和 ConversationRuntime 共享。
-    // 之前 CliToolExecutor 和 ConversationRuntime 各自独立，topology 只在 runtime 构造后注入，
-    // 导致 CliToolExecutor 调用 refactor_algorithm_topo 时没有 topology 实例可用。
-    // 现在提前创建，共享同一个 Arc。
     // D1:改用线程局部注册表按规范化 cwd 复用 build_system_prompt 已构造的实例
     // （同一 cwd 下不重复建，多个 build_runtime 调用点共享同一拓扑）。
     let shared_topology = Some(topology_for(workspace));
@@ -3855,24 +712,20 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 稍后用于构造独立的 subagent api_client(DAG dispatch 用)。
     // AnthropicRuntimeClient 不是 Clone(内含 tokio::runtime::Runtime),只能重建。
     let model_for_subagent = model.clone();
-    // P0(2026-08-13 Pro 0813):为质量敏感的辅助 LLM 子件解析旗舰模型,
-    // 让 judge / summarizer / extractor / planner / research 吃到 Pro 0813 红利。
+    // P0:为质量敏感的辅助 LLM 子件解析旗舰模型。
     let quality_model = resolve_quality_model(&model_for_subagent);
     let api_client = build_api_client(
         session_id,
         &model,
         enable_tools,
-        emit_output,
         allowed_tools.clone(),
         tool_registry.clone(),
-        progress_reporter,
     )?;
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         api_client,
         CliToolExecutor::new(
             allowed_tools.clone(),
-            emit_output,
             tool_registry.clone(),
             mcp_state.clone(),
         )
@@ -3881,9 +734,6 @@ pub(crate) fn build_runtime_with_plugin_state(
         system_prompt,
         &feature_config,
     );
-    if emit_output {
-        runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
-    }
     // design-gaps #5:注入子 agent 工具签名目录。
     // 从 GlobalToolRegistry 生成(描述与 mvp_tool_specs 单源一致),
     // build_subagent_context 按 capability 白名单过滤后注入 Available Tools 层。
@@ -3892,24 +742,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     // (settings.json / .claw.json 等)的 mtime,变化则原子替换 hooks 配置,
     // 无需重启会话。加载失败(如 cwd 不可用)时静默保持默认行为。
     runtime = runtime.with_hooks_hot_reload(ConfigLoader::default_for(workspace.to_path_buf()));
-    // 建议2(统一收口):易变运行时内容不再经 ContextAssembler 注入
-    // system_prompt 变动区,统一由 runtime 内部的 render_runtime_hints
-    // 渲染成 messages 末尾的冻结槽位块(见 conversation.rs)。旧架构
-    // with_context_assembler / context_assembler 模块已删除,此处无需再注入。
     // P1-6 修复：注入 harness V(验证)层和 O(可观测性)层组件。
-    // 之前 VerifierAgent / TraceAnalyzer 实现完整但从未注入主流程，
-    // 导致 conversation.rs 中 `self.verifier_agent` / `self.trace_analyzer`
-    // 永远为 None，相关代码分支永远走 else 路径，harness 层形同虚设。
-    //
-    // 现在无条件注入：
-    // - VerifierAgent：内含 Rule + 可选 ModelJudge 两种 verifier。
-    //   Rule 执行 verify_command 检查 exit_code；ModelJudge(2026-08-13 P2)
-    //   在 step 无 verify_command 时用 pro 模型语义校验 tool_result 是否
-    //   满足 acceptance_criteria,填补「无可执行命令」验证盲区。
-    //   只在 `plan_mode_enabled && !plan.steps.is_empty()` 时被调用，
-    //   未启用 plan mode 时不会有副作用。
-    // - TraceAnalyzer：记录每次 turn 的 trace 数据（latency / failure_kind 等），
-    //   未来可用于 CSV 导出和失败模式聚类。
     let mut verifier_agent = runtime::VerifierAgent::new();
     match crate::llm_clients::DeepSeekJudgeClient::new(&quality_model, Some(1024)) {
         Ok(judge) => {
@@ -3923,14 +756,10 @@ pub(crate) fn build_runtime_with_plugin_state(
         .with_verifier_agent(verifier_agent)
         .with_trace_analyzer(runtime::TraceAnalyzer::new());
     // design-gaps #2:注入 self-evolving harness archive。
-    // 让会话运行时每 evolution_interval turn 自动执行 weakness mining +
-    // 规则式 Proposer + 两重门控验证,失败教训跨会话沉淀。
     // 打开失败只静默跳过(archive 是可选增强,不应阻塞启动)。
     runtime = runtime.with_harness_evolution(workspace.to_path_buf());
-    // P0(2026-08-13 Pro 0813):注入 LLM harness Proposer(Phase 3)。
-    // 规则式 Proposer 未命中时,用 LLM 从失败模式提出新 harness 规则,
-    // 突破硬编码规则覆盖上限。构造失败(无 API key)静默跳过,
-    // 回退到纯规则式路径(零 LLM 调用)。
+    // P0:注入 LLM harness Proposer(Phase 3)。
+    // 构造失败(无 API key)静默跳过,回退到纯规则式路径(零 LLM 调用)。
     match crate::llm_clients::DeepSeekHarnessProposer::new(&quality_model, Some(512)) {
         Ok(proposer) => {
             runtime::harness_evolution::set_global_harness_proposer(std::sync::Arc::new(proposer));
@@ -3940,15 +769,6 @@ pub(crate) fn build_runtime_with_plugin_state(
         }
     }
     // Epic 2:注入 MultiAgentCoordinator,启用 subagent-as-tool 路由。
-    // 注入后,主 agent 可通过 dispatch_subagent tool 派发子 agent,
-    // 通过 check_subagent tool 查询状态/结果。子 agent 走独立 LLM 请求 +
-    // 独立 prompt cache,不污染主 agent 缓存(§5.2)。
-    // 详见 plan.md §9.2 Epic 2。
-    //
-    // Epic 3:同时构造 TaskRegistry 并共享同一份 coordinator 引用,
-    // 使 task 级元数据(状态/heartbeat/output)与 subagent 生命周期打通,
-    // 为 LaneBoard 监控和后续 Epic 4 lane_events 提供数据源。
-    // 详见 plan.md §9.2 Epic 3。
     let coordinator = runtime::MultiAgentCoordinator::new();
 
     // v2 Phase 2 Epic 4:启动恢复 — 扫描 .claw/checkpoints/*.json,
@@ -3978,12 +798,8 @@ pub(crate) fn build_runtime_with_plugin_state(
     }
 
     // v2 §10.5 多 ValidationGate:注册 rust/npm/pytest gate。
-    // 设计要点:
-    // - gate 用 file_filter 正则隔离,Rust 子 agent 改 .rs 只触发 cargo-build,
-    //   Node 子 agent 改 .ts/.tsx 只触发 npm-build,Python 同理 — 互不干扰
-    // - 命令不存在时跳过注册(避免 retryable=false 中止 validation 链),
-    //   借鉴 PATH 探测模式:有 cargo/npm/python 才注册对应 gate
-    // - 无 workspace_root 时全部跳过(CommandValidationGate 需要 cwd)
+    // 命令不存在时跳过注册(避免 retryable=false 中止 validation 链);
+    // 无 workspace_root 时全部跳过(CommandValidationGate 需要 cwd)。
     {
         let workspace_root = workspace.to_path_buf();
         if crate::command_exists("cargo") {
@@ -4003,14 +819,7 @@ pub(crate) fn build_runtime_with_plugin_state(
         }
 
         // v2 Phase 2 Epic 5:注册 LlmJudgeGate(诊断/架构任务的 LLM-as-judge 评分)。
-        //
-        // 设计要点:
-        // - judge 模型用质量敏感子件的旗舰模型(pro),保证判断质量(Pro 0813 红利)
-        // - max_tokens=1024(judge 只输出 0.0-1.0 分数 + 简短说明,1024 足够)
-        // - 构造失败(无 API key / 模型名无效)时跳过注册,不阻断启动
-        //   (降级为 MVP 行为:只有命令 gate,无 LLM judge)
-        // - 注入后,LlmJudgeGate::validate 会在命令 gate 之后执行,
-        //   对诊断/架构任务做四维评分(根因定位/方案可行性/完整性/副作用)
+        // 构造失败(无 API key / 模型名无效)时跳过注册,不阻断启动。
         match crate::llm_clients::DeepSeekJudgeClient::new(&quality_model, Some(1024)) {
             Ok(judge_client) => {
                 let judge: std::sync::Arc<dyn runtime::multi_agent::validation::JudgeClient> =
@@ -4030,37 +839,17 @@ pub(crate) fn build_runtime_with_plugin_state(
     }
 
     // v0.2 生产接入:保留一份 coordinator 的 Arc,用于构造 CoordinatorExecutor。
-    // coordinator 是 Clone(内部全 Arc<Mutex>),clone 后再 move 给 with_multi_agent_coordinator。
     let coordinator_arc = std::sync::Arc::new(coordinator.clone());
     runtime = runtime.with_multi_agent_coordinator(coordinator);
 
     // v2 Phase 2 Epic 6:注入全局 DecisionExtractorClient。
-    //
-    // 注入后,context compaction 触发时 `extract_decisions_before_compaction` 的
-    // `LlmExtract` 分支会真正调用 LLM 提取结构化决策点
-    // (context/decision/rationale/alternatives),而非降级为 Heuristic。
-    //
-    // 设计要点:
-    // - 用质量敏感子件的旗舰模型(pro):决策提取决定压缩后的记忆锚点保真,
-    //   低质提取会在压缩后丢关键决策(记忆丢失根因),故升级(Pro 0813 红利)
-    // - max_tokens=2048(决策提取需输出 JSON 数组,2048 容纳多决策点)
-    // - OnceLock 进程级单例,只能注册一次(重复调用静默忽略)
-    // - 构造失败(无 API key / 模型名无效)时跳过,不阻断启动
-    //   (降级为 Heuristic,保证不丢决策)
+    // 构造失败(无 API key / 模型名无效)时跳过,不阻断启动。
     match crate::llm_clients::DeepSeekDecisionExtractorClient::new(&quality_model, Some(2048)) {
         Ok(extractor) => {
             let extractor_client: std::sync::Arc<
                 dyn runtime::decision_log::DecisionExtractorClient,
             > = std::sync::Arc::new(extractor);
             runtime::decision_log::set_global_decision_extractor_client(extractor_client);
-            // v3 §4.7 端到端接入:client 注册成功后,把 runtime 的检测策略
-            // 从默认的 Heuristic 升级为 LlmExtract。这样 maybe_auto_compact
-            // 触发时会调用 LLM 提取结构化决策点(context/decision/rationale/
-            // alternatives),而非仅做关键词匹配。
-            //
-            // 失败时(client 未注册 / LLM 调用失败 / JSON 解析失败)自动 3 路降级
-            // 为 Heuristic,保证不阻塞 compaction(详见
-            // decision_log::extract_decisions_with_llm)。
             runtime = runtime.with_detection_strategy(
                 runtime::decision_log::DetectionStrategy::LlmExtract {
                     model: quality_model.clone(),
@@ -4073,17 +862,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     }
 
     // 知识新鲜度门控(Phase 1):注入全局 ResearchClient。
-    //
-    // 注入后,DAG 任务的 Novel 类(新版本/新论文)在派发前会触发联网调研
-    // (WebSearch + WebFetch + LLM 摘要),摘要注入 system prompt,避免
-    // 模型用过时参数知识自信地错答。Stable/Evolving 类不调研,零成本。
-    //
-    // 设计要点(镜像 DecisionExtractorClient 注入模式):
-    // - 用质量敏感子件的旗舰模型(pro):调研摘要质量直接影响诊断准确性
-    // - max_tokens=2048(摘要输出上限)
-    // - OnceLock 进程级单例,重复注册静默忽略
-    // - 构造失败(无 API key)时跳过,降级为不调研(不阻塞任务)
-    // - 网络失败/超时由 gate_task 降级为 None(不阻塞任务)
+    // 构造失败(无 API key)时跳过,降级为不调研(不阻塞任务)。
     match crate::llm_clients::WebResearchClient::new(&quality_model, Some(2048)) {
         Ok(researcher) => {
             let research_client: std::sync::Arc<dyn runtime::knowledge_freshness::ResearchClient> =
@@ -4096,16 +875,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     }
 
     // 知识新鲜度门控(Phase 2.1):注入全局 FreshnessAssessor。
-    //
-    // 注入后,关键词评估为 Evolving(不确定)的任务会调 flash 模型做语义细化,
-    // 区分"看似 Evolving 实则 Novel"(如冷门库新版本)和"确实 Stable"(如通用重构)。
-    // Novel/Stable(强信号)不调 LLM,零额外成本。
-    //
-    // 设计要点:
-    // - 用 budget 模型(评估任务对推理能力要求低,降成本)
-    // - max_tokens=256(只返回 JSON,不需要长输出)
-    // - OnceLock 进程级单例,重复注册静默忽略
-    // - 构造失败(无 API key)时跳过,降级为纯关键词评估(不阻塞任务)
+    // 构造失败(无 API key)时跳过,降级为纯关键词评估(不阻塞任务)。
     match crate::llm_clients::DeepSeekFreshnessAssessor::new(&model_for_subagent, Some(256)) {
         Ok(assessor) => {
             let assessor_client: std::sync::Arc<
@@ -4119,16 +889,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     }
 
     // 知识新鲜度门控(Phase 2.3):注入全局 QueryBuilderClient。
-    //
-    // 注入后,Novel 任务(需调研)的搜索查询由 LLM 从任务文本提取关键实体构建,
-    // 而非启发式截取前 200 字符。提升搜索命中率,调研摘要质量更高。
-    // LLM 提取失败时降级回启发式 build_research_query。
-    //
-    // 设计要点:
-    // - 用 budget 模型(提取任务对推理能力要求低,降成本)
-    // - max_tokens=128(只返回关键词,不需要长输出)
-    // - OnceLock 进程级单例,重复注册静默忽略
-    // - 构造失败(无 API key)时跳过,降级为启发式查询(不阻塞任务)
+    // 构造失败(无 API key)时跳过,降级为启发式查询(不阻塞任务)。
     match crate::llm_clients::DeepSeekQueryBuilderClient::new(&model_for_subagent, Some(128)) {
         Ok(builder) => {
             let builder_client: std::sync::Arc<
@@ -4142,19 +903,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     }
 
     // v1.0 LLM context editing:注入全局 CompactionSummarizerClient。
-    //
-    // 注入后,context compaction(`compact_session_with_trigger` →
-    // `summarize_messages_with_llm`)会调用 LLM 生成模型摘要(语义压缩),
-    // 而非启发式规则摘要;失败/未注入自动降级回启发式,不阻塞压缩。
-    //
-    // 设计要点:
-    // - 用主模型(flash)而非旗舰(pro):摘要输入是全量上下文的一次性 prompt,
-    //   前缀天然不可复用,缓存命中≈0(session-1786886590898 实测 0.14%,
-    //   22 分钟 3 次压缩 → 361K 全 miss,Pro 价格 ~10x)。摘要为模板化任务
-    //   (结构化 prompt + 解析失败自动降级启发式),flash 质量兜底已足够。
-    // - max_tokens=2048(摘要输出通常足够)
-    // - OnceLock 进程级单例,重复注册静默忽略
-    // - 构造失败(无 API key)时跳过,启动不失败
+    // 构造失败(无 API key)时跳过,启动不失败。
     match crate::llm_clients::DeepSeekCompactionSummarizerClient::new(
         &model_for_subagent,
         Some(2048),
@@ -4174,15 +923,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     }
 
     // D1.0 LLM-driven planning:注入全局 PlanGeneratorClient。
-    //
-    // 注入后,复杂任务(plan_mode + assess_complexity==Complex)由模型生成
-    // 计划步骤(JSON),失败/未注入自动回退启发式 decompose_task。
-    //
-    // 设计要点:
-    // - 用质量敏感子件的旗舰模型(pro):计划质量决定执行路径,plan 复杂任务
-    //   对推理要求高,故升级(Pro 0813 红利)
-    // - max_tokens=2048(计划 JSON 通常足够)
-    // - OnceLock 进程级单例,构造失败跳过,不阻断启动
+    // 构造失败跳过,不阻断启动。
     match crate::llm_clients::DeepSeekPlanGeneratorClient::new(&quality_model, Some(2048)) {
         Ok(planner_client) => {
             let planner_client: std::sync::Arc<dyn runtime::planner::PlanGeneratorClient> =
@@ -4215,23 +956,19 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 因 AnthropicRuntimeClient 不是 Clone(内含 tokio::runtime::Runtime),
     // 这里用之前 clone 的 model_for_subagent 重建一份独立的 client 给 subagent
     // dispatcher。subagent 走独立 LLM 请求 + 独立 prompt cache(§5.2 缓存保护),
-    // enable_tools=false(subagent system prompt 明确不需要工具),
-    // emit_output=false(避免子 agent 输出污染主 CLI),
-    // progress_reporter=None(subagent 不需要进度回调)。
+    // enable_tools=false(subagent system prompt 明确不需要工具)。
     let workspace_root = workspace.to_path_buf();
     if workspace_root.is_dir() {
         let subagent_api_client = build_api_client(
             session_id,
             &model_for_subagent,
             false, // enable_tools
-            false, // emit_output
             None,  // allowed_tools
             tool_registry.clone(),
-            None, // progress_reporter
         )?;
         // DAG 并行派发子代理的 tool executor:执行层白名单覆盖所有能力工具
         // (以 Execute 白名单为超集),实际能力分级过滤由 SubagentCapability
-        // 白名单在 process_tool_uses(Guard 2)完成。此前传 None → 子代理无工具。
+        // 白名单在 process_tool_uses(Guard 2)完成。
         let dag_tool_executor = tools::make_subagent_tool_executor(
             runtime::multi_agent::SubagentCapability::Execute
                 .allowed_tools()
@@ -4252,8 +989,6 @@ pub(crate) fn build_runtime_with_plugin_state(
 
     // v0.2 生产接入:把 CoordinatorExecutor 注入 tools 层全局 registry,
     // 让 dag_run 工具的 "start" 分支能取出它构造 DagScheduler。
-    // Arc<CoordinatorExecutor> 通过 unsizing 自动转换为
-    // Arc<dyn SubagentExecutor + Send + Sync>。
     if let Some(executor) = runtime.coordinator_executor() {
         tools::set_coordinator_executor(executor.clone());
     }
@@ -4293,9 +1028,6 @@ pub(crate) fn build_runtime_with_plugin_state(
         runtime = runtime.with_persistent_memory(memory);
 
         // Phase 4 认知外骨骼：注入 DecisionLog / ProjectTopology / RefactorTransaction。
-        // 之前三个 with_* builder 已经定义但从未被调用，导致 LLM 调用 9 个新工具时
-        // 全部返回 "not available" 降级字符串。现在无条件注入三个实例。
-        // 详见 docs/agent-cognitive-exoskeleton-plan.md 第五章。
         //
         // DecisionLog：SQLite 决策库，失败时降级为 None（不阻断启动）。
         if let Ok(decision_log) = runtime::DecisionLog::open(&cwd) {
@@ -4310,20 +1042,11 @@ pub(crate) fn build_runtime_with_plugin_state(
         runtime = runtime.with_refactor_transaction(tx);
 
         // P2(2026-08-14):注入 runtime 层 workspace_root。
-        // 此前 ConversationRuntime.workspace_root 恒为 None(Session 层与 runtime
-        // 层独立,app.rs 从未调用 with_workspace_root),导致依赖它的记忆/持久化
-        // 功能全部静默失效:task_state.json 永不写(压缩后无任务锚点)、
-        // tool_result 归档不写、NOTEBOOK 决策落盘不写、notebook_update 返回
-        // "not available" 软失败、"失忆"体感(history_index 在 Session 层正常,
-        // session_search 可用掩盖了问题)。with_workspace_root 同时同步注入
-        // multi_agent_coordinator 的 workspace_root。
+        // with_workspace_root 同时同步注入 multi_agent_coordinator 的 workspace_root。
         runtime = runtime.with_workspace_root(cwd.clone());
     }
     // P1(2026-08-13):Telemetry SessionTracer 接入生产路径。
-    // 之前 runtime 侧 session_tracer 字段和 7 个 record 函数已完整实现,
-    // 但生产从未调用 with_session_tracer,turn/tool 追踪数据无落盘载体。
-    // 现在用 JsonlTelemetrySink 写入 <cwd>/.claw/telemetry.jsonl,
-    // 为后续 trace 分析 / 失败模式聚类 / CSV 导出提供数据依据。
+    // 用 JsonlTelemetrySink 写入 <cwd>/.claw/telemetry.jsonl。
     // 失败(无 cwd / 目录不可写)时静默跳过,不阻塞启动。
     {
         let telemetry_path = workspace.join(".claw").join("telemetry.jsonl");
@@ -4342,484 +1065,448 @@ pub(crate) fn build_runtime_with_plugin_state(
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
 }
 
-pub(crate) struct CliHookProgressReporter;
+// ===== LiveCli 执行内核 =====
 
-impl runtime::HookProgressReporter for CliHookProgressReporter {
-    fn on_event(&mut self, event: &runtime::HookProgressEvent) {
-        match event {
-            runtime::HookProgressEvent::Started {
-                event,
-                tool_name,
-                command,
-            } => eprintln!(
-                "[hook {event_name}] {tool_name}: {command}",
-                event_name = event.as_str()
-            ),
-            runtime::HookProgressEvent::Completed {
-                event,
-                tool_name,
-                command,
-            } => eprintln!(
-                "[hook done {event_name}] {tool_name}: {command}",
-                event_name = event.as_str()
-            ),
-            runtime::HookProgressEvent::Cancelled {
-                event,
-                tool_name,
-                command,
-            } => eprintln!(
-                "[hook cancelled {event_name}] {tool_name}: {command}",
-                event_name = event.as_str()
-            ),
-        }
-    }
+pub(crate) struct LiveCli {
+    model: String,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    system_prompt: Vec<String>,
+    runtime: BuiltRuntime,
+    session: SessionHandle,
+    /// 本 CLI 绑定的工作区根；所有需要 cwd 的内部路径都从这里派生，
+    /// 不读取进程级当前目录（Web 多工作区下进程 cwd 是中性临时目录）。
+    workspace: PathBuf,
+    // 流式状态事件出口：Web 在 serve.rs 中挂载，驱动 SSE 文本/工具事件。
+    status_emitter: Option<runtime::StatusEmitter>,
+    /// 热升级优雅中断信号。
+    ///
+    /// `/upgrade` 命令置位后,当前正在执行的 turn 在下一次 run_turn 迭代
+    /// 顶部检测到 → 注入"暂停通知"给 LLM → turn 自然收尾。因
+    /// `prepare_turn_runtime` 每轮重建 runtime,信号必须存于此字段并在
+    /// 重建时经 `with_upgrade_signal` 注入,否则每轮新 runtime 的
+    /// upgrade_pending 都是默认 false,信号丢失。
+    upgrade_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 主会话 mid-turn steering 收件箱（inject 模式）。
+    ///
+    /// 与 `upgrade_signal` 同构：turn 执行期间把用户输入投入此队列，
+    /// `run_turn` 每次迭代顶部取出并注入为 user 消息。因
+    /// `prepare_turn_runtime` 每轮重建 runtime,队列必须存于此字段并在
+    /// 重建时经 `with_steer_inbox` 注入,否则每轮新 runtime 的队列都是空的。
+    steer_inbox: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// 外部注入的 abort signal。
+    /// Web 层在启动本轮执行前设置（保留 clone 用于「停止」），
+    /// prepare_turn_runtime 优先使用此 signal（而非创建新的），
+    /// 让调用方能在 turn 执行期间取消当前轮。
+    external_abort_signal: Option<runtime::HookAbortSignal>,
+    /// S3-M2:会话级子进程登记表（Web worker 每会话一份，跨轮复用）。
+    /// prepare_turn_runtime 注入到本轮工具注册表，worker 退出 / 看门狗回收 /
+    /// 会话删除时由调度器统一终止登记的进程树。
+    session_processes: Option<std::sync::Arc<runtime::process_registry::SessionProcesses>>,
 }
 
-pub(crate) struct CliPermissionPrompter {
-    current_mode: PermissionMode,
+pub(crate) struct BuiltRuntime {
+    /// `Box<dyn runtime::ApiClient>`:允许在默认 API 后端运行时不改动
+    /// `ConversationRuntime` 泛型约束。
+    runtime: Option<ConversationRuntime<Box<dyn runtime::ApiClient>, CliToolExecutor>>,
+    plugin_registry: PluginRegistry,
+    plugins_active: bool,
+    mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    mcp_active: bool,
 }
 
-impl CliPermissionPrompter {
-    fn new(current_mode: PermissionMode) -> Self {
-        Self { current_mode }
-    }
-}
-
-impl runtime::PermissionPrompter for CliPermissionPrompter {
-    fn decide(
+impl BuiltRuntime {
+    /// 会话边界：通知记忆 worker 收尾（0 等待，失败静默）。
+    pub(crate) fn on_memory_boundary(
         &mut self,
-        request: &runtime::PermissionRequest,
-    ) -> runtime::PermissionPromptDecision {
-        // Enhanced permission prompt with box-drawing and colored tool name
-        println!();
-        println!("\x1b[33m┌─ ⚠ Permission approval required \x1b[0m");
-        println!(
-            "\x1b[33m│\x1b[0m Tool             \x1b[1;36m{}\x1b[0m",
-            request.tool_name
-        );
-        println!(
-            "\x1b[33m│\x1b[0m Current mode     {}",
-            self.current_mode.as_str()
-        );
-        println!(
-            "\x1b[33m│\x1b[0m Required mode    \x1b[1;31m{}\x1b[0m",
-            request.required_mode.as_str()
-        );
-        if let Some(reason) = &request.reason {
-            println!("\x1b[33m│\x1b[0m Reason           {reason}");
+        boundary: runtime::memory_extract::MemorySessionBoundary,
+    ) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.on_memory_boundary(boundary);
         }
-        // Truncate very long inputs for display (UTF-8 safe)
-        let input_display = if request.input.chars().count() > 200 {
-            let truncated: String = request.input.chars().take(200).collect();
-            format!("{truncated}… (truncated)")
-        } else {
-            request.input.clone()
-        };
-        println!("\x1b[33m│\x1b[0m Input            {input_display}");
-        println!("\x1b[33m└─\x1b[0m Approve this tool call? [y/N]: ");
-        let _ = io::stdout().flush();
+    }
 
-        let mut response = String::new();
-        match io::stdin().read_line(&mut response) {
-            Ok(_) => {
-                let normalized = response.trim().to_ascii_lowercase();
-                if matches!(normalized.as_str(), "y" | "yes") {
-                    runtime::PermissionPromptDecision::Allow
-                } else {
-                    runtime::PermissionPromptDecision::Deny {
-                        reason: format!(
-                            "tool '{}' denied by user approval prompt",
-                            request.tool_name
-                        ),
-                    }
+    fn new(
+        runtime: ConversationRuntime<Box<dyn runtime::ApiClient>, CliToolExecutor>,
+        plugin_registry: PluginRegistry,
+        mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    ) -> Self {
+        Self {
+            runtime: Some(runtime),
+            plugin_registry,
+            plugins_active: true,
+            mcp_state,
+            mcp_active: true,
+        }
+    }
+
+    fn with_hook_abort_signal(mut self, hook_abort_signal: runtime::HookAbortSignal) -> Self {
+        // 同一份令牌同时驱动 agent loop 检查点与 bash 轮询循环：
+        // 「停止」不再依赖进程级全局标志，且按 turn 隔离（并发会话互不影响）。
+        let token = hook_abort_signal.token();
+        let mut runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before installing hook abort signal")
+            .with_hook_abort_signal(hook_abort_signal);
+        runtime.tool_executor_mut().set_turn_cancel(token);
+        self.runtime = Some(runtime);
+        self
+    }
+
+    /// S3-M2:注入会话级子进程登记表（Web worker 跨轮复用的同一份）。
+    fn with_session_processes(
+        mut self,
+        processes: Option<std::sync::Arc<runtime::process_registry::SessionProcesses>>,
+    ) -> Self {
+        if let Some(processes) = processes {
+            if let Some(runtime) = self.runtime.as_mut() {
+                runtime.tool_executor_mut().set_session_processes(processes);
+            }
+        }
+        self
+    }
+
+    /// 注入热升级优雅中断信号。
+    ///
+    /// 与 [`with_hook_abort_signal`](Self::with_hook_abort_signal) 同构:
+    /// 把 LiveCli 持有的 `upgrade_signal`(跨 `prepare_turn_runtime` 重建
+    /// 持久)注入 runtime,使 `/upgrade` 命令置位后,当前正在执行的 turn
+    /// 在 run_turn 循环顶部检测到并优雅收尾。
+    fn with_upgrade_signal(
+        mut self,
+        upgrade_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before installing upgrade signal");
+        self.runtime = Some(runtime.with_upgrade_signal(upgrade_signal));
+        self
+    }
+
+    /// 注入主会话 mid-turn steering 收件箱（inject 模式）。
+    fn with_steer_inbox(
+        mut self,
+        steer_inbox: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Self {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before installing steer inbox");
+        self.runtime = Some(runtime.with_steer_inbox(steer_inbox));
+        self
+    }
+
+    pub(crate) fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.plugins_active {
+            self.plugin_registry.shutdown()?;
+            self.plugins_active = false;
+        }
+        Ok(())
+    }
+
+    fn shutdown_mcp(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.mcp_active {
+            if let Some(mcp_state) = &self.mcp_state {
+                mcp_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .shutdown()?;
+            }
+            self.mcp_active = false;
+        }
+        Ok(())
+    }
+}
+
+impl Deref for BuiltRuntime {
+    type Target = ConversationRuntime<Box<dyn runtime::ApiClient>, CliToolExecutor>;
+
+    fn deref(&self) -> &Self::Target {
+        self.runtime
+            .as_ref()
+            .expect("runtime should exist while built runtime is alive")
+    }
+}
+
+impl DerefMut for BuiltRuntime {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.runtime
+            .as_mut()
+            .expect("runtime should exist while built runtime is alive")
+    }
+}
+
+impl Drop for BuiltRuntime {
+    fn drop(&mut self) {
+        let _ = self.shutdown_mcp();
+        let _ = self.shutdown_plugins();
+    }
+}
+
+impl Drop for LiveCli {
+    fn drop(&mut self) {
+        // 会话/进程收尾（serve worker 回收）：
+        // 通知记忆 worker 做边界巩固（0 等待，失败静默）。
+        self.runtime
+            .on_memory_boundary(runtime::memory_extract::MemorySessionBoundary::Exited);
+    }
+}
+
+impl LiveCli {
+    pub(crate) fn new(
+        model: String,
+        enable_tools: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        additional_workspace_roots: Vec<PathBuf>,
+        workspace: &Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        crate::diag_log(&format!("[LiveCli::new] start, model={model}"));
+        let t0 = std::time::Instant::now();
+        crate::diag_log("[LiveCli::new] calling build_system_prompt");
+        let system_prompt = build_system_prompt(&model, workspace)?;
+        crate::diag_log("[LiveCli::new] build_system_prompt OK");
+        let t_sp = t0.elapsed();
+        let session_state = new_cli_session_with_roots_in(workspace, additional_workspace_roots)?;
+        crate::diag_log("[LiveCli::new] new_cli_session_with_roots OK");
+        let t_sess = t0.elapsed();
+        let session = create_managed_session_handle_in(workspace, &session_state.session_id)?;
+        crate::diag_log("[LiveCli::new] create_managed_session_handle OK");
+        let t_handle = t0.elapsed();
+        crate::diag_log("[LiveCli::new] calling build_runtime");
+        let mut runtime = build_runtime(
+            session_state.with_persistence_path(session.path.clone()),
+            &session.id,
+            model.clone(),
+            system_prompt.clone(),
+            enable_tools,
+            allowed_tools.clone(),
+            permission_mode,
+            workspace,
+        )?;
+        let t_rt = t0.elapsed();
+        eprintln!(
+            "[timing] build_system_prompt={:?} new_cli_session={:?} create_handle={:?} build_runtime={:?} total={:?}",
+            t_sp, t_sess, t_handle, t_rt, t_rt
+        );
+        // Tier S #3 穷鬼模式：从 settings.json 的 `poorMode` 字段读取初始值，
+        // 写入进程级全局 AtomicBool。加载失败时保持默认（inactive），不阻断启动。
+        {
+            let cwd = workspace.to_path_buf();
+            // workspace_root 对所有工具路径都需要(notebook_update/recall_full/
+            // subagent 等),且与 config 解析正交——config 解析失败时不应导致
+            // workspace_root 缺失。因此无条件设置,不嵌套在 loader.load() 分支内。
+            runtime.set_workspace_root(cwd.clone());
+            let loader = ConfigLoader::default_for(&cwd);
+            if let Ok(config) = loader.load() {
+                if let Some(poor) = config.feature_config().poor_mode() {
+                    runtime::poor_mode::set_active(poor);
                 }
+                // P3-1:从 settings.json `planMode` 控制 Plan/Execute/Review。
+                // 默认启用(true)。
+                match config.feature_config().plan_mode() {
+                    Some(true) => runtime.set_plan_mode_enabled(true),
+                    Some(false) => runtime.set_plan_mode_enabled(false),
+                    None => {} // 保持默认(true)
+                }
+                // SP4.2-B3:从配置初始化 LSP servers(best-effort,失败不阻断启动)
+                let _ = init_lsp_from_config(&config, &cwd);
             }
-            Err(error) => runtime::PermissionPromptDecision::Deny {
-                reason: format!("permission approval failed: {error}"),
-            },
         }
-    }
-}
-
-/// `/keybindings` 的静态说明（与 TUI 实际键位保持一致）。
-fn keybindings_help() -> String {
-    [
-        "键盘快捷键：",
-        "  输入        Enter 提交 / Ctrl+J、Shift+Enter 换行 / Tab 补全斜杠命令",
-        "  斜杠菜单    ↑↓ 选择 / Enter 或 Tab 确认 / Esc 关闭",
-        "  中断        Ctrl+C（有输入时清空，空输入时退出）/ Ctrl+D 退出",
-        "  vim         /vim 开关；普通模式 i a A I 插入，h l 0 $ w b e 移动，",
-        "              x X D dd dw d$ cw 删除，u 撤销，p 粘贴，Esc 回普通模式",
-        "  浏览        PgUp / PgDn 翻页，End 回到最新，J / K 上一条 / 下一条回复",
-        "  面板        F2 侧栏，Ctrl+T 折叠最近工具卡，F12 调试浮层，? 帮助",
-        "  语音        F4 一次性语音输入",
-    ]
-    .join("\n")
-}
-
-/// `/files`：列出当前工作区文件（跳过隐藏目录与构建产物，最多 100 条）。
-fn list_workspace_files() -> String {
-    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let mut out = String::from("当前目录文件（最多 100 条，跳过 target/node_modules/.git 等）：\n");
-    let mut count = 0usize;
-    collect_workspace_files(&root, &root, 0, &mut out, &mut count);
-    if count == 0 {
-        out.push_str("  （空）\n");
-    }
-    out
-}
-
-fn collect_workspace_files(
-    root: &std::path::Path,
-    dir: &std::path::Path,
-    depth: usize,
-    out: &mut String,
-    count: &mut usize,
-) {
-    const MAX_ENTRIES: usize = 100;
-    const MAX_DEPTH: usize = 3;
-    if depth > MAX_DEPTH || *count >= MAX_ENTRIES {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
-            continue;
-        }
-        if path.is_dir() {
-            if matches!(name.as_str(), "target" | "node_modules" | "dist" | "build") {
-                continue;
-            }
-            collect_workspace_files(root, &path, depth + 1, out, count);
-        } else {
-            if *count >= MAX_ENTRIES {
-                return;
-            }
-            let rel = path.strip_prefix(root).unwrap_or(&path);
-            out.push_str(&format!("  {}\n", rel.display()));
-            *count += 1;
-        }
-    }
-}
-
-/// `/tasks [list|get <id>]`：读取全局任务注册表。
-fn list_tasks(args: Option<&str>) -> String {
-    let tasks = runtime::task_registry::global().list(None);
-    let sub = args.unwrap_or("list").trim();
-    if let Some(raw_id) = sub.strip_prefix("get ") {
-        let id = raw_id.trim();
-        return match tasks.iter().find(|task| task.task_id == id) {
-            Some(task) => format!(
-                "任务 {}\n  状态: {:?}\n  提示: {}\n  创建: {}\n  更新: {}\n  输出: {}",
-                task.task_id,
-                task.status,
-                truncate_text(&task.prompt, 200),
-                task.created_at,
-                task.updated_at,
-                truncate_text(&task.output, 400),
-            ),
-            None => format!("没有找到任务 {id}"),
+        let cli = Self {
+            model,
+            allowed_tools,
+            permission_mode,
+            system_prompt,
+            runtime,
+            session,
+            workspace: workspace.to_path_buf(),
+            status_emitter: None,
+            upgrade_signal: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            steer_inbox: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            external_abort_signal: None,
+            session_processes: None,
         };
+        cli.persist_session()?;
+        Ok(cli)
     }
-    if tasks.is_empty() {
-        return "任务列表为空。".to_string();
-    }
-    let mut out = String::from("任务列表（最多 30 条）：\n");
-    for task in tasks.iter().take(30) {
-        out.push_str(&format!(
-            "  {:<12} {:<9} {}\n",
-            task.task_id,
-            format!("{:?}", task.status),
-            truncate_text(&task.prompt, 60),
-        ));
-    }
-    out
-}
 
-/// 按字符截断，避免在 UTF-8 边界切开。
-fn truncate_text(text: &str, limit: usize) -> String {
-    let mut chars = text.chars();
-    let mut out: String = chars.by_ref().take(limit).collect();
-    if chars.next().is_some() {
-        out.push('…');
-    }
-    out
-}
-
-/// 取最后一条指定角色的文本消息（跳过工具块与思考块）。
-fn message_text(session: &runtime::Session, role: runtime::MessageRole) -> Option<String> {
-    let message = session
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == role)?;
-    let text = message
-        .blocks
-        .iter()
-        .filter_map(|block| match block {
-            runtime::ContentBlock::Text { text } => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if text.trim().is_empty() {
-        None
-    } else {
-        Some(text)
-    }
-}
-
-fn last_assistant_text(session: &runtime::Session) -> String {
-    message_text(session, runtime::MessageRole::Assistant).unwrap_or_default()
-}
-
-fn last_user_text(session: &runtime::Session) -> String {
-    message_text(session, runtime::MessageRole::User).unwrap_or_default()
-}
-
-/// `/copy`：优先 OSC52（SSH 也可用），同时落一份本地备份便于终端不支持时取用。
-fn deliver_to_clipboard(text: &str) -> String {
-    if text.trim().is_empty() {
-        return "没有可复制的内容（当前会话还没有模型回复）。".to_string();
-    }
-    let backup =
-        crate::settings::path().and_then(|path| path.parent().map(|dir| dir.join("last-copy.txt")));
-    let saved = backup.and_then(|path| {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok()?;
-        }
-        std::fs::write(&path, text).ok().map(|()| path)
-    });
-
-    let encoded = base64_encode(text.as_bytes());
-    let mut stdout = std::io::stdout();
-    let _ = write!(stdout, "\x1b]52;c;{encoded}\x07");
-    let _ = stdout.flush();
-
-    match saved {
-        Some(path) => format!(
-            "已发送 OSC52 复制序列（{} 字节）。终端不支持时，全文备份在 {}",
-            text.len(),
-            path.display()
-        ),
-        None => {
-            "已发送 OSC52 复制序列，但本地备份写入失败；终端不支持 OSC52 时可能无效。".to_string()
+    pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        if let Some(rt) = self.runtime.runtime.as_mut() {
+            rt.api_client_mut().set_reasoning_effort(effort);
         }
     }
-}
 
-/// 极简 base64（OSC52 需要），避免为此引入依赖。
-fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = u32::from(chunk[0]);
-        let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
-        let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[((triple >> 6) & 0x3F) as usize] as char
+    /// 设置 DeepSeek 思考模式开关(Some(true)=开启,Some(false)=关闭,None=模型默认)。
+    pub(crate) fn set_thinking_mode(&mut self, thinking: Option<bool>) {
+        if let Some(rt) = self.runtime.runtime.as_mut() {
+            rt.api_client_mut().set_thinking_mode(thinking);
+        }
+    }
+
+    /// 读取当前 thinking_mode 设置。
+    pub(crate) fn thinking_mode(&self) -> Option<bool> {
+        if let Some(rt) = self.runtime.runtime.as_ref() {
+            rt.api_client().thinking_mode()
         } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[(triple & 0x3F) as usize] as char
+            None
+        }
+    }
+
+    /// 读取当前 reasoning_effort 设置。
+    pub(crate) fn reasoning_effort(&self) -> Option<String> {
+        if let Some(rt) = self.runtime.runtime.as_ref() {
+            rt.api_client().reasoning_effort()
         } else {
-            '='
-        });
-    }
-    out
-}
-
-/// `/feedback`：只写本地 JSONL，不外发。
-fn write_feedback_entry(session_id: &str, model: &str, last_user: &str) -> String {
-    let Some(base) =
-        crate::settings::path().and_then(|path| path.parent().map(std::path::Path::to_path_buf))
-    else {
-        return "无法定位 ~/.claw，反馈未记录。".to_string();
-    };
-    if let Err(error) = std::fs::create_dir_all(&base) {
-        return format!("创建 {} 失败: {error}", base.display());
-    }
-    let path = base.join("feedback.jsonl");
-    let entry = serde_json::json!({
-        "ts_ms": now_ms(),
-        "session": session_id,
-        "model": model,
-        "last_user": truncate_text(last_user, 500),
-    });
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .and_then(|mut file| writeln!(file, "{entry}"))
-    {
-        Ok(()) => format!("反馈已记录到 {}", path.display()),
-        Err(error) => format!("写入 {} 失败: {error}", path.display()),
-    }
-}
-
-fn now_ms() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis())
-}
-
-#[cfg(test)]
-mod topology_registry_tests {
-    use super::*;
-
-    /// D1 定向测试：同一规范化 cwd 重复取用必须返回**同一 Arc 实例**，
-    /// 这是「一次构造、多处复用、不重复 cargo metadata」的核心不变量。
-    #[test]
-    fn topology_for_same_cwd_returns_same_instance() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = topology_for(dir.path());
-        let b = topology_for(dir.path());
-        assert!(
-            Arc::ptr_eq(&a, &b),
-            "same cwd must reuse the same shared ProjectTopology Arc"
-        );
+            None
+        }
     }
 
-    /// D1 定向测试：不同 cwd 必须得到**不同实例**，防止跨项目串味
-    /// （这正是放弃单一 `OnceLock`、改用 cwd 键控注册表的原因）。
-    #[test]
-    fn topology_for_different_cwd_returns_distinct_instances() {
-        let dir1 = tempfile::tempdir().unwrap();
-        let dir2 = tempfile::tempdir().unwrap();
-        let a = topology_for(dir1.path());
-        let b = topology_for(dir2.path());
-        assert!(
-            !Arc::ptr_eq(&a, &b),
-            "different cwd must not share a ProjectTopology instance"
-        );
+    fn prepare_turn_runtime(
+        &mut self,
+    ) -> Result<
+        (BuiltRuntime, HookAbortMonitor, runtime::HookAbortSignal),
+        Box<dyn std::error::Error>,
+    > {
+        // 中断支持：优先使用外部注入的 abort signal
+        // （由调用方在 spawn worker / 入队前设置），让 HTTP 层能通过
+        // 保留的 clone 取消当前 turn。非中断模式创建新的 signal。
+        let hook_abort_signal = self.external_abort_signal.clone().unwrap_or_default();
+        let mut runtime = build_runtime(
+            self.runtime.session().clone(),
+            &self.session.id,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            &self.workspace,
+        )?
+        .with_hook_abort_signal(hook_abort_signal.clone())
+        .with_session_processes(self.session_processes.clone())
+        .with_upgrade_signal(self.upgrade_signal.clone())
+        .with_steer_inbox(self.steer_inbox.clone());
+        // 推理状态同步：AnthropicRuntimeClient 每轮 turn 都会在
+        // prepare_turn_runtime 中重建(见 run_turn → replace_runtime 生命周期),
+        // 新 client 上 reasoning_effort / thinking_mode 均为默认值。
+        // 从 LiveCli 持有的旧 client 读取并同步到本轮新建的 client。
+        {
+            let effort = self.reasoning_effort();
+            let thinking = self.thinking_mode();
+            if let Some(rt) = runtime.runtime.as_mut() {
+                let client = rt.api_client_mut();
+                client.set_reasoning_effort(effort);
+                client.set_thinking_mode(thinking);
+            }
+        }
+        // 把状态事件出口注入本轮新建的 client 与工具执行器：
+        // Web SSE 依赖它输出文本与工具事件。
+        if let Some(emitter) = &self.status_emitter {
+            if let Some(rt) = runtime.runtime.as_mut() {
+                rt.api_client_mut().set_status_emitter(Arc::clone(emitter));
+                // Also inject into CliToolExecutor so ToolResult events are emitted
+                rt.tool_executor_mut()
+                    .set_status_emitter(Arc::clone(emitter));
+            }
+        }
+        let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal.clone());
+
+        Ok((runtime, hook_abort_monitor, hook_abort_signal))
     }
 
-    /// D1 定向测试：含 `.` / `..` 的等价路径经 `normalize_root` 折叠后
-    /// 命中原实例——保证 `build_system_prompt` 与 `build_runtime` 即使传入
-    /// 字面不同的 cwd 路径，只要指向同一目录就复用同一拓扑。
-    #[test]
-    fn topology_for_normalizes_equivalent_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = topology_for(dir.path());
-        let roundabout = dir.path().join("nested").join("..");
-        let again = topology_for(&roundabout);
-        assert!(
-            Arc::ptr_eq(&base, &again),
-            "path with .. must normalize to the same registry entry"
-        );
-    }
-}
-
-#[cfg(test)]
-mod extras_cache_tests {
-    use super::*;
-
-    #[test]
-    fn extras_cache_roundtrip_scoped_to_workspace_and_fingerprint() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path();
-        assert!(extras_cache_get(cwd, "repomap", 7).is_none());
-
-        extras_cache_put(cwd, "repomap", 7, "rendered");
-        assert_eq!(
-            extras_cache_get(cwd, "repomap", 7).as_deref(),
-            Some("rendered")
-        );
-        // 指纹变化(源文件 mtime 变)必须失效。
-        assert!(extras_cache_get(cwd, "repomap", 8).is_none());
-
-        // 其他工作区不能读到本工作区条目。
-        let other = tempfile::tempdir().unwrap();
-        assert!(extras_cache_get(other.path(), "repomap", 7).is_none());
+    fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
+        self.runtime.shutdown_plugins()?;
+        self.runtime = runtime;
+        Ok(())
     }
 
-    #[test]
-    fn source_fingerprint_tracks_mtime_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("lib.rs");
-        std::fs::write(&file, "fn main() {}").unwrap();
-        let first = runtime::repomap::source_fingerprint(dir.path());
-        assert_eq!(
-            first,
-            runtime::repomap::source_fingerprint(dir.path()),
-            "fingerprint must be stable for unchanged sources"
-        );
-        let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
-        std::fs::File::options()
-            .write(true)
-            .open(&file)
-            .unwrap()
-            .set_modified(bumped)
-            .unwrap();
-        assert_ne!(
-            first,
-            runtime::repomap::source_fingerprint(dir.path()),
-            "mtime change must change the fingerprint"
-        );
-    }
-}
-
-#[cfg(test)]
-mod slash_helpers_tests {
-    use super::*;
-
-    #[test]
-    fn keybindings_mention_vim_and_interrupt() {
-        let text = keybindings_help();
-        assert!(text.contains("vim"));
-        assert!(text.contains("Ctrl+C"));
+    /// Web（`claw serve`）用：跑一轮但不写终端输出；审批由调用方提供的 prompter 决定，
+    /// 流式事件通过 `set_status_emitter` 注入的回调输出。
+    pub(crate) fn run_turn_silent_with(
+        &mut self,
+        input: &str,
+        prompter: &mut dyn runtime::PermissionPrompter,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime()?;
+        let result = runtime.run_turn(input, Some(prompter));
+        hook_abort_monitor.stop();
+        let _summary = result?;
+        self.replace_runtime(runtime)?;
+        self.persist_session()?;
+        Ok(())
     }
 
-    #[test]
-    fn truncate_text_adds_ellipsis_only_when_truncated() {
-        assert_eq!(truncate_text("abc", 5), "abc");
-        assert_eq!(truncate_text("abcdef", 3), "abc…");
-        // CJK 按字符切，不按字节切。
-        assert_eq!(truncate_text("中文测试", 2), "中文…");
+    pub(crate) fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.runtime.session().save_to_path(&self.session.path)?;
+        Ok(())
     }
 
-    #[test]
-    fn workspace_listing_skips_build_dirs() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("keep.txt"), "x").unwrap();
-        std::fs::create_dir_all(dir.path().join("target")).unwrap();
-        std::fs::write(dir.path().join("target").join("artifact.bin"), "x").unwrap();
-        let mut out = String::new();
-        let mut count = 0;
-        collect_workspace_files(dir.path(), dir.path(), 0, &mut out, &mut count);
-        assert!(out.contains("keep.txt"));
-        assert!(!out.contains("artifact.bin"));
-        assert_eq!(count, 1);
+    /// 当前会话的持久化文件路径（session JSONL）。
+    pub(crate) fn session_file_path(&self) -> std::path::PathBuf {
+        self.session.path.clone()
     }
 
-    #[test]
-    fn tasks_get_missing_returns_message() {
-        let text = list_tasks(Some("get does-not-exist"));
-        assert!(text.contains("没有找到任务"));
+    /// Web 写入通道（`claw serve` 子进程）用：从磁盘会话恢复后继续跑。
+    pub(crate) fn resume_from_path(
+        &mut self,
+        session_path: &std::path::Path,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let session_ref = session_path.to_string_lossy().to_string();
+        let (handle, mut session) = load_session_reference_in(&self.workspace, &session_ref)?;
+        // 上次 turn 若在工具执行中被中断（进程被杀/卡死），会话末尾会留下
+        // 没有 tool_result 的 tool_use，API 会以 400 拒绝续聊。恢复时补齐。
+        session.repair_dangling_tool_uses();
+        let session_id = session.session_id.clone();
+        let runtime = build_runtime(
+            session,
+            &handle.id,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            &self.workspace,
+        )?;
+        self.runtime
+            .on_memory_boundary(runtime::memory_extract::MemorySessionBoundary::Switched);
+        self.replace_runtime(runtime)?;
+        self.session = SessionHandle {
+            id: session_id,
+            path: handle.path,
+        };
+        Ok(true)
     }
 
-    #[test]
-    fn base64_matches_rfc4648_vectors() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-        // 多字节 UTF-8 必须按字节编码，不能按字符。
-        assert_eq!(base64_encode("中".as_bytes()), "5Lit");
+    /// 挂载状态事件出口（Web SSE 文本/工具事件）。
+    pub(crate) fn set_status_emitter(&mut self, emitter: runtime::StatusEmitter) {
+        self.status_emitter = Some(emitter);
     }
 
-    #[test]
-    fn copy_with_empty_text_reports_nothing_to_copy() {
-        assert!(deliver_to_clipboard("").contains("没有可复制的内容"));
-        assert!(deliver_to_clipboard("   \n").contains("没有可复制的内容"));
+    /// 解除已挂载的状态事件出口。
+    pub(crate) fn clear_status_emitter(&mut self) {
+        self.status_emitter = None;
+    }
+
+    /// 设置外部 abort signal。
+    /// 调用方在启动本轮执行前调用此方法，传入 abort signal 的 clone。
+    /// prepare_turn_runtime 会优先使用此 signal，让调用方在 turn 执行期间
+    /// 取消当前 turn。turn 结束后由 clear_external_abort_signal 清空。
+    pub(crate) fn set_external_abort_signal(&mut self, signal: runtime::HookAbortSignal) {
+        self.external_abort_signal = Some(signal);
+    }
+
+    /// S3-M2:设置会话级进程登记表（Web worker 每会话一份，跨轮复用）。
+    pub(crate) fn set_session_processes(
+        &mut self,
+        processes: std::sync::Arc<runtime::process_registry::SessionProcesses>,
+    ) {
+        self.session_processes = Some(processes);
+    }
+
+    /// 清空外部 abort signal（turn 结束后调用）。
+    pub(crate) fn clear_external_abort_signal(&mut self) {
+        self.external_abort_signal = None;
     }
 }

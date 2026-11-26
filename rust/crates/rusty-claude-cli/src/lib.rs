@@ -6,30 +6,25 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+//! CLaw Web 服务 crate（历史名 `rusty-claude-cli`）。
+//!
+//! Phase 3 起产品界面只有 Web：本 crate 只保留 `claw serve` 入口、
+//! turn 执行内核、会话/检查点/热升级与会话市场能力，CLI/TUI 界面层已删除。
+
+pub mod api_client;
 pub mod app;
 pub mod checkpoint;
-pub mod commands_handler;
-pub mod doctor;
-pub mod format;
 pub mod init;
-pub mod input;
 pub mod llm_clients;
-pub mod locale;
-pub mod paste;
 pub mod plugin_state;
-pub mod render;
 pub mod serve;
 pub mod session_mgr;
-pub mod settings;
-pub mod streaming;
-pub mod suggestion;
-pub mod tool_display;
-pub mod ultraplan;
+pub mod tool_executor;
 pub mod upgrade_helper;
 pub mod voice;
 
 pub use commands::plugin_market;
-/// 技能市场已下沉到 `commands`（CLI `/skills install` 与 WebUI 共用同一条
+/// 技能市场已下沉到 `commands`（WebUI 与内部流水线共用同一条
 /// 原子安装流水线），此处重导出以保持 `crate::skill_market` 路径稳定。
 pub use commands::skill_market;
 
@@ -38,266 +33,37 @@ mod tests;
 
 use std::collections::BTreeSet;
 use std::env;
-use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
-use std::net::TcpListener;
-use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use api::{
-    detect_provider_kind, model_family_identity_for, model_requires_reasoning_content_in_history,
-    CacheControl, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, SystemBlock, SystemContent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
-};
-
-use app::*;
-use commands::{
-    classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
-    handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
-    handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
-    render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
-    slash_command_specs, validate_slash_command_input, PluginsCommandResult, SkillSlashDispatch,
-    SlashCommand,
-};
-use commands_handler::*;
-use doctor::*;
-use format::*;
-use init::initialize_repo;
-use paste::{
-    expand_paste_placeholders, fold_pasted_input, format_pasted_text_ref, paste_cache_path,
-    paste_cache_root, pasted_text_ref_num_lines, read_clipboard_text, should_fold_paste,
-    store_paste_and_make_placeholder, try_auto_expand_clipboard, PASTE_FOLD_CHAR_THRESHOLD,
-    PASTE_FOLD_LINE_THRESHOLD,
-};
-use plugin_state::{
-    build_plugin_manager, build_runtime_mcp_state, build_runtime_plugin_state,
-    build_runtime_plugin_state_with_loader, mcp_annotation_flag, mcp_runtime_tool_definition,
-    mcp_wrapper_tool_definitions, permission_mode_for_mcp_tool, plugins_command_payload_for,
-    plugins_command_payload_from_result, resolve_plugin_path,
-    runtime_hook_config_from_plugin_hooks, RuntimeMcpState, RuntimePluginState,
-    RuntimePluginStateBuildOutput,
-};
-use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
-use render::{MarkdownStreamState, OutputVerbosity, Spinner, TerminalRenderer};
-use runtime::{
-    check_base_commit, format_stale_base_warning, format_usd, load_system_prompt,
-    load_system_prompt_with_extras, pricing_for_model, resolve_expected_base,
-    resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, BaseCommitState,
-    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
-    ConversationRuntime, HistoryIndex, McpServer, McpServerManager, McpServerSpec, McpTool,
-    MessageRole, ModelPricing, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    RepoMap, ResolvedPermissionMode, RuntimeError, Session, SystemPromptExtras, SystemPromptSplit,
-    TokenUsage, ToolError, ToolExecutor, UsageTracker,
-};
-use serde::Deserialize;
-use serde_json::{json, Map, Value};
-use session_mgr::{
-    civil_from_days, collect_session_prompt_history, confirm_session_deletion,
-    create_managed_session_handle, current_session_store, default_export_filename,
-    delete_managed_session, format_history_timestamp, format_session_modified_age,
-    latest_managed_session, list_managed_sessions, load_session_reference,
-    looks_like_slash_command_token, new_cli_session, new_cli_session_with_roots,
-    parse_history_count, recent_user_context, render_prompt_history_report, render_session_list,
-    render_session_markdown, resolve_export_path, resolve_managed_session_path,
-    resolve_session_reference, resume_command_can_absorb_token, resume_session, run_export,
-    run_resume_command, run_resumed_session_command, session_clear_backup_path,
-    session_details_json, session_exists_json, session_reference_exists, sessions_dir,
-    summarize_tool_payload_for_markdown, write_session_clear_backup, ManagedSessionSummary,
-    PromptHistoryEntry, ResumeCommandOutcome, SessionHandle, SessionLifecycleKind,
-    SessionLifecycleSummary, DEFAULT_HISTORY_LIMIT, LATEST_SESSION_REFERENCE,
-    LEGACY_SESSION_EXTENSION, PRIMARY_SESSION_EXTENSION, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT,
-    SESSION_REFERENCE_ALIASES,
-};
-use streaming::{
-    build_system_blocks, collect_prompt_cache_events, collect_tool_results, collect_tool_uses,
-    compact_tool_output_for_model, convert_messages, extract_system_messages, final_assistant_text,
-    format_context_window_blocked_error, format_user_visible_api_error,
-    mark_last_tool_with_cache_control, permission_policy, push_output_block,
-    render_thinking_block_summary, request_ends_with_tool_result, response_to_events,
-    AnthropicRuntimeClient, HookAbortMonitor, NETWORK_ERROR_KEYWORDS, POST_TOOL_STALL_TIMEOUT,
-};
-use suggestion::{
-    common_prefix_len, levenshtein_distance, looks_like_subcommand_typo, ranked_suggestions,
-    render_suggestion_line, suggest_closest_term, suggest_similar_subcommand,
-    suggest_slash_commands, CLI_OPTION_SUGGESTIONS,
-};
-use tool_display::{
-    clear_rustyline_echo, estimate_display_width, extract_tool_path, first_visible_line,
-    format_bash_call, format_bash_result, format_edit_result, format_generic_tool_result,
-    format_glob_result, format_grep_result, format_patch_preview, format_read_result,
-    format_search_start, format_structured_patch_preview, format_tool_call_start,
-    format_tool_result, format_tool_result_card_close, format_tool_result_compact,
-    format_user_message_card, format_write_result, indent_with_card_prefix, is_wide_char,
-    print_user_card, short_tool_id, summarize_tool_payload, truncate_for_summary,
-    truncate_output_for_display, CliToolExecutor, ListMcpResourcesRequest, McpToolRequest,
-    ReadMcpResourceRequest, ToolSearchRequest, DISPLAY_TRUNCATION_NOTICE, READ_DISPLAY_MAX_CHARS,
-    READ_DISPLAY_MAX_LINES, TOOL_CARD_PREFIX, TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-    TOOL_OUTPUT_DISPLAY_MAX_LINES, USER_CARD_PREFIX,
-};
-use tools::{
-    execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
-};
-use ultraplan::{
-    describe_tool_progress, format_internal_prompt_progress_line, InternalPromptProgressEvent,
-    InternalPromptProgressReporter, InternalPromptProgressRun, InternalPromptProgressShared,
-    InternalPromptProgressState, INTERNAL_PROGRESS_HEARTBEAT_INTERVAL,
-};
+use runtime::ConfigLoader;
+use serde_json::{json, Value};
 
 // 单模型架构:Pro 已下线,主会话与子任务统一使用 flash(官方 ID deepseek-flash)。
-// 旧 ID deepseek-v4-flash / deepseek-v4.1-flash 仍可被 alias 层归一化。
 pub const DEFAULT_MODEL: &str = "deepseek-flash";
 
-/// 网页版后端模型名:走 chat.deepseek.com 登录态(零 Token),实现见
-/// web-bridge crate(`WebApiClient` + `DeepseekWebClient`)。用
-/// `claw.exe --model deepseek-web "任务"` 直接驱动主 agent,凭证
-/// 位于 `~/.claw/web-bridge/deepseek-auth.json`,需先登录一次。
-pub const WEB_MODEL_NAME: &str = "deepseek-web";
-
-/// #148: Model provenance for `claw status` JSON/text output. Records where
-/// the resolved model string came from so claws don't have to re-read argv
-/// to audit whether their `--model` flag was honored vs falling back to env
-/// or config or default.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModelSource {
-    /// Explicit `--model` / `--model=` CLI flag.
-    Flag,
-    /// CLAW_MODEL environment variable (when no flag was passed).
-    Env,
-    /// `model` key in `.claw.json` / `.claw/settings.json` (when neither
-    /// flag nor env set it).
-    Config,
-    /// Auto-detected from available API keys (zero-config fallback).
-    AutoDetect,
-    /// Compiled-in DEFAULT_MODEL fallback (no keys found at all).
-    Default,
-}
-
-impl ModelSource {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ModelSource::Flag => "flag",
-            ModelSource::Env => "env",
-            ModelSource::Config => "config",
-            ModelSource::AutoDetect => "auto-detect",
-            ModelSource::Default => "default",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelProvenance {
-    /// Resolved model string (after alias expansion).
-    pub resolved: String,
-    /// Raw user input before alias resolution. None when source is Default.
-    pub raw: Option<String>,
-    /// Where the resolved model string originated.
-    pub source: ModelSource,
-}
-
-impl ModelProvenance {
-    fn default_fallback() -> Self {
-        Self {
-            resolved: DEFAULT_MODEL.to_string(),
-            raw: None,
-            source: ModelSource::Default,
-        }
-    }
-
-    fn from_flag(raw: &str) -> Self {
-        Self {
-            resolved: resolve_model_alias_with_config(raw),
-            raw: Some(raw.to_string()),
-            source: ModelSource::Flag,
-        }
-    }
-
-    pub fn from_env_or_config_or_default(cli_model: &str) -> Self {
-        // Only called when no --model flag was passed. Probe env first,
-        // then config, else auto-detect from available API keys.
-        // Mirrors the logic in resolve_repl_model() but captures the source.
-        if cli_model != DEFAULT_MODEL {
-            // Already resolved from some prior path; treat as flag.
-            return Self {
-                resolved: cli_model.to_string(),
-                raw: Some(cli_model.to_string()),
-                source: ModelSource::Flag,
-            };
-        }
-        if let Some(env_model) = env::var("CLAW_MODEL")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-        {
-            return Self {
-                resolved: resolve_model_alias_with_config(&env_model),
-                raw: Some(env_model),
-                source: ModelSource::Env,
-            };
-        }
-        if let Some(config_model) = config_model_for_current_dir() {
-            return Self {
-                resolved: resolve_model_alias_with_config(&config_model),
-                raw: Some(config_model),
-                source: ModelSource::Config,
-            };
-        }
-        // Zero-config auto-detection: pick the best model for available API keys.
-        let auto_model = detect_best_available_model();
-        if auto_model != DEFAULT_MODEL {
-            return Self {
-                resolved: resolve_model_alias_with_config(&auto_model),
-                raw: None,
-                source: ModelSource::AutoDetect,
-            };
-        }
-        Self::default_fallback()
-    }
-}
-
-pub fn max_tokens_for_model(model: &str) -> u32 {
-    api::max_tokens_for_model(model)
-}
-// Build-time constants injected by build.rs (fall back to static values when
-// build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") {
     Some(d) => d,
     None => "unknown",
 };
-const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 构建指纹(build.rs 注入):工作树干净时为 git 短 sha,脏树时为内容哈希,
-/// 非 git 环境为空串。用于状态栏区分"同版本号的不同构建"——热升级只重编译、
-/// 不改 `Cargo.toml`,版本号本身在升级后不变,无法证明新二进制已接管。
+/// 非 git 环境为空串。用于区分"同版本号的不同构建"。
 pub const GIT_FINGERPRINT: &str = match option_env!("GIT_FINGERPRINT") {
     Some(f) => f,
     None => "",
 };
 /// 构建时刻(build.rs 注入,`MMDD-HHMM`,分钟精度)。
-///
-/// 为何需要它:`GIT_FINGERPRINT` 对**相同源码内容**是确定性的(干净树=git sha,
-/// 脏树=内容哈希)⇒ 若热升级未改变源码内容(重部署/重启/无新提交),重建后指纹
-/// 与版本号**完全相同**,用户仍无法确认新二进制是否接管 —— 恰是该机制本要
-/// 解决的问题。注入构建时刻后,每次重编译都产生可区分的标签。
-/// `SOURCE_DATE_EPOCH` 存在时由 build.rs 取该值(保可复现构建)。
 pub const BUILD_TIME: &str = match option_env!("BUILD_TIME") {
     Some(t) => t,
     None => "",
 };
+pub const BUILD_TARGET: Option<&str> = option_env!("TARGET");
+pub const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
+
+pub type AllowedToolSet = BTreeSet<String>;
+
 /// 状态栏展示的**构建标签**:`<指纹>@<构建时刻>`。
-///
-/// 不再包含 `VERSION`(即 `Cargo.toml` 里手写的 `2026.10.5`):该常量形如日期
-/// 却**不随构建变化**,在热升级场景下既误导人又无区分度,故从展示中移除。
-/// 真正能区分新旧二进制的是构建指纹 + 构建时刻 —— 二者随每次重编译更新。
-/// 版本号本身仍可通过 `claw --version` / `claw doctor`(直接读 `VERSION`)获取。
-///
-/// 降级:无指纹时用 `@<时刻>`;无时刻时用 `<指纹>`;两者皆无 → `v<VERSION>`(最后兜底)。
 #[must_use]
 pub fn version_label() -> String {
     match (GIT_FINGERPRINT.is_empty(), BUILD_TIME.is_empty()) {
@@ -307,100 +73,16 @@ pub fn version_label() -> String {
         (true, true) => format!("v{VERSION}"),
     }
 }
-pub const BUILD_TARGET: Option<&str> = option_env!("TARGET");
-pub const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
-pub const OFFICIAL_REPO_URL: &str = "https://github.com/dong382258137/claw-code";
-pub const OFFICIAL_REPO_SLUG: &str = "dong382258137/claw-code";
-pub const DEPRECATED_INSTALL_COMMAND: &str = "cargo install claw-code";
 
-pub type AllowedToolSet = BTreeSet<String>;
-
-/// #77: Classify a stringified error message into a machine-readable kind.
-///
-/// Returns a snake_case token that downstream consumers can switch on instead
-/// of regex-scraping the prose. The classification is best-effort prefix/keyword
-/// matching against the error messages produced throughout the CLI surface.
-pub fn classify_error_kind(message: &str) -> &'static str {
-    // Check specific patterns first (more specific before generic)
-    if message.contains("missing DeepSeek credentials") {
-        "missing_credentials"
-    } else if message.contains("Manifest source files are missing") {
-        "missing_manifests"
-    } else if message.contains("no worker state file found") {
-        "missing_worker_state"
-    } else if message.contains("session not found") {
-        "session_not_found"
-    } else if message.contains("failed to restore session") {
-        "session_load_failed"
-    } else if message.contains("no managed sessions found") {
-        "no_managed_sessions"
-    } else if message.contains("unrecognized argument") || message.contains("unknown option") {
-        "cli_parse"
-    } else if message.contains("invalid model syntax") {
-        "invalid_model_syntax"
-    } else if message.contains("is not yet implemented") {
-        "unsupported_command"
-    } else if message.contains("unsupported resumed command") {
-        "unsupported_resumed_command"
-    } else if message.contains("confirmation required") {
-        "confirmation_required"
-    } else if message.contains("api failed") || message.contains("api returned") {
-        "api_http_error"
-    } else {
-        "unknown"
-    }
+pub fn filter_tool_specs(
+    tool_registry: &tools::GlobalToolRegistry,
+    allowed_tools: Option<&AllowedToolSet>,
+) -> Vec<api::ToolDefinition> {
+    tool_registry.definitions(allowed_tools)
 }
 
-/// #77: Split a multi-line error message into (short_reason, optional_hint).
-///
-/// The short_reason is the first line (up to the first newline), and the hint
-/// is the remaining text or `None` if there's no newline. This prevents the
-/// runbook prose from being stuffed into the `error` field that downstream
-/// parsers expect to be the short reason alone.
-pub fn split_error_hint(message: &str) -> (String, Option<String>) {
-    match message.split_once('\n') {
-        Some((short, hint)) => (short.to_string(), Some(hint.trim().to_string())),
-        None => (message.to_string(), None),
-    }
-}
-
-/// Read piped stdin content when stdin is not a terminal.
-///
-/// Returns `None` when stdin is attached to a terminal (interactive REPL use),
-/// when reading fails, or when the piped content is empty after trimming.
-/// Returns `Some(raw_content)` when a pipe delivered non-empty content.
-pub fn read_piped_stdin() -> Option<String> {
-    if io::stdin().is_terminal() {
-        return None;
-    }
-    let mut buffer = String::new();
-    if io::stdin().read_to_string(&mut buffer).is_err() {
-        return None;
-    }
-    if buffer.trim().is_empty() {
-        return None;
-    }
-    Some(buffer)
-}
-
-/// Merge a piped stdin payload into a prompt argument.
-///
-/// When `stdin_content` is `None` or empty after trimming, the prompt is
-/// returned unchanged. Otherwise the trimmed stdin content is appended to the
-/// prompt separated by a blank line so the model sees the prompt first and the
-/// piped context immediately after it.
-pub fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String {
-    let Some(raw) = stdin_content else {
-        return prompt.to_string();
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return prompt.to_string();
-    }
-    if prompt.is_empty() {
-        return trimmed.to_string();
-    }
-    format!("{prompt}\n\n{trimmed}")
+pub fn max_tokens_for_model(model: &str) -> u32 {
+    api::max_tokens_for_model(model)
 }
 
 pub fn plugin_command_json(
@@ -456,9 +138,16 @@ pub fn plugin_load_failure_json(failure: &plugins::PluginLoadFailure) -> Value {
     })
 }
 
+pub struct PluginsCommandPayload {
+    pub message: String,
+    pub reload_runtime: bool,
+    pub status: &'static str,
+    pub config_load_error: Option<String>,
+    pub plugins: Vec<Value>,
+    pub load_failures: Vec<Value>,
+}
+
 /// 细粒度诊断日志（`~/.claw/claw-diag.log`）。
-///
-/// 原为 TUI 专用，但 Web 端排查会话卡死同样依赖该日志，故不再按特性门控。
 pub(crate) fn diag_log(msg: &str) {
     use std::io::Write;
     let home = std::env::var_os("USERPROFILE")
@@ -482,1120 +171,6 @@ pub(crate) fn diag_log(msg: &str) {
     }
 }
 
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // 启动最早期把 `.claw.json` 的 `env` 块应用到当前进程。
-    //
-    // 必须早于任何 `std::env::var` 读取的功能开关判定 —— 例如
-    // `parse_survey_budget` 读 `CLAW_SURVEY_BUDGET`。
-    // 在此之前 `env` 块只被 MCP 子进程消费(`mcp_stdio::apply_env`),
-    // 进程自身从不 set_var, 故该键在配置里是死键。
-    // 外部真实环境变量优先(见 `RuntimeConfig::apply_env_to_process`)。
-    if let Ok(cwd) = env::current_dir() {
-        if let Ok(config) = runtime::ConfigLoader::default_for(&cwd).load() {
-            let applied = config.apply_env_to_process();
-            if applied > 0 {
-                runtime::diag::global().info(
-                    "config",
-                    &format!("applied {applied} env var(s) from config"),
-                );
-            }
-        }
-    }
-    let args: Vec<String> = env::args().skip(1).collect();
-    match parse_args(&args)? {
-        CliAction::BootstrapPlan { output_format } => print_bootstrap_plan(output_format)?,
-        CliAction::Agents {
-            args,
-            output_format,
-        } => {
-            // CLI 模式直接 println; LiveCli::print_agents 现已改为实例方法(走 tui_println)
-            let cwd = env::current_dir()?;
-            match output_format {
-                CliOutputFormat::Text => {
-                    println!("{}", handle_agents_slash_command(args.as_deref(), &cwd)?)
-                }
-                CliOutputFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&handle_agents_slash_command_json(
-                        args.as_deref(),
-                        &cwd,
-                    )?)?
-                ),
-            }
-        }
-        CliAction::Mcp {
-            args,
-            output_format,
-        } => {
-            // CLI 模式直接 println; LiveCli::print_mcp 现已改为实例方法(走 tui_println)
-            let args_ref = args.as_deref();
-            if matches!(args_ref.map(str::trim), Some("serve")) {
-                run_mcp_serve()?;
-            } else {
-                let cwd = env::current_dir()?;
-                match output_format {
-                    CliOutputFormat::Text => {
-                        println!("{}", handle_mcp_slash_command(args_ref, &cwd)?)
-                    }
-                    CliOutputFormat::Json => {
-                        let value = handle_mcp_slash_command_json(args_ref, &cwd)?;
-                        let is_error = value.get("ok").and_then(|v| v.as_bool()) == Some(false);
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                        if is_error {
-                            std::process::exit(1);
-                        }
-                    }
-                }
-            }
-        }
-        CliAction::Skills {
-            args,
-            output_format,
-        } => {
-            // CLI 模式直接 println; LiveCli::print_skills 现已改为实例方法(走 tui_println)
-            let cwd = env::current_dir()?;
-            match output_format {
-                CliOutputFormat::Text => {
-                    println!("{}", handle_skills_slash_command(args.as_deref(), &cwd)?)
-                }
-                CliOutputFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&handle_skills_slash_command_json(
-                        args.as_deref(),
-                        &cwd,
-                    )?)?
-                ),
-            }
-        }
-        CliAction::Plugins {
-            action,
-            target,
-            output_format,
-        } => LiveCli::print_plugins(action.as_deref(), target.as_deref(), output_format)?,
-        CliAction::PrintSystemPrompt {
-            cwd,
-            date,
-            model,
-            output_format,
-        } => print_system_prompt(cwd, date, &model, output_format)?,
-        CliAction::Version { output_format } => print_version(output_format)?,
-        CliAction::ResumeSession {
-            session_path,
-            commands,
-            output_format,
-        } => resume_session(&session_path, &commands, output_format),
-        CliAction::Status {
-            model,
-            model_flag_raw,
-            permission_mode,
-            output_format,
-            allowed_tools,
-        } => print_status_snapshot(
-            &model,
-            model_flag_raw.as_deref(),
-            permission_mode,
-            output_format,
-            allowed_tools.as_ref(),
-        )?,
-        CliAction::ForkSession { session_id, .. } => {
-            eprintln!(
-                "fork-session: {} -- session forking not yet implemented",
-                session_id
-            );
-        }
-        CliAction::ListSessions { .. } => {
-            eprintln!("list-sessions: session listing not yet implemented");
-        }
-        CliAction::Sandbox { output_format } => print_sandbox_status_snapshot(output_format)?,
-        CliAction::Prompt {
-            prompt,
-            model,
-            output_format,
-            allowed_tools,
-            permission_mode,
-            compact,
-            base_commit,
-            reasoning_effort,
-            thinking_mode,
-            allow_broad_cwd,
-            additional_workspace_roots,
-            output_verbosity,
-        } => {
-            enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
-            run_stale_base_preflight(base_commit.as_deref());
-            // Only consume piped stdin as prompt context when the permission
-            // mode is fully unattended. In modes where the permission
-            // prompter may invoke CliPermissionPrompter::decide(), stdin
-            // must remain available for interactive approval; otherwise the
-            // prompter's read_line() would hit EOF and deny every request.
-            let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess) {
-                read_piped_stdin()
-            } else {
-                None
-            };
-            let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            // 未显式传 --model 时，在派发点解析 CLAW_MODEL / settings.json
-            // model / 自动探测；解析留在执行侧而非 parse_args，保持参数解析
-            // 的纯函数语义（`claw status` 另在 print_status_snapshot 内解析）。
-            let model = resolve_repl_model(model);
-            let workspace = std::env::current_dir()?;
-            let mut cli = LiveCli::new(
-                model,
-                true,
-                allowed_tools,
-                permission_mode,
-                additional_workspace_roots,
-                output_verbosity,
-                &workspace,
-            )?;
-            cli.set_reasoning_effort(reasoning_effort);
-            cli.set_thinking_mode(thinking_mode);
-            // 内部交接：`claw serve` 的写入通道通过该环境变量让子进程在既有会话上继续，
-            // 而不是新建会话。仅当变量存在且指向可读文件时生效。
-            if let Some(session_file) = std::env::var_os("CLAW_RESUME_SESSION") {
-                let path = std::path::Path::new(&session_file);
-                if path.is_file() {
-                    // LiveCli::new 会先按当前时间建一个空会话；恢复成功后把这份
-                    // 只有 header 的弃用文件删掉，避免在会话列表里留下垃圾条目。
-                    let abandoned = cli.session_file_path();
-                    cli.resume_from_path(path)?;
-                    if abandoned != path
-                        && std::fs::metadata(&abandoned)
-                            .map(|meta| meta.len() < 4096)
-                            .unwrap_or(false)
-                    {
-                        let _ = std::fs::remove_file(&abandoned);
-                    }
-                }
-            }
-            cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
-        }
-        CliAction::Doctor {
-            output_format,
-            cache_stats,
-        } => run_doctor(output_format, cache_stats)?,
-        CliAction::State { output_format } => run_worker_state(output_format)?,
-        CliAction::Init {
-            output_format,
-            force,
-        } => run_init(output_format, force)?,
-        // #146: dispatch pure-local introspection. Text mode uses existing
-        // render_config_report/render_diff_report; JSON mode uses the
-        // corresponding _json helpers already exposed for resume sessions.
-        CliAction::Config {
-            section,
-            output_format,
-        } => match output_format {
-            CliOutputFormat::Text => {
-                println!("{}", render_config_report(section.as_deref())?);
-            }
-            CliOutputFormat::Json => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&render_config_json(section.as_deref())?)?
-                );
-            }
-        },
-        CliAction::Diff { output_format } => match output_format {
-            CliOutputFormat::Text => {
-                page_long_output(&render_diff_report()?);
-            }
-            CliOutputFormat::Json => {
-                let cwd = env::current_dir()?;
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&render_diff_json_for(&cwd)?)?
-                );
-            }
-        },
-        CliAction::Export {
-            session_reference,
-            output_path,
-            output_format,
-        } => run_export(&session_reference, output_path.as_deref(), output_format)?,
-        CliAction::Repl {
-            model,
-            allowed_tools,
-            permission_mode,
-            base_commit,
-            reasoning_effort,
-            thinking_mode,
-            allow_broad_cwd,
-            additional_workspace_roots,
-            output_verbosity,
-            tui,
-            enable_plan_mode,
-            enable_policy_engine,
-        } => {
-            if tui {
-                eprintln!("error: TUI 已移除，请使用 Web UI 启动：claw serve");
-                std::process::exit(1);
-            }
-            run_repl(
-                model,
-                allowed_tools,
-                permission_mode,
-                base_commit,
-                reasoning_effort,
-                thinking_mode,
-                allow_broad_cwd,
-                additional_workspace_roots,
-                output_verbosity,
-                enable_plan_mode,
-                enable_policy_engine,
-            )?
-        }
-        CliAction::Harness {
-            subcommand,
-            output_format,
-        } => run_harness_command(subcommand, output_format)?,
-        CliAction::EvolveSource {
-            action,
-            target,
-            output_format,
-        } => run_evolve_source(action.as_deref(), target.as_deref(), output_format)?,
-        CliAction::HelpTopic {
-            topic,
-            output_format,
-        } => print_help_topic(topic, output_format)?,
-        CliAction::Help { output_format } => print_help(output_format)?,
-    }
-    Ok(())
-}
-
-/// `claw harness <list|stats|rollback|evolve>` 分派(design-gaps #2)。
-///
-/// 操作当前目录 `.claw/decision_log.db` 中的 `harness_edits` 表。
-/// `--output-format json` 输出结构化数据(text 输出供人工阅读)。
-fn run_harness_command(
-    subcommand: HarnessCommand,
-    output_format: CliOutputFormat,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    let archive = runtime::harness_evolution::HarnessArchive::open(&cwd)
-        .map_err(|e| format!("cannot open harness archive: {e}"))?;
-
-    match subcommand {
-        HarnessCommand::List(status_filter) => {
-            let edits = archive
-                .list_edits(status_filter)
-                .map_err(|e| format!("cannot list harness edits: {e}"))?;
-            match output_format {
-                CliOutputFormat::Text => print_harness_edits_text(&edits),
-                CliOutputFormat::Json => {
-                    let payload = serde_json::to_string_pretty(&json!({
-                        "ok": true,
-                        "count": edits.len(),
-                        "edits": edits,
-                    }))?;
-                    println!("{payload}");
-                }
-            }
-        }
-        HarnessCommand::Stats => {
-            let stats = archive
-                .stats()
-                .map_err(|e| format!("cannot read harness stats: {e}"))?;
-            match output_format {
-                CliOutputFormat::Text => {
-                    println!(
-                        "harness_edits: total={} active={} candidate={} retired={} rule={} llm={}",
-                        stats.total,
-                        stats.active,
-                        stats.candidate,
-                        stats.retired,
-                        stats.rule_sourced,
-                        stats.llm_sourced,
-                    );
-                    println!(
-                        "active success_rate avg: {:.2}",
-                        stats.avg_active_success_rate
-                    );
-                }
-                CliOutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&stats)?);
-                }
-            }
-        }
-        HarnessCommand::RollbackAll => {
-            let n = archive
-                .rollback_all()
-                .map_err(|e| format!("rollback failed: {e}"))?;
-            match output_format {
-                CliOutputFormat::Text => {
-                    println!("rolled back {n} active harness edit(s)");
-                }
-                CliOutputFormat::Json => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&json!({
-                            "ok": true,
-                            "rolled_back": n,
-                        }))?
-                    );
-                }
-            }
-        }
-        HarnessCommand::RollbackId(id) => match archive.get_edit(&id) {
-            Ok(Some(_)) => {
-                archive
-                    .rollback(&id)
-                    .map_err(|e| format!("rollback failed: {e}"))?;
-                match output_format {
-                    CliOutputFormat::Text => println!("rolled back harness edit `{id}`"),
-                    CliOutputFormat::Json => {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&json!({
-                                "ok": true,
-                                "edit_id": id,
-                            }))?
-                        );
-                    }
-                }
-            }
-            Ok(None) => {
-                eprintln!("harness edit `{id}` not found");
-                std::process::exit(1);
-            }
-            Err(e) => return Err(format!("cannot read harness edit `{id}`: {e}").into()),
-        },
-        HarnessCommand::EvolveDryRun => {
-            // 预览一轮 evolution(不污染真实 archive):
-            // - 工具级信号:真实 failure_traces.jsonl + tool_call_stats.jsonl
-            //   (与 conversation.rs 运行时一致,见 failure_trace::load_all)。
-            // - turn 级信号:turn 级 TraceAnalyzer 在生产中是会话内存态,从不
-            //   落盘 traces.csv;无文件时用空 analyzer 继续(工具级信号仍可用)。
-            let config = runtime::harness_evolution::EvolutionConfig::default();
-            let failure_traces = runtime::failure_trace::load_all(&cwd).unwrap_or_default();
-            let tool_stats = runtime::tool_call_stats::load_all(&cwd).unwrap_or_default();
-            // 临时 archive:dry-run 语义「预览不写入」,在临时目录打开一个空库,
-            // 跑完整 evolve 后丢弃,真实 decision_log.db 的 harness_edits 不受影响。
-            let dry_run_root =
-                std::env::temp_dir().join(format!("claw-evolve-dryrun-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dry_run_root);
-            std::fs::create_dir_all(dry_run_root.join(".claw")).map_err(std::io::Error::other)?;
-            let dry_archive = runtime::harness_evolution::HarnessArchive::open(&dry_run_root)
-                .map_err(|e| format!("cannot open dry-run archive: {e}"))?;
-            let analyzer = runtime::trace_analyzer::TraceAnalyzer::new();
-            match runtime::harness_evolution::evolve(
-                &analyzer,
-                &failure_traces,
-                &tool_stats,
-                &dry_archive,
-                &config,
-            ) {
-                Ok(report) => match output_format {
-                    CliOutputFormat::Text => {
-                        println!(
-                            "dry-run (no writes): {} weaknesses, {} proposals, {} promoted, {} retired, {} skipped",
-                            report.weaknesses_count,
-                            report.proposals_count,
-                            report.promoted_count,
-                            report.retired_count,
-                            report.skipped_count
-                        );
-                    }
-                    CliOutputFormat::Json => {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
-                    }
-                },
-                Err(e) => {
-                    eprintln!("evolution dry-run failed: {e}");
-                    std::process::exit(1);
-                }
-            }
-            let _ = std::fs::remove_dir_all(&dry_run_root);
-        }
-    }
-    Ok(())
-}
-
-/// `claw evolve-source` 实现(P2 元认知闭环)。
-///
-/// 扫描源码根的 evolution inbox(见 `runtime::evolution_inbox`),操作:
-/// - `list`(默认):列出待处理提案
-/// - `process`:把提案标记为已处理(移入 `processed/`)
-/// - `show <file>`:打印指定提案内容
-fn run_evolve_source(
-    action: Option<&str>,
-    target: Option<&str>,
-    output_format: CliOutputFormat,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    let inbox = runtime::evolution_inbox::resolve_inbox_dir(&cwd);
-    let action = action.unwrap_or("list");
-    match action {
-        "list" => {
-            let pending = runtime::evolution_inbox::list_pending(&inbox);
-            match output_format {
-                CliOutputFormat::Text => {
-                    println!("evolution inbox: {}", inbox.display());
-                    if pending.is_empty() {
-                        println!("(无待处理提案)");
-                    } else {
-                        for p in &pending {
-                            println!("  - {}", p.display());
-                        }
-                        println!("共 {} 条待处理。", pending.len());
-                    }
-                }
-                CliOutputFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "ok": true,
-                        "inbox": inbox.display().to_string(),
-                        "pending_count": pending.len(),
-                        "pending": pending.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-                    }))?
-                ),
-            }
-        }
-        "process" => {
-            let pending = runtime::evolution_inbox::list_pending(&inbox);
-            let mut moved = Vec::new();
-            for p in &pending {
-                if let Some(dst) =
-                    runtime::evolution_inbox::mark_processed(&inbox, p)?
-                {
-                    moved.push(dst.display().to_string());
-                }
-            }
-            match output_format {
-                CliOutputFormat::Text => {
-                    println!("已处理 {} 条提案 → {}", moved.len(), inbox.join("processed").display());
-                }
-                CliOutputFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "ok": true,
-                        "processed_count": moved.len(),
-                        "processed": moved,
-                    }))?
-                ),
-            }
-        }
-        "show" => {
-            let Some(target) = target else {
-                return Err("`claw evolve-source show` requires a proposal file path".into());
-            };
-            let path = PathBuf::from(target);
-            let body = std::fs::read_to_string(&path)
-                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-            match output_format {
-                CliOutputFormat::Text => println!("{body}"),
-                CliOutputFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "ok": true,
-                        "path": path.display().to_string(),
-                        "content": body,
-                    }))?
-                ),
-            }
-        }
-        "run" => {
-            // P3: 唤醒进化子智能体 —— 以 cwd=源码根 启动一个无头 claw 进程,
-            // 喂入"进化任务提示"(见 evolution_runner::evolution_prompt)。
-            // 安全:① 递归防护(CLAW_EVOLUTION_ACTIVE);② 子智能体提示内嵌硬性
-            // 约束(不改测试/黑名单/测试门);③ 子智能体**不自行部署**(人工闸门)。
-            if std::env::var_os("CLAW_EVOLUTION_ACTIVE").is_some() {
-                return Err("递归防护:当前已处于进化会话,拒绝再次 spawn 进化子智能体".into());
-            }
-            let Some(source_root) = runtime::source_root::resolve_source_root() else {
-                return Err(
-                    "未登记源码根:请先设置 CLAW_SOURCE_ROOT 或在源码树内运行一次热升级".into(),
-                );
-            };
-            // P4: 获取进化锁,防多实例并发 cargo build / exe 覆盖竞争。
-            let _lock = match runtime::evolution_lock::EvolutionLock::acquire(&source_root)? {
-                Some(l) => l,
-                None => {
-                    return Err(
-                        "另一个进化会话正在运行(进化锁被持有);请等待其结束或删除 \
-                         <源码根>/.claw/evolution/.lock"
-                            .into(),
-                    )
-                }
-            };
-            // 目标:优先指定提案文件,否则取 inbox 第一条待处理。
-            let proposal_path = match target {
-                Some(t) => PathBuf::from(t),
-                None => {
-                    let pending = runtime::evolution_inbox::list_pending(&inbox);
-                    match pending.into_iter().next() {
-                        Some(p) => p,
-                        None => return Err("inbox 无待处理提案,无可进化目标".into()),
-                    }
-                }
-            };
-            let text = std::fs::read_to_string(&proposal_path)
-                .map_err(|e| format!("cannot read {}: {e}", proposal_path.display()))?;
-            let parsed = runtime::evolution_runner::parse_proposal(&text);
-            let prompt = runtime::evolution_runner::evolution_prompt(&proposal_path, &parsed);
-            let exe = env::current_exe()?;
-            let mut cmd = std::process::Command::new(&exe);
-            cmd.current_dir(&source_root)
-                .env("CLAW_EVOLUTION_ACTIVE", "1")
-                .args(["--dangerously-skip-permissions", "-p", &prompt]);
-            match output_format {
-                CliOutputFormat::Text => {
-                    println!("唤醒进化子智能体:\n  cwd={}\n  提案={}", source_root.display(), proposal_path.display());
-                    println!("（子智能体将改码→测试门→提交,不自行部署;完成后请人工复核）");
-                }
-                CliOutputFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "ok": true,
-                        "source_root": source_root.display().to_string(),
-                        "proposal": proposal_path.display().to_string(),
-                        "spawned": true,
-                    }))?
-                ),
-            }
-            // 前台执行:子智能体输出直接可见(TUI 模式下用户可观察)。
-            let status = cmd.status()?;
-            if !status.success() {
-                return Err(format!("进化子智能体退出码非零: {status}").into());
-            }
-            // 成功后把提案标记为已处理(移入 processed/)。
-            let _ = runtime::evolution_inbox::mark_processed(&inbox, &proposal_path);
-        }
-        "install" => {
-            // P4(人工闸门):显式部署 —— 构建 release 并回拷到当前运行路径,
-            // **下次启动生效**(不强制重启,与 §3.4 约束 3 的"人工闸门"一致)。
-            let Some(source_root) = runtime::source_root::resolve_source_root() else {
-                return Err("未登记源码根:请先设置 CLAW_SOURCE_ROOT".into());
-            };
-            let _lock = match runtime::evolution_lock::EvolutionLock::acquire(&source_root)? {
-                Some(l) => l,
-                None => return Err("另一个进化会话正在运行(进化锁被持有)".into()),
-            };
-            // 1. 构建 release。
-            let status = std::process::Command::new("cargo")
-                .args(["build", "--release", "-p", "rusty-claude-cli"])
-                .current_dir(&source_root)
-                .status()
-                .map_err(|e| format!("启动 cargo 失败: {e}"))?;
-            if !status.success() {
-                return Err("cargo build --release 失败,拒绝部署".into());
-            }
-            // 2. 定位产物与部署目标。
-            let exe = env::current_exe()?;
-            let name = exe
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or("无法获取当前 exe 文件名")?;
-            let built = source_root.join("target").join("release").join(name);
-            if !built.is_file() {
-                return Err(format!("构建产物缺失: {}", built.display()).into());
-            }
-            // 3. Windows 不允许覆盖运行中的 exe:先 rename 旧文件为 .old。
-            let old = {
-                let mut s = exe.clone().into_os_string();
-                s.push(".old");
-                PathBuf::from(s)
-            };
-            let _ = std::fs::remove_file(&old);
-            if let Err(e) = std::fs::rename(&exe, &old) {
-                return Err(format!("备份 {} 失败: {e}", exe.display()).into());
-            }
-            if let Err(e) = std::fs::copy(&built, &exe) {
-                // 回滚:恢复旧 exe,避免 brick。
-                let _ = std::fs::rename(&old, &exe);
-                return Err(format!("回拷到 {} 失败(已回滚): {e}", exe.display()).into());
-            }
-            match output_format {
-                CliOutputFormat::Text => println!(
-                    "已部署: {} → {}\n旧二进制备份: {}\n**下次启动生效**;如需立即生效请执行热升级(/upgrade)。",
-                    built.display(),
-                    exe.display(),
-                    old.display()
-                ),
-                CliOutputFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "ok": true,
-                        "built": built.display().to_string(),
-                        "installed": exe.display().to_string(),
-                        "backup": old.display().to_string(),
-                        "takes_effect": "next_start",
-                    }))?
-                ),
-            }
-        }
-        "auto" => {
-            // 自动进化管道入口: 由上报钩子以 detached 方式拉起(`evolve-source auto`)。
-            // 全流程 = 取 inbox 首条 → 源码根拉起 claw 子进程修复(测试门)→
-            // 真实 diff 黑名单硬校验 → 自动部署到全局回拷。
-            // 任何一步不过即中止, 提案保留在 inbox 等下次重试, 绝不半截部署。
-            let Some(source_root) = runtime::source_root::resolve_source_root() else {
-                return Err("未登记源码根,无法执行自动进化".into());
-            };
-            match runtime::evolution_auto::run_pipeline(&source_root) {
-                Ok(msg) => match output_format {
-                    CliOutputFormat::Text => println!("[evolve-auto] {msg}"),
-                    CliOutputFormat::Json => println!(
-                        "{}",
-                        serde_json::to_string_pretty(&json!({
-                            "ok": true,
-                            "result": msg,
-                        }))?
-                    ),
-                },
-                Err(e) => {
-                    // 失败不是异常路径(常见的: 无待办/锁被占/无法复现),
-                    // 但仍要可见 —— 否则自动管道哑火时无人知晓。
-                    eprintln!("[evolve-auto] 未部署: {e}");
-                }
-            }
-        }
-        other => {
-            return Err(format!(
-                "unknown evolve-source action `{other}`; expected list | process | show | run | install | auto"
-            )
-            .into())
-        }
-    }
-    Ok(())
-}
-fn print_harness_edits_text(edits: &[runtime::harness_evolution::HarnessEdit]) {
-    if edits.is_empty() {
-        println!("no harness edits");
-        return;
-    }
-    for edit in edits {
-        let created = format_ms_timestamp(edit.created_at);
-        println!(
-            "[{}] {}  status={}  source={}  verify={} success={} rate={:.2}  created={}",
-            edit.status.as_db_str(),
-            edit.id,
-            edit.pathology,
-            edit.source.as_db_str(),
-            edit.verify_count,
-            edit.success_count,
-            edit.success_rate(),
-            created,
-        );
-        if let Some(reason) = &edit.retire_reason {
-            println!("    retired: {reason}");
-        }
-        println!("    content: {}", truncate_inline(&edit.content, 120));
-    }
-}
-
-/// ms 时间戳 → 本地 `YYYY-MM-DD HH:MM:SS`。
-fn format_ms_timestamp(ms: i64) -> String {
-    use chrono::{DateTime, Local, Utc};
-    let Some(dt) = DateTime::<Utc>::from_timestamp_millis(ms) else {
-        return String::new();
-    };
-    dt.with_timezone(&Local)
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
-}
-
-/// 单行截断(供 CLI 文本展示,保留可读性)。
-fn truncate_inline(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
-        s.to_string()
-    } else {
-        let truncated: String = chars[..max].iter().collect();
-        format!("{truncated}…")
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CliOutputFormat {
-    Text,
-    Json,
-}
-
-impl CliOutputFormat {
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "text" => Ok(Self::Text),
-            "json" => Ok(Self::Json),
-            other => Err(format!(
-                "unsupported value for --output-format: {other} (expected text or json)"
-            )),
-        }
-    }
-}
-
-pub fn resolve_model_alias(model: &str) -> &str {
-    // DeepSeek-only build: built-in aliases are resolved by the api crate's
-    // `api::resolve_model_alias` (e.g. "pro"/旧 ID -> "deepseek-flash"). The CLI
-    // layer no longer maintains its own alias table.
-    model
-}
-
-/// Resolve a model name through user-defined config aliases first, then fall
-/// back to the built-in alias table. This is the entry point used wherever a
-/// user-supplied model string is about to be dispatched to a provider.
-pub fn resolve_model_alias_with_config(model: &str) -> String {
-    let trimmed = model.trim();
-    if let Some(resolved) = config_alias_for_current_dir(trimmed) {
-        return resolve_model_alias(&resolved).to_string();
-    }
-    resolve_model_alias(trimmed).to_string()
-}
-
-/// Validate model syntax at parse time.
-/// Accepts: bare DeepSeek model names or provider/model pattern.
-/// Rejects: empty, whitespace-only, strings with spaces, or invalid chars.
-pub fn validate_model_syntax(model: &str) -> Result<(), String> {
-    let trimmed = model.trim();
-    if trimmed.is_empty() {
-        return Err("model string cannot be empty".to_string());
-    }
-    // Check for spaces (malformed)
-    if trimmed.contains(' ') {
-        return Err(format!(
-            "invalid model syntax: '{}' contains spaces. Use provider/model format or a known DeepSeek model name",
-            trimmed
-        ));
-    }
-    // 网页版后端(deepseek-web)不是 API provider 模型,单独放行,由运行时
-    // 路由到 web-bridge 的登录态客户端(见 build_api_client)。
-    if trimmed == WEB_MODEL_NAME {
-        return Ok(());
-    }
-    // Check provider/model format: provider_id/model_id
-    let parts: Vec<&str> = trimmed.split('/').collect();
-    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-        // Bare model names that metadata_for_model can route to a provider
-        // are valid without the `provider/` prefix. This includes:
-        //   deepseek-flash, deepseek-chat, deepseek-reasoner
-        if api::metadata_for_model(trimmed).is_some() {
-            return Ok(());
-        }
-        let err_msg = format!(
-            "invalid model syntax: '{}'. Expected provider/model (e.g., deepseek/deepseek-flash) or a known DeepSeek model name",
-            trimmed
-        );
-        return Err(err_msg);
-    }
-    Ok(())
-}
-
-pub fn config_alias_for_current_dir(alias: &str) -> Option<String> {
-    if alias.is_empty() {
-        return None;
-    }
-    let cwd = env::current_dir().ok()?;
-    let loader = ConfigLoader::default_for(&cwd);
-    let config = loader.load().ok()?;
-    config.aliases().get(alias).cloned()
-}
-
-pub fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
-    if values.is_empty() {
-        return Ok(None);
-    }
-    current_tool_registry()?.normalize_allowed_tools(values)
-}
-
-pub fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
-    let cwd = env::current_dir().map_err(|error| error.to_string())?;
-    let loader = ConfigLoader::default_for(&cwd);
-    let runtime_config = loader.load().map_err(|error| error.to_string())?;
-    let state = build_runtime_plugin_state_with_loader(&cwd, &loader, &runtime_config)
-        .map_err(|error| error.to_string())?;
-    let registry = state.tool_registry.clone();
-    if let Some(mcp_state) = state.mcp_state {
-        mcp_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .shutdown()
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(registry)
-}
-
-pub fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
-    normalize_permission_mode(value)
-        .ok_or_else(|| {
-            format!(
-                "unsupported permission mode '{value}'. Use read-only, workspace-write, or danger-full-access."
-            )
-        })
-        .map(permission_mode_from_label)
-}
-
-pub fn permission_mode_from_label(mode: &str) -> PermissionMode {
-    match mode {
-        "read-only" => PermissionMode::ReadOnly,
-        "workspace-write" => PermissionMode::WorkspaceWrite,
-        "danger-full-access" => PermissionMode::DangerFullAccess,
-        other => panic!("unsupported permission mode label: {other}"),
-    }
-}
-
-pub fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> PermissionMode {
-    match mode {
-        ResolvedPermissionMode::ReadOnly => PermissionMode::ReadOnly,
-        ResolvedPermissionMode::WorkspaceWrite => PermissionMode::WorkspaceWrite,
-        ResolvedPermissionMode::DangerFullAccess => PermissionMode::DangerFullAccess,
-    }
-}
-
-pub fn default_permission_mode() -> PermissionMode {
-    env::var("RUSTY_CLAUDE_PERMISSION_MODE")
-        .ok()
-        .as_deref()
-        .and_then(normalize_permission_mode)
-        .map(permission_mode_from_label)
-        .or_else(config_permission_mode_for_current_dir)
-        .unwrap_or(PermissionMode::DangerFullAccess)
-}
-
-pub fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
-    let cwd = env::current_dir().ok()?;
-    let loader = ConfigLoader::default_for(&cwd);
-    loader
-        .load()
-        .ok()?
-        .permission_mode()
-        .map(permission_mode_from_resolved)
-}
-
-pub fn config_model_for(workspace: &Path) -> Option<String> {
-    let loader = ConfigLoader::default_for(workspace);
-    loader.load().ok()?.model().map(ToOwned::to_owned)
-}
-
-/// 兼容包装：从进程当前目录读取配置模型。`cwd-allowlist: cli-entry`
-pub fn config_model_for_current_dir() -> Option<String> {
-    let cwd = env::current_dir().ok()?;
-    config_model_for(&cwd)
-}
-
-pub fn resolve_repl_model(cli_model: String) -> String {
-    if cli_model != DEFAULT_MODEL {
-        return cli_model;
-    }
-    if let Some(env_model) = env::var("CLAW_MODEL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        return resolve_model_alias_with_config(&env_model);
-    }
-    if let Some(config_model) = config_model_for_current_dir() {
-        return resolve_model_alias_with_config(&config_model);
-    }
-    // Zero-config auto-detection: pick the best available model based on
-    // which API keys are present in the environment or .env file.
-    detect_best_available_model()
-}
-
-/// Auto-detect the best available model based on which API keys are present
-/// in the environment or `.env` file.
-///
-/// DeepSeek-only build: checks `DEEPSEEK_API_KEY`. Falls back to
-/// [`DEFAULT_MODEL`] when no API key is found (connection will fail with a
-/// clear auth error at that point).
-fn detect_best_available_model() -> String {
-    if api::has_api_key("DEEPSEEK_API_KEY") {
-        return DEFAULT_MODEL.to_string();
-    }
-    DEFAULT_MODEL.to_string()
-}
-
-/// Returns `true` if at least one provider API key is available in the
-/// environment or `.env` file. Used to skip the first-run wizard when the
-/// user has pre-configured keys (zero-config auto-bootstrap).
-fn any_api_key_available() -> bool {
-    api::has_api_key("DEEPSEEK_API_KEY")
-}
-
-pub fn provider_label(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::DeepSeek => "deepseek",
-    }
-}
-
-pub fn format_connected_line(model: &str) -> String {
-    let provider = provider_label(detect_provider_kind(model));
-    format!("Connected: {model} via {provider}")
-}
-
-pub fn filter_tool_specs(
-    tool_registry: &GlobalToolRegistry,
-    allowed_tools: Option<&AllowedToolSet>,
-) -> Vec<ToolDefinition> {
-    tool_registry.definitions(allowed_tools)
-}
-
-pub(crate) fn parse_system_prompt_args(
-    args: &[String],
-    model: String,
-    output_format: CliOutputFormat,
-) -> Result<CliAction, String> {
-    let mut cwd = env::current_dir().map_err(|error| error.to_string())?;
-    let mut date = DEFAULT_DATE.to_string();
-    let mut index = 0;
-
-    while index < args.len() {
-        match args[index].as_str() {
-            "--cwd" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --cwd".to_string())?;
-                cwd = PathBuf::from(value);
-                index += 2;
-            }
-            "--date" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --date".to_string())?;
-                date.clone_from(value);
-                index += 2;
-            }
-            other => {
-                // #152: hint `--output-format json` when user types `--json`.
-                let mut msg = format!("unknown system-prompt option: {other}");
-                if other == "--json" {
-                    msg.push_str("\nDid you mean `--output-format json`?");
-                }
-                return Err(msg);
-            }
-        }
-    }
-
-    Ok(CliAction::PrintSystemPrompt {
-        cwd,
-        date,
-        model,
-        output_format,
-    })
-}
-
-pub(crate) fn parse_export_args(
-    args: &[String],
-    output_format: CliOutputFormat,
-) -> Result<CliAction, String> {
-    let mut session_reference = LATEST_SESSION_REFERENCE.to_string();
-    let mut output_path: Option<PathBuf> = None;
-    let mut index = 0;
-
-    while index < args.len() {
-        match args[index].as_str() {
-            "--session" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --session".to_string())?;
-                session_reference.clone_from(value);
-                index += 2;
-            }
-            flag if flag.starts_with("--session=") => {
-                session_reference = flag[10..].to_string();
-                index += 1;
-            }
-            "--output" | "-o" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| format!("missing value for {}", args[index]))?;
-                output_path = Some(PathBuf::from(value));
-                index += 2;
-            }
-            flag if flag.starts_with("--output=") => {
-                output_path = Some(PathBuf::from(&flag[9..]));
-                index += 1;
-            }
-            other if other.starts_with('-') => {
-                return Err(format!("unknown export option: {other}"));
-            }
-            other if output_path.is_none() => {
-                output_path = Some(PathBuf::from(other));
-                index += 1;
-            }
-            other => {
-                return Err(format!("unexpected export argument: {other}"));
-            }
-        }
-    }
-
-    Ok(CliAction::Export {
-        session_reference,
-        output_path,
-        output_format,
-    })
-}
-
-pub(crate) fn parse_resume_args(
-    args: &[String],
-    output_format: CliOutputFormat,
-) -> Result<CliAction, String> {
-    let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
-        None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
-        Some(first) if looks_like_slash_command_token(first) => {
-            (PathBuf::from(LATEST_SESSION_REFERENCE), args)
-        }
-        Some(first) => (PathBuf::from(first), &args[1..]),
-    };
-    let mut commands = Vec::new();
-    let mut current_command = String::new();
-
-    for token in command_tokens {
-        if token.trim_start().starts_with('/') {
-            if resume_command_can_absorb_token(&current_command, token) {
-                current_command.push(' ');
-                current_command.push_str(token);
-                continue;
-            }
-            if !current_command.is_empty() {
-                commands.push(current_command);
-            }
-            current_command = String::from(token.as_str());
-            continue;
-        }
-
-        if current_command.is_empty() {
-            return Err("--resume trailing arguments must be slash commands".to_string());
-        }
-
-        current_command.push(' ');
-        current_command.push_str(token);
-    }
-
-    if !current_command.is_empty() {
-        commands.push(current_command);
-    }
-
-    Ok(CliAction::ResumeSession {
-        session_path,
-        commands,
-        output_format,
-    })
-}
-
-pub fn git_output(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(env::current_dir()?)
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(format!("git {} failed: {stderr}", args.join(" ")).into());
-    }
-    Ok(String::from_utf8(output.stdout)?)
-}
-
-pub fn git_status_ok(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(env::current_dir()?)
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(format!("git {} failed: {stderr}", args.join(" ")).into());
-    }
-    Ok(())
-}
-
 pub fn command_exists(name: &str) -> bool {
     Command::new("which")
         .arg(name)
@@ -1604,41 +179,69 @@ pub fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn write_temp_text_file(
-    filename: &str,
-    contents: &str,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let path = env::temp_dir().join(filename);
-    fs::write(&path, contents)?;
-    Ok(path)
+pub fn permission_mode_from_label(mode: &str) -> runtime::PermissionMode {
+    match mode {
+        "read-only" => runtime::PermissionMode::ReadOnly,
+        "workspace-write" => runtime::PermissionMode::WorkspaceWrite,
+        "danger-full-access" => runtime::PermissionMode::DangerFullAccess,
+        other => panic!("unsupported permission mode label: {other}"),
+    }
 }
 
-pub struct PluginsCommandPayload {
-    pub message: String,
-    pub reload_runtime: bool,
-    pub status: &'static str,
-    pub config_load_error: Option<String>,
-    pub plugins: Vec<Value>,
-    pub load_failures: Vec<Value>,
+pub fn config_model_for(workspace: &Path) -> Option<String> {
+    let loader = ConfigLoader::default_for(workspace);
+    loader.load().ok()?.model().map(ToOwned::to_owned)
+}
+
+/// 摘要截断：按字符数截断并在溢出时追加省略号。
+pub(crate) fn truncate_for_summary(value: &str, limit: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+/// 工具 ID 摘要：超过 12 字符时截断并追加省略号。
+pub(crate) fn short_tool_id(id: &str) -> String {
+    let char_count = id.chars().count();
+    if char_count <= 12 {
+        return id.to_string();
+    }
+    let prefix: String = id.chars().take(12).collect();
+    format!("{prefix}…")
+}
+
+fn help_text() -> String {
+    format!(
+        "claw {version}
+
+用法:
+  claw serve [选项]      启动 Web UI 服务（唯一产品入口）
+  claw --version         打印版本
+  claw --help            显示本帮助
+
+说明:
+  Phase 3 起 CLI/TUI 界面已移除。所有交互请通过 `claw serve` 打开 Web UI。
+  以 `claw-web` 文件名启动时等价于 `claw serve`。
+",
+        version = version_label()
+    )
 }
 
 /// `claw` / `claw-plus` binary 的统一入口。
 ///
-/// 注册 panic hook（落盘到 ~/.claw/claw-crash.log），然后调用 `run()`。
-/// 错误时按 `--output-format` 决定 JSON 或文本输出，最后 `exit(1)`。
-/// `src/main.rs`（claw-plus bin）和 `src/bin/claw.rs`（claw bin）都调用此函数，
-/// 避免入口逻辑重复。
+/// 只处理三件事：`--upgrade-helper`、`serve`、`--version/--help`。
 pub fn main_entry() {
     // 诊断：注册 panic hook,落盘到 ~/.claw/claw-crash.log
     // 双击运行时 stderr 不可见,panic hook 是唯一能确认"是否 panic"的可靠信号。
-    // Multi-Agent Hardening §0.1 v2 修正:提取内联闭包到 runtime::diag 模块,
-    // 供 main_entry/headless/测试入口复用,避免 hook 注册逻辑重复。
     runtime::diag::install_panic_hook();
 
     // 热升级助手分支(任务 2 一键化):检测 --upgrade-helper <user_cwd>。
     // 由旧进程 /upgrade spawn 的独立进程(新终端),自动化
     // "等旧进程退出 → mv exe.old → cargo build → 启动新进程"。
-    // 此分支不进 REPL/TUI,直接执行迁移后退出。
     let mut argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--upgrade-helper") {
         let user_cwd = argv
@@ -1683,58 +286,22 @@ pub fn main_entry() {
         argv.insert(1, "serve".to_string());
     }
 
-    // B1 本地只读 Web 视图：独立于 REPL/TUI 的子命令，走早期分支。
-    // 只绑定 127.0.0.1，启动时打印带一次性 token 的 URL。
-    if argv.get(1).map(String::as_str) == Some("serve") {
-        if let Err(error) = serve::run_web(&argv[2..]) {
-            eprintln!("serve failed: {error}");
-            std::process::exit(1);
-        }
-        return;
-    }
-
-    if let Err(error) = run() {
-        let message = error.to_string();
-        // When --output-format json is active, emit errors as JSON so downstream
-        // tools can parse failures the same way they parse successes (ROADMAP #42).
-        let argv: Vec<String> = std::env::args().collect();
-        let json_output = argv
-            .windows(2)
-            .any(|w| w[0] == "--output-format" && w[1] == "json")
-            || argv.iter().any(|a| a == "--output-format=json");
-        if json_output {
-            // #77: classify error by prefix so downstream claws can route without
-            // regex-scraping the prose. Split short-reason from hint-runbook.
-            let kind = classify_error_kind(&message);
-            let (short_reason, hint) = split_error_hint(&message);
-            eprintln!(
-                "{}",
-                serde_json::json!({
-                    "type": "error",
-                    "error": short_reason,
-                    "kind": kind,
-                    "hint": hint,
-                    "exit_code": 1,
-                })
-            );
-        } else {
-            // #156: Add machine-readable error kind to text output so stderr observers
-            // don't need to regex-scrape the prose.
-            let kind = classify_error_kind(&message);
-            if message.contains("`claw --help`") {
-                eprintln!(
-                    "[error-kind: {kind}]
-error: {message}"
-                );
-            } else {
-                eprintln!(
-                    "[error-kind: {kind}]
-error: {message}
-
-Run `claw --help` for usage."
-                );
+    match argv.get(1).map(String::as_str) {
+        Some("serve") => {
+            // 只绑定 127.0.0.1，启动时打印带一次性 token 的 URL。
+            if let Err(error) = serve::run_web(&argv[2..]) {
+                eprintln!("serve failed: {error}");
+                std::process::exit(1);
             }
         }
-        std::process::exit(1);
+        Some("--version" | "-V") => println!("claw {}", version_label()),
+        Some("--help" | "-h") | None => println!("{}", help_text()),
+        Some(other) => {
+            eprintln!(
+                "error: 不支持的参数 `{other}` —— Phase 3 起 CLI 子命令已移除。\n\n{}",
+                help_text()
+            );
+            std::process::exit(1);
+        }
     }
 }

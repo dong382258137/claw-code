@@ -1,5 +1,11 @@
 # Claw Plus Usage
 
+> **Phase 3 起 CLI/TUI 界面已移除。** 当前产品入口只有本地 Web UI：
+> 构建后在 `rust/` 下运行 `cargo run --release -p rusty-claude-cli --bin claw -- serve`，
+> 浏览器打开启动日志中带 token 的 URL。
+> 本文档保留为历史 CLI 参考（`/doctor`、REPL、子命令等均已不可用），
+> 构建与环境信息仍适用；Web UI 使用说明见 [README](./README.md)。
+
 > 本项目是 [dong382258137/claw-code](https://github.com/dong382258137/claw-code)（MIT License）的 fork，本使用指南经适配修改。
 
 This guide covers the current Rust workspace under `rust/` and the `claw-plus` CLI binary. If you are brand new, make the doctor health check your first run: start `claw-plus`, then run `/doctor`.

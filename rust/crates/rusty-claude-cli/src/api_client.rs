@@ -1,20 +1,13 @@
-﻿//! Streaming API client: SSE consumption, message conversion, error formatting.
+﻿//! API client: SSE consumption, message conversion, error formatting.
 //!
-//! This module groups the API client wiring (`AnthropicRuntimeClient`), the
-//! streaming SSE consumption loop (`consume_stream`), the request building
-//! helpers (`build_system_blocks`, `mark_last_tool_with_cache_control`,
-//! `convert_messages`, `extract_system_messages`), and the error formatting
-//! helpers (`format_user_visible_api_error`, `format_context_window_blocked_error`).
-//!
-//! These pieces are co-located so that the `impl ApiClient for AnthropicRuntimeClient`
-//! and its private `consume_stream` helper can share the message conversion
-//! and event-emission utilities without sprinkling `pub(crate)` across
-//! every other file.
+//! 本模块由原 `streaming.rs` 收敛而来：保留 API 客户端接线
+//! (`AnthropicRuntimeClient`)、SSE 消费循环、请求构造 helper 与错误格式化；
+//! 终端渲染（Markdown 流式渲染、工具卡片、thinking 摘要）已全部移除，
+//! 流式状态统一经 `StatusEvent` 输出给 Web SSE。
 
 #![allow(dead_code, unused_imports, unused_variables)]
 
 use std::collections::BTreeSet;
-use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -35,10 +28,7 @@ use runtime::{
 use serde_json::json;
 use tools::GlobalToolRegistry;
 
-use crate::render::{MarkdownStreamState, TerminalRenderer};
-use crate::tool_display::{format_tool_call_start, truncate_for_summary};
-use crate::ultraplan::InternalPromptProgressReporter;
-use crate::{filter_tool_specs, max_tokens_for_model, AllowedToolSet};
+use crate::{filter_tool_specs, max_tokens_for_model, truncate_for_summary, AllowedToolSet};
 
 /// Callback type for emitting streaming events to a status observer.
 /// Type 已上移到 runtime crate(供 `Box<dyn ApiClient>` 经 trait 注入),
@@ -133,10 +123,8 @@ pub(crate) struct AnthropicRuntimeClient {
     session_id: String,
     model: String,
     enable_tools: bool,
-    emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
-    progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
     /// DeepSeek thinking-mode toggle: Some(true)=显式开启思考,
     /// Some(false)=关闭思考(非思考模式), None=不发送字段走模型默认。
@@ -187,10 +175,8 @@ impl AnthropicRuntimeClient {
         session_id: &str,
         model: String,
         enable_tools: bool,
-        emit_output: bool,
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
-        progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // DeepSeek-only build: the api crate's `ProviderClient::from_model`
         // reads `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` from the environment
@@ -216,10 +202,8 @@ impl AnthropicRuntimeClient {
             session_id: session_id.to_string(),
             model,
             enable_tools,
-            emit_output,
             allowed_tools,
             tool_registry,
-            progress_reporter,
             reasoning_effort: None,
             thinking_mode: None,
             status_emitter: None,
@@ -430,9 +414,6 @@ impl ApiClient for AnthropicRuntimeClient {
 
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        if let Some(progress_reporter) = &self.progress_reporter {
-            progress_reporter.mark_model_phase();
-        }
         let is_post_tool = request_ends_with_tool_result(&request);
 
         // Extract system-role messages so they route through MessageRequest.system
@@ -519,7 +500,6 @@ impl ApiClient for AnthropicRuntimeClient {
     /// [`stream`](Self::stream)。
     ///
     /// 与同步版本语义完全一致:
-    /// - 触发 `progress_reporter.mark_model_phase()`
     /// - 计算 `is_post_tool` / `effective_effort` 路由
     /// - 单次 `consume_stream` 调用(stall 仍由内部 `tokio::time::timeout` 保护)
     ///
@@ -536,9 +516,6 @@ impl ApiClient for AnthropicRuntimeClient {
         >,
     > {
         Box::pin(async move {
-            if let Some(progress_reporter) = &self.progress_reporter {
-                progress_reporter.mark_model_phase();
-            }
             let is_post_tool = request_ends_with_tool_result(&request);
 
             // 与同步 `stream` 一致:抽离 system 角色消息走 system 字段(prompt cache)
@@ -611,9 +588,7 @@ impl ApiClient for AnthropicRuntimeClient {
     ///
     /// 子 agent client 配置:
     /// - `enable_tools = false`:子 agent 走单轮 LLM 请求,不调用工具
-    /// - `emit_output = false`:静默执行,不污染主 agent 的 stdout
     /// - `allowed_tools = None`:无工具白名单
-    /// - `progress_reporter = None`:不订阅进度事件
     /// - `status_emitter = None`:不订阅状态事件
     /// - 复用主 agent 的 `session_id` 前缀 + `tool_registry`(共享工具定义);
     ///   子请求经 `request_kind = Subagent` 路由到独立 `subagent-{session}` 缓存统计(3b)
@@ -622,10 +597,8 @@ impl ApiClient for AnthropicRuntimeClient {
             &self.session_id,
             model.to_string(),
             false, // enable_tools:子 agent 不调用工具
-            false, // emit_output:静默
             None,  // allowed_tools
             self.tool_registry.clone(),
-            None, // progress_reporter
         )
         .map_err(|e| format!("failed to construct subagent client for {model}: {e}"))?;
         Ok(Box::new(client))
@@ -641,7 +614,7 @@ impl ApiClient for AnthropicRuntimeClient {
     ///   如 browser_control)合并进 `AllowedToolSet`,使子代理可真正调用
     ///   它们——否则 API 层 schema 缺失,模型不会生成对应 tool_use
     ///
-    /// 子 agent client 其余配置与 `with_model` 一致:静默执行、无进度/状态订阅、
+    /// 子 agent client 其余配置与 `with_model` 一致:静默执行、无状态订阅、
     /// 复用主 agent 的 `session_id` 前缀 + `tool_registry`。
     fn with_model_and_capability(
         &self,
@@ -662,10 +635,8 @@ impl ApiClient for AnthropicRuntimeClient {
             &self.session_id,
             model.to_string(),
             enable_tools,
-            false, // emit_output:静默
             allowed_tools,
             self.tool_registry.clone(),
-            None, // progress_reporter
         )
         .map_err(|e| format!("failed to construct subagent client for {model}: {e}"))?;
         Ok(Box::new(client))
@@ -802,18 +773,6 @@ impl AnthropicRuntimeClient {
                 ));
             }
         };
-        let mut stdout = io::stdout();
-        let mut sink = io::sink();
-        // v3:使用 `dyn Write + Send` 让 `consume_stream` 返回的 Future 为 `Send`,
-        // 从而可在 `stream_async` 中直接 `.await`(消除嵌套 runtime)。
-        // `io::Stdout` 与 `io::Sink` 均为 `Send + Sync`,满足此 bound。
-        let out: &mut (dyn Write + Send) = if self.emit_output {
-            &mut stdout
-        } else {
-            &mut sink
-        };
-        let renderer = TerminalRenderer::new();
-        let mut markdown_stream = MarkdownStreamState::default();
         let mut events = Vec::new();
         let mut pending_tool: Option<(String, String, String)> = None;
         // P0 修复：thinking 内容累积器。
@@ -900,7 +859,6 @@ impl AnthropicRuntimeClient {
                     for block in start.message.content {
                         push_output_block(
                             block,
-                            out,
                             &mut events,
                             &mut pending_tool,
                             true,
@@ -953,7 +911,6 @@ impl AnthropicRuntimeClient {
                     let pre_len = events.len();
                     push_output_block(
                         start.content_block,
-                        out,
                         &mut events,
                         &mut pending_tool,
                         true,
@@ -962,7 +919,7 @@ impl AnthropicRuntimeClient {
                     )?;
                     // P0 修复：OpenAI-compatible 提供商（DeepSeek 等）可能在
                     // ContentBlockStart 中携带完整文本块。push_output_block 只写入
-                    // out（TUI 下为 io::sink），需额外 emit TextDelta 给 TUI 渲染。
+                    // events，需额外 emit TextDelta 给状态观察者渲染。
                     for event in &events[pre_len..] {
                         if let AssistantEvent::TextDelta(text) = event {
                             self.emit_status(StatusEvent::TextDelta(text.clone()));
@@ -1009,17 +966,6 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                     ContentBlockDelta::TextDelta { text } => {
                         if !text.is_empty() {
-                            if let Some(progress_reporter) = &self.progress_reporter {
-                                progress_reporter.mark_text_phase(&text);
-                            }
-                            if let Some(rendered) = markdown_stream.push(&renderer, &text) {
-                                write!(out, "{rendered}")
-                                    .and_then(|()| out.flush())
-                                    .map_err(|error| {
-                                        // P0-1 修复 #5/9：TextDelta 写入失败。
-                                        self.emit_stream_error(error.to_string(), false)
-                                    })?;
-                            }
                             self.emit_status(StatusEvent::TextDelta(text.clone()));
                             events.push(AssistantEvent::TextDelta(text));
                         }
@@ -1036,7 +982,6 @@ impl AnthropicRuntimeClient {
                         // 下一轮请求 DeepSeek API 报 400
                         // (reasoning_content must be passed back)。
                         if !block_has_thinking_summary {
-                            render_thinking_block_summary(out, None, false)?;
                             block_has_thinking_summary = true;
                         }
                         // 实时渲染：每个 delta 都 emit 增量文本给 TUI 追加到
@@ -1067,14 +1012,6 @@ impl AnthropicRuntimeClient {
                 },
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
-                    if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        write!(out, "{rendered}")
-                            .and_then(|()| out.flush())
-                            .map_err(|error| {
-                                // P0-1 修复 #6/9：ContentBlockStop markdown flush 失败。
-                                self.emit_stream_error(error.to_string(), false)
-                            })?;
-                    }
                     // P0 修复：thinking 块结束时统一 emit AssistantEvent::Thinking。
                     // 这是 DeepSeek thinking 模式不报 400 的关键 — 下一轮请求时
                     // convert_messages 会把这个 thinking 块转换成 reasoning_content
@@ -1099,16 +1036,6 @@ impl AnthropicRuntimeClient {
                         }
                     }
                     if let Some((id, name, input)) = pending_tool.take() {
-                        if let Some(progress_reporter) = &self.progress_reporter {
-                            progress_reporter.mark_tool_phase(&name, &input);
-                        }
-                        // Display tool call now that input is fully accumulated
-                        writeln!(out, "\n{}", format_tool_call_start(&name, &input))
-                            .and_then(|()| out.flush())
-                            .map_err(|error| {
-                                // P0-1 修复 #7/9：ToolCall 显示写入失败。
-                                self.emit_stream_error(error.to_string(), false)
-                            })?;
                         self.emit_status(StatusEvent::ToolUse {
                             id: id.clone(),
                             name: name.clone(),
@@ -1124,14 +1051,6 @@ impl AnthropicRuntimeClient {
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
-                    if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        write!(out, "{rendered}")
-                            .and_then(|()| out.flush())
-                            .map_err(|error| {
-                                // P0-1 修复 #8/9：MessageStop markdown flush 失败。
-                                self.emit_stream_error(error.to_string(), false)
-                            })?;
-                    }
                     events.push(AssistantEvent::MessageStop);
                     self.emit_status(StatusEvent::MessageStop);
                 }
@@ -1173,7 +1092,7 @@ impl AnthropicRuntimeClient {
             })?;
         // 非流式回退路径:从 response.usage 记录 cache break。
         let fallback_usage = response.usage.token_usage();
-        let mut events = response_to_events(response, out)?;
+        let mut events = response_to_events(response)?;
         push_prompt_cache_event(
             &mut events,
             self.record_cache_break(request_kind, message_request, Some(fallback_usage)),
@@ -1448,26 +1367,8 @@ pub(crate) const NETWORK_ERROR_KEYWORDS: &[&str] = &[
     "stream closed",
 ];
 
-pub(crate) fn render_thinking_block_summary(
-    out: &mut (impl Write + ?Sized),
-    char_count: Option<usize>,
-    redacted: bool,
-) -> Result<(), RuntimeError> {
-    let summary = if redacted {
-        "\n▶ Thinking block hidden by provider\n".to_string()
-    } else if let Some(char_count) = char_count {
-        format!("\n▶ Thinking ({char_count} chars hidden)\n")
-    } else {
-        "\n▶ Thinking hidden\n".to_string()
-    };
-    write!(out, "{summary}")
-        .and_then(|()| out.flush())
-        .map_err(|error| RuntimeError::new(error.to_string()))
-}
-
 pub(crate) fn push_output_block(
     block: OutputContentBlock,
-    out: &mut (impl Write + ?Sized),
     events: &mut Vec<AssistantEvent>,
     pending_tool: &mut Option<(String, String, String)>,
     streaming_tool_input: bool,
@@ -1485,10 +1386,6 @@ pub(crate) fn push_output_block(
     match block {
         OutputContentBlock::Text { text } => {
             if !text.is_empty() {
-                let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
-                write!(out, "{rendered}")
-                    .and_then(|()| out.flush())
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
                 events.push(AssistantEvent::TextDelta(text));
             }
         }
@@ -1510,7 +1407,6 @@ pub(crate) fn push_output_block(
             thinking,
             signature,
         } => {
-            render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
             *block_has_thinking_summary = true;
             if streaming_tool_input {
                 // 流式路径：暂存到 pending_thinking，等待后续 delta 追加，
@@ -1518,7 +1414,7 @@ pub(crate) fn push_output_block(
                 *pending_thinking = Some((thinking, signature));
             } else {
                 // G10.5 fix: non-streaming fallback path must emit Thinking
-                // event so downstream consumers (planner, TUI status) receive
+                // event so downstream consumers (planner, Web status) receive
                 // the full event stream — mirrors tools/lib.rs push_output_block.
                 events.push(AssistantEvent::Thinking {
                     thinking,
@@ -1527,7 +1423,6 @@ pub(crate) fn push_output_block(
             }
         }
         OutputContentBlock::RedactedThinking { .. } => {
-            render_thinking_block_summary(out, None, true)?;
             *block_has_thinking_summary = true;
         }
     }
@@ -1536,7 +1431,6 @@ pub(crate) fn push_output_block(
 
 pub(crate) fn response_to_events(
     response: MessageResponse,
-    out: &mut (impl Write + ?Sized),
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
@@ -1549,7 +1443,6 @@ pub(crate) fn response_to_events(
         let mut block_has_thinking_summary = false;
         push_output_block(
             block,
-            out,
             &mut events,
             &mut pending_tool,
             false,

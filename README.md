@@ -37,7 +37,7 @@ CLAW 是一个完全独立演进的 Rust 代码智能体，围绕「模型之外
 | 🧠 记忆与上下文管理 | NOTEBOOK / TaskState / 教训库 / 决策日志 / 依赖感知压缩 |
 | 🔌 插件生态 | Skills / MCP / Hooks / 自定义 Agent |
 | 💬 IM 桥接 | 飞书 / 企业微信 / Discord 远程操控 |
-| 🖥️ 现代化 TUI | 侧边栏、工具卡片、Markdown 流式渲染 |
+| 🌐 本地 Web UI | 会话、流式对话、工具卡片、文件与终端面板 |
 
 > 完整特性见下方 [核心特性](#核心特性-key-features) 章节。
 
@@ -64,9 +64,9 @@ The entire project is rewritten in Rust, compiling to a single native binary wit
 
 ### 🌐 多 Provider 兼容 / Multi-Provider Support
 
-一套 CLI 接口适配所有主流 LLM Provider，通过模型名前缀自动路由。
+一套统一接口适配所有主流 LLM Provider，通过模型名前缀自动路由。
 
-One CLI interface for all major LLM providers, with prefix-based automatic routing.
+One unified interface for all major LLM providers, with prefix-based automatic routing.
 
 | Provider | 前缀 Prefix | 认证方式 Auth |
 |---|---|---|
@@ -80,20 +80,19 @@ One CLI interface for all major LLM providers, with prefix-based automatic routi
 - **模型别名 / Model aliases** — `opus` → `claude-opus-4-6`, `sonnet` → `claude-sonnet-4-6`, `haiku` → `claude-haiku-4-5`；支持自定义别名
 - **流式 SSE / Streaming SSE** — 所有 Provider 统一通过 Server-Sent Events 实时返回 token
 - **智能回退 / Smart fallback** — 根据模型名前缀自动选择正确的 API endpoint 和认证方式
-- **推理强度控制 / Reasoning effort control** — `--reasoning-effort low|medium|high` 支持 OpenAI 推理模型
+- **推理强度控制 / Reasoning effort control** — 会话设置支持 `low|medium|high` 推理强度（OpenAI 推理模型）
 
-### 🖥️ 现代化终端 UI / Modern Terminal UI (TUI)
+### 🌐 本地 Web UI / Local Web UI
 
-基于 Ratatui 构建的全屏终端界面，实时展示会话状态和交互进度。
+`claw serve` 在 127.0.0.1 启动单页 Web UI，浏览器是唯一产品界面（CLI/TUI 已移除）。
 
-A full-screen terminal interface built on Ratatui with real-time session state and interaction progress.
+A single-page local Web UI started by `claw serve` on 127.0.0.1 — the browser is the only product surface (CLI/TUI removed).
 
-- **侧边栏 / Sidebar** — 实时显示已加载的 Skills、Agents、MCP 服务器和会话信息
-- **状态栏 / Status bar** — 模型名、费用统计、Token 消耗、上下文窗口利用率一目了然
-- **上下文窗口进度条 / Context window progress bar** — 可视化当前上下文窗口的使用率，防止溢出
-- **工具卡片渲染 / Tool card rendering** — 每个工具调用以带边框的卡片展示（同会话框），含状态图标、输入/输出预览
-- **流式输出 / Streaming output** — 模型回复逐 token 实时渲染，支持 Markdown 语法高亮
-- **斜杠命令集成 / Slash command integration** — 50+ 斜杠命令直接在 TUI 中用结构化面板展示结果
+- **会话侧栏 / Session sidebar** — 会话列表、新建、恢复、删除与导出
+- **流式对话 / Streaming chat** — SSE 逐 token 渲染 Markdown，展示工具卡片与上下文占用
+- **工具卡片 / Tool cards** — 每次工具调用带状态图标、输入/输出预览与审批入口
+- **文件与终端面板 / Files & terminal panels** — 工作区文件浏览、diff 查看与内嵌终端
+- **本地鉴权 / Local auth** — 启动时生成一次性 token，URL 带 token 访问
 
 ### 🤖 多智能体 DAG 并行编排 / Multi-Agent DAG Orchestration
 
@@ -123,7 +122,6 @@ An LLM-driven failure-mode learning system: mines weaknesses from past failures,
 - **规则式 Proposer（Stage 2）** — 7+ 种预定义错误模式（`old_string not found`、`unresolved import`、`connection refused` 等）直接映射为 HarnessEdit，MVP 零 LLM 调用；simhash 去重防重复提案
 - **两重门控验证 / Dual-gate validation** — Validity（基础设施噪声过滤 + pathology 出现确认）+ Significance：turn 级 candidate 走 task_success z-test，工具级 candidate 走失败率 z-test（`ToolCallStats` 提供失败率分母，alpha=0.05），仅统计显著且有据可依的 edit 晋升为 Active
 - **全量动态注入 / Dynamic injection** — Active edits（≤10 条）注入 `SystemPromptSplit::dynamic_sections`，约束总 token
-- **CLI 管理 / `claw harness`** — `list [--status]` / `stats` / `rollback --all | --id` / `evolve --dry-run`，支持 `--output-format json`
 - **SQLite 持久化 / SQLite persistence** — edits 存于 `.claw/decision_log.db` 的 `harness_edits` 表，进程重启后保留状态
 
 > 设计文档：`docs/2026-07-24-p3-self-evolving-harness-design.md`；实现位于 `rust/crates/runtime/src/harness_evolution/`
@@ -134,8 +132,8 @@ An LLM-driven failure-mode learning system: mines weaknesses from past failures,
 
 Full plugin lifecycle management + Skills system + MCP protocol support + Hooks system + custom Agents.
 
-- **插件管理器 / Plugin manager** — `claw plugins [list|install|enable|disable|update|uninstall]`（JSON 输出支持）
-- **Skills 技能系统 / Skills system** — 可发现、加载和调用的可复用技能模块（`/skills list|install|invoke`）
+- **插件市场 / Plugin market** — Web UI 内浏览、安装、启用、禁用、更新与卸载插件
+- **Skills 技能系统 / Skills system** — 可发现、加载和调用的可复用技能模块（Web UI 技能市场与调用）
 - **MCP 服务器 / MCP servers** — 完整的 Model Context Protocol 生命周期（config → spawn → initialize → tool discovery → invoke → cleanup），支持 stdio/http/sse/ws 传输
 - **Hooks 钩子系统 / Hooks system** — PreToolUse / PostToolUse / PostToolUseFailure / Stop / Notification / UserPromptSubmit / SessionStart / PreCompact / SubagentStop
 - **自定义 Agent / Custom agents** — TOML 和 Markdown (YAML frontmatter) 格式的 Agent 定义，支持自定义 model、tools、reasoning_effort
@@ -151,7 +149,7 @@ Multi-layered security from permission modes to sandbox isolation.
   - `workspace-write` — 允许工作区内写入和编辑
   - `danger-full-access` — 完全访问（需显式 opt-in）
 - **细粒度规则 / Fine-grained rules** — `permissions.allow` / `permissions.deny` / `permissions.ask`，支持按工具名 + 匹配模式控制
-- **工具白名单 / Tool allowlist** — `--allowedTools` 精确控制可用工具集
+- **工具白名单 / Tool allowlist** — 会话权限模式与工具白名单精确控制可用工具集
 - **沙箱支持 / Sandbox support** — Linux namespace 隔离（`unshare`）、macOS 文件系统提示
 - **Broad-CWD 防护 / Broad-CWD guardrail** — 检测并阻止从 `$HOME` 或根目录启动（防止意外全局扫描）
 - **Confirm-on-first-use** — 首次使用 MCP 服务器工具时弹出交互式权限提示
@@ -176,16 +174,13 @@ Remote control of CLAW via instant messaging platforms like Discord, enabling "h
 
 From health checks to session management, every detail is polished for developers.
 
-- **50+ 斜杠命令 / 50+ slash commands** — `/doctor`, `/status`, `/diff`, `/commit`, `/pr`, `/export`, `/skills`, `/agents`, `/mcp`, `/config`, `/session`, `/compact`, `/cost`, `/usage`, `/stats`, `/tokens`, `/cache`, `/context`, `/memory`, `/hooks`, `/plugins`, `/tasks`, `/cron`, `/team`, `/subagent` 等
-- **Doctor 健康检查 / Doctor health check** — 一键诊断 API 密钥、配置文件、工作区状态、沙箱状态、安装来源
+- **会话工作台 / Session workspace** — Web UI 提供会话状态、diff、文件、终端、任务与计划面板
 - **配置层级 / Configuration hierarchy** — `~/.claw/settings.json` (用户) → `.claw.json` (项目) → `.claw/settings.json` (项目) → `.claw/settings.local.json` (本地)
-- **会话管理 / Session management** — 持久化、恢复、列表、切换、分支、删除、导出（JSONL 格式）
+- **会话管理 / Session management** — 持久化、恢复、列表、切换、删除、导出（JSONL 格式）
 - **上下文压缩 / Context compaction** — 自动检测长会话并智能压缩，保留关键信息的同时控制 token 消耗
 - **Prompt Cache 优化 / Prompt cache optimization** — 自动利用 Anthropic/OpenAI 的 prompt caching 降低费用
 - **Git 集成 / Git integration** — 自动检测分支、生成 diff、创建 commit、发起 PR
 - **Brace 展开 / Brace expansion** — `glob_search` 原生支持 `**/*.{rs,toml,md}` 花括号展开模式
-- **机器可读 JSON 输出 / Machine-readable JSON output** — 所有 CLI 命令支持 `--output-format json`
-- **Tab 补全 / Tab completion** — REPL 中自动补全斜杠命令、模型别名、权限模式和会话 ID
 
 ### 📊 可观测性 / Observability
 
@@ -213,16 +208,20 @@ First-class support for containerized and automated pipelines.
 
 ---
 
-CLAW is a Rust implementation of the `claw` CLI agent harness. The canonical
+CLAW is a Rust agent harness with a local Web UI. The canonical
 implementation lives in [`rust/`](./rust)。项目已从最初的 MIT License 代码库
 独立演进为完整的智能体工程底座，详见上方「核心能力概览」。
 
 > [!IMPORTANT]
-> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. For file submission/navigation questions, see [Navigation and file context](./docs/navigation-file-context.md). For local OpenAI-compatible models and offline skill installs, see [Local OpenAI-compatible providers and skills setup](./docs/local-openai-compatible-providers.md). Windows users can jump to the PowerShell-first [Windows install and release quickstart](./docs/windows-install-release.md) or run the one-click installer [`install.ps1`](./install.ps1). Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
+> 产品界面是本地 Web UI：构建后运行 `claw serve`，浏览器打开启动日志中的
+> 带 token URL。CLI 子命令与 TUI 已在 Phase 3 移除，仅保留 `serve`、
+> `--version`、`--help` 与内部 `--upgrade-helper` 入口。
+> 构建与环境细节见 [`USAGE.md`](./USAGE.md)；Windows 用户可参考
+> [Windows install and release quickstart](./docs/windows-install-release.md)
 
 ## Current repository shape
 
-- **`rust/`** — canonical Rust workspace and the `claw` CLI binary
+- **`rust/`** — canonical Rust workspace and the `claw` Web server binary
 - **`USAGE.md`** — task-oriented usage guide for the current product surface
 - **`PARITY.md`** — Rust-port parity status and migration notes
 - **`ROADMAP.md`** — active roadmap and cleanup backlog
@@ -316,27 +315,24 @@ Test the binary directly using its path:
 
 ```bash
 # macOS/Linux (debug build)
-./rust/target/debug/claw-plus --help
-./rust/target/debug/claw-plus doctor
+./rust/target/debug/claw --version
+./rust/target/debug/claw serve --help
 
 # Windows PowerShell (debug build)
-.\rust\target\debug\claw.exe --help
-.\rust\target\debug\claw.exe doctor
+.\rust\target\debug\claw.exe --version
+.\rust\target\debug\claw.exe serve --help
 ```
 
 PowerShell smoke commands that do not require live credentials:
 
 ```powershell
-$env:CLAW_CONFIG_HOME = Join-Path $env:TEMP "claw config home"
-New-Item -ItemType Directory -Force -Path $env:CLAW_CONFIG_HOME | Out-Null
-Remove-Item Env:\ANTHROPIC_API_KEY, Env:\ANTHROPIC_AUTH_TOKEN, Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
-.\rust\target\debug\claw.exe help
-.\rust\target\debug\claw.exe status
-.\rust\target\debug\claw.exe config env
-.\rust\target\debug\claw.exe doctor
+.\rust\target\debug\claw.exe --version
+.\rust\target\debug\claw.exe --help
+# 启动 Web UI（Ctrl+C 停止），浏览器打开日志中的带 token URL
+.\rust\target\debug\claw.exe serve --port 4317 --no-open
 ```
 
-If these commands succeed, the build is working. `claw doctor` is your first health check — it validates your API key, model access, and tool configuration.
+If these commands succeed, the build is working. Web UI 首页与 `/api/sessions` 返回 200 即代表服务可用。
 
 ### Optional: Add to PATH
 

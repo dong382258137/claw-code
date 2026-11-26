@@ -19,8 +19,6 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::app::LiveCli;
-
 /// 默认录音秒数。
 const DEFAULT_RECORD_SECONDS: u64 = 5;
 /// 录音秒数允许范围。
@@ -794,13 +792,9 @@ fn dir_size_mb(path: &Path) -> u64 {
 ///
 /// 流程:校验识别模型就绪 → 录音 → 本地识别 → 文本填入输入框(TUI)draft 槽;
 /// 无槽时直接打印。模型未就绪(首次下载中)时给出明确提示,不阻塞、不白录音。
-pub(crate) fn run_voice_input(cli: &mut LiveCli, hint: Option<&str>) -> Result<(), String> {
+pub(crate) fn run_voice_input(hint: Option<&str>) -> Result<(), String> {
     let seconds = parse_seconds(hint)?;
-    let progress = |msg: &str| {
-        if !cli.tui_println(msg) {
-            println!("{msg}");
-        }
-    };
+    let progress = |msg: &str| println!("{msg}");
 
     // 前置检查(模型就绪 / ffmpeg / 设备)与拨动式录音共用同一套逻辑。
     let ctx = prepare_recorder()?;
