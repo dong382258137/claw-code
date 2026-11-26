@@ -212,6 +212,7 @@ infra/     会话索引、设置、热升级、路径解析
 | Phase 5 会话读取索引 | 已完成（2026-11-26） | 新增 `runtime::session_index`（`<ws>/.claw/sessions.db`，WAL）：`sessions` / `messages` 双表（含 `workspace,jsonl_mtime_ms` 索引），`Session` 追加消息时写消息字节区间（失败静默），`save_to_path` 整份重写后重建全部区间，新增 `append_jsonl_tail_from` 只消费新增完整行。serve：`/api/sessions` 走索引（分页 `limit`≤500、`all=1` 聚合多工作区，去掉每工作区 50 条硬上限），首次访问按 size/mtime 对账懒建/清理索引，DB 不可用时回退旧扫描；`/api/session/{id}/stream` 以 `(size,mtime)` + 头 4 KiB/边界 128 B 指纹判定，未变发 keepalive、变长走增量解析，快照 LRU 8；`/api/block` 按索引字节区间只读单条消息。Web 恢复会话补挂 `history.db`。**偏差**：`running_state` 未落库（运行态只在调度器内存，仍在响应时装饰），避免双写。实测（debug serve，临时工作区，1000 小会话 + 1×1 万条消息）：列表首查 767 ms（建 1001 条索引）、热查 2.3–5.6 ms、500 条分页 16 ms；1 万条会话 `/api/session` 冷读 476 ms、SSE 首快照 1299 ms（含固定 900 ms 轮询间隔）、未变轮询增量 5–11 ms；运行中追加消息 2.06 s 内推送含新消息快照；删 `sessions.db*` 重启首查 452 ms 自动重建、二次 3.9 ms、block 仍取全文。`cargo test -p runtime session_index` 4 通过、`session::tests` 增量解析 2 通过，`cargo test -p rusty-claude-cli` 144 通过，clippy 无告警 |
 | Phase 6 定时任务真实执行 | 已完成（2026-11-26） | 新增 `serve/cron_expr`（5 段 cron：`*`、`*/n`、`a-b`、列表，按本地时区求下次时间，日/周同时受限走标准「或」语义）与 `serve/cron_runner`（15 s tick、进程内下次到期表、启动按 `last_run_at`→`created_at` 重算只补跑最近一次）。`CronEntry` 增加 `session_id`/`last_status`/`last_finished_at`/`last_error`（`serde(default)` 兼容旧文件），新增 `bind_session`/`record_start`/`record_finish`；到期任务封装为 `PromptJob` 进入现有 `Scheduler`，不绕过并发门闸；专属会话首次执行时创建（标题 `定时任务 · 名称`，删除后下次执行自动重建，不提供改绑）；权限继承 Web 设置且最高 `workspace-write`；同一任务上次未结束时记 `skipped` 并推跳过事件。API：列表返回 `next_run_at`/`last_status`/`schedule_error`，新建时校验表达式（非法 400），`POST .../{id}/run` 实装为立即入队（运行中 409）；worker 收尾写回结果并向该会话事件流推送 `kind=cron` 的 `start`/`end`/`skipped`；TasksPane 显示下次执行/上次结果并支持立即执行。实测（debug serve + 真实模型）：每分钟任务连续 3 次 `success`，会话落盘 3 轮 user/assistant 且 `run_count=3`；重启后 8 s 内不重复，下一分钟继续第 4 次；全局并发 4 被占满时手动触发任务状态 `queued>running` 后 `success`；重叠触发返回 409 且 `run_count` 不增；SSE 收到 start/end 各 1 条；非法表达式 400。`cargo test -p rusty-claude-cli` 151 通过（新增 cron_expr 7）、`cargo test -p runtime cron` 29 通过，clippy 干净 |
 | Phase 7 中文嵌入模型与 ONNX 动态加载 | 已完成（2026-11-26，体积目标未达） | `fastembed` 改 `default-features = false` + `ort-load-dynamic` + `hf-hub-native-tls`（不再静态链接 ONNX、去掉 image-models 依赖），模型切 `BGESmallZHV15`（512 维，`name()` = `bge-small-zh-v1.5`）。新增 `runtime::EmbeddingStatus` / `embedding_status()`：serve 启动后台预热，`/api/meta.embedding` 上报 `ready/keyword/loading/disabled`，设置页「关于」新增「语义检索」状态行（降级显示“关键词降级”并附原因）。初始化前预检 `onnxruntime.dll`（`ORT_DYLIB_PATH` → exe 同目录 → cwd），缺库/版本不兼容（ort 内部 panic 已兜住）统一返回 None 走关键词降级。`history_meta` 增加 `embedding_model`：与当前模型不一致时清空 `history_vectors` 并后台分批重建（独立连接 + busy timeout + EXISTS 守卫防孤儿向量）；记忆 L1 索引本就只存文本，加载时重算，未改。评测（25 条中文记忆查询对，top-3）：BGE-small-en-v1.5 11/25 = 44.0%，bge-small-zh-v1.5 20/25 = 80.0%，保留切换。实测：`claw.exe` 58.7 → **40.41 MB**（-18.3 MB，`onnxruntime.dll` 16.0 MB 独立分发）；移走 DLL 后服务正常启动、首页 200、`/api/meta` 返回 `state=keyword`；旧工作区（schema v4、384 维旧向量、无 `embedding_model`）首次对话后自动写入 `embedding_model` 并将 2 条旧向量重建为 2048 B（512×f32），日志 `[history] rebuilt 2 vector(s)`。**偏差**：主二进制未达 ≤25 MB，剩余体积（wasmtime/tiktoken 词表/axum/portable-pty 等）留 Phase 8 排查。`cargo test -p runtime history` 45 通过（新增模型切换重建回归测试）、`cargo test -p rusty-claude-cli` 151 通过，clippy 干净 |
+| Phase 8 体积实测与动态加载收口 | 已完成（2026-11-26） | release profile 增加 `opt-level="z"` + `lto="fat"` + `codegen-units=1` + `strip="symbols"`：`claw.exe` 40.41 → **22.88 MB**（较 Phase 3 静态基线 58.7 MB 降 61%，≤25 MB 达成）。语义检索从“启动预热”改为“启动仅探测 DLL、首次检索加载模型”（新增 `runtime::probe_embedding`，状态可更新）：空闲 RSS 10.3–10.6 MB，加载模型后 ≈163 MB，首轮 `build_runtime` 1.07 s（含模型加载）。三组实测见下方对比表（静态基线 58.7 MB / 560–772 ms / 12.5 MB；动态+profile 22.88 MB / 503–516 ms / 10.3–10.6 MB；移走 DLL 同二进制 / 501–514 ms / 10.6 MB，`/api/meta` state=keyword，首页 200、737 KB）。`cargo bloat`：CLI 4.6 / tools 4.4 / runtime 4.2 / chromiumoxide 3.9 MiB，未再删功能依赖（wasmtime、tiktoken 已不在依赖图）。新增 `scripts/package-release.ps1`（exe×2 + DLL×2 + README，zip 实测 22.38 MB）。**遗留**：启动到监听 503–516 ms，仍未达 ≤300 ms 目标（Phase 9 前再评估）。`cargo test -p rusty-claude-cli` 151 通过、`cargo test -p runtime history` 45 通过，clippy 干净 |
 
 ### Phase 0：基线与测量脚本
 
@@ -461,6 +462,26 @@ CREATE TABLE messages (
 - 一张构建对比表，数据可复现。
 - 主二进制 ≤ 25 MB。
 - 移走 DLL 后服务正常启动，语义检索退化为关键词，界面有提示。
+
+**实测（2026-11-26，Windows / release）**
+
+| 构建 | 二进制 | release 构建 | cargo check（增量） | 启动到监听 | 空闲 RSS | 首轮 |
+|---|---:|---:|---:|---:|---:|---:|
+| 静态链接基线（Phase 3） | 58.7 MB | 未采集 | 未采集 | 560–772 ms | 12.5 MB | 未采集 |
+| 动态加载 + 体积 profile | **22.88 MB** | 9m23s（全依赖）/ 6m13s（仅 CLI 改动） | 15.2 s（runtime）/ 17.8 s（CLI） | 503–516 ms（3 次） | 10.3–10.6 MB（未加载模型）；首次检索后 ≈163 MB | `build_runtime` 1.07 s（含模型加载；远端回复受网络影响未计入） |
+| 同上，移走 `onnxruntime.dll` | 22.88 MB（同一二进制） | 同左 | 同左 | 501–514 ms | 10.6 MB | 同左（关键词降级） |
+
+口径与复现：
+
+- 启动到监听：`claw.exe serve --port <p> --cwd <临时目录> --no-open`，每 10 ms 尝试 TCP 连接，各 3 次。
+- 空闲 RSS：监听后 500 ms 的 Working Set（未打开会话、未触发检索）。
+- 首轮：`POST /api/sessions` 后 `POST /api/session/{id}/prompt`，从 serve 日志读取 `build_runtime` 耗时；远程模型回复受网络影响，未纳入对比。
+- 构建/检查：`cargo build --release -p rusty-claude-cli`、`cargo check -p rusty-claude-cli`（依赖已缓存）。
+- 体积来源：`cargo bloat --release -p rusty-claude-cli --bin claw --crates`，`.text` 29.6 MiB；最大项 `rusty-claude-cli` 4.6 / `tools` 4.4 / `runtime` 4.2 / `chromiumoxide` 3.9 / `std` 2.2 / `reqwest` 1.4 MiB。未再裁剪功能依赖（chromiumoxide 为浏览器工具所需；wasmtime、tiktoken 已不在依赖图中）。
+
+体积收口手段：`[profile.release]` 增加 `opt-level = "z"`、`lto = "fat"`、`codegen-units = 1`、`strip = "symbols"`（40.41 → 22.88 MB，较 Phase 3 静态基线降 61%）。语义检索改为启动时只探测 DLL（`runtime::probe_embedding`），模型首次检索时加载，空闲进程不再常驻 ~120 MB 模型内存。
+
+**打包**：`powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1` 生成 `dist/claw-<version>-win-x64/`（`claw.exe`、`claw-plus.exe`、`onnxruntime.dll`、`onnxruntime_providers_shared.dll`、`README.txt`）与同名 zip（实测 22.38 MB）。前端资源已内嵌进 exe，无需单独分发。DLL 要求 ≥1.24（ort `api-24`），来源与缺失行为见脚本头注释与包内 README。
 
 ### Phase 9：收尾
 

@@ -464,28 +464,67 @@ pub struct EmbeddingStatus {
     pub detail: String,
 }
 
-static EMBEDDING_STATUS: OnceLock<EmbeddingStatus> = OnceLock::new();
+static EMBEDDING_STATUS: OnceLock<std::sync::Mutex<EmbeddingStatus>> = OnceLock::new();
+
+fn embedding_status_slot() -> &'static std::sync::Mutex<EmbeddingStatus> {
+    EMBEDDING_STATUS.get_or_init(|| {
+        let initial = if cfg!(feature = "embedding") {
+            EmbeddingStatus {
+                state: "loading".to_owned(),
+                model: "bge-small-zh-v1.5".to_owned(),
+                dim: 0,
+                detail: "语义检索正在初始化".to_owned(),
+            }
+        } else {
+            EmbeddingStatus {
+                state: "disabled".to_owned(),
+                model: String::new(),
+                dim: 0,
+                detail: "本构建未启用语义检索".to_owned(),
+            }
+        };
+        std::sync::Mutex::new(initial)
+    })
+}
+
+fn set_embedding_status(status: EmbeddingStatus) {
+    let mut slot = embedding_status_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = status;
+}
 
 /// 查询语义检索状态。模型尚未初始化时返回 `loading`,不会触发模型加载。
 #[must_use]
 pub fn embedding_status() -> EmbeddingStatus {
-    if let Some(status) = EMBEDDING_STATUS.get() {
-        return status.clone();
-    }
-    if cfg!(feature = "embedding") {
-        EmbeddingStatus {
-            state: "loading".to_owned(),
-            model: "bge-small-zh-v1.5".to_owned(),
+    embedding_status_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// 启动时轻量探测语义检索可用性(**不加载模型**)。
+///
+/// 只检查 ONNX Runtime 动态库是否存在:
+/// - 存在:标记 `ready`,说明模型将在首次检索时加载;
+/// - 缺失:标记 `keyword`,界面直接提示关键词降级。
+///
+/// 这样未使用语义检索的进程不必常驻 ~120 MB 的模型内存。
+pub fn probe_embedding() {
+    #[cfg(feature = "embedding")]
+    match memory_semantic::fastembed_provider::probe_runtime_available() {
+        Ok(()) => set_embedding_status(EmbeddingStatus {
+            state: "ready".to_owned(),
+            model: memory_semantic::fastembed_provider::EMBEDDING_MODEL_NAME.to_owned(),
             dim: 0,
-            detail: "语义检索正在初始化".to_owned(),
-        }
-    } else {
-        EmbeddingStatus {
-            state: "disabled".to_owned(),
-            model: String::new(),
+            detail: "语义检索可用（模型将在首次检索时加载）".to_owned(),
+        }),
+        Err(e) => set_embedding_status(EmbeddingStatus {
+            state: "keyword".to_owned(),
+            model: memory_semantic::fastembed_provider::EMBEDDING_MODEL_NAME.to_owned(),
             dim: 0,
-            detail: "本构建未启用语义检索".to_owned(),
-        }
+            detail: format!("语义检索不可用，当前为关键词匹配（{e}）"),
+        }),
     }
 }
 
@@ -513,7 +552,7 @@ pub fn build_embedding_provider() -> Option<Arc<dyn EmbeddingProvider + Send + S
                             "embedding provider: fastembed ({dim}-dim {})",
                             memory_semantic::fastembed_provider::EMBEDDING_MODEL_NAME
                         );
-                        let _ = EMBEDDING_STATUS.set(EmbeddingStatus {
+                        set_embedding_status(EmbeddingStatus {
                             state: "ready".to_owned(),
                             model,
                             dim,
@@ -525,7 +564,7 @@ pub fn build_embedding_provider() -> Option<Arc<dyn EmbeddingProvider + Send + S
                         eprintln!(
                             "embedding unavailable ({e}), semantic search falls back to keyword"
                         );
-                        let _ = EMBEDDING_STATUS.set(EmbeddingStatus {
+                        set_embedding_status(EmbeddingStatus {
                             state: "keyword".to_owned(),
                             model: memory_semantic::fastembed_provider::EMBEDDING_MODEL_NAME
                                 .to_owned(),

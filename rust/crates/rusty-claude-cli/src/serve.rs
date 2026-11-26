@@ -1294,11 +1294,9 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         spawn_session_watchdog(state.clone());
         // Phase 6:进程内 tick 线程,扫描各工作区到期的定时任务并入队。
         cron_runner::spawn_cron_runner(state.clone());
-        // Phase 7:后台预热语义检索(动态加载 onnxruntime.dll + ONNX 模型)。
-        // 不阻塞端口监听;失败时 /api/meta 上报 keyword 降级状态。
-        std::thread::spawn(|| {
-            let _ = runtime::build_embedding_provider();
-        });
+        // Phase 8:启动时只探测语义检索可用性（检查 onnxruntime.dll），
+        // 不预热模型；模型在首次检索时加载，空闲进程不再常驻 ~120 MB。
+        runtime::probe_embedding();
         let app = Router::new()
             .route("/", get(index))
             .route("/api/sessions", get(api_sessions).post(api_create_session))

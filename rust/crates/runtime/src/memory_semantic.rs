@@ -716,6 +716,14 @@ pub mod fastembed_provider {
         )))
     }
 
+    /// 轻量探测 ONNX Runtime 动态库是否可用（不加载模型、不下载文件）。
+    ///
+    /// 供服务启动时决定“语义检索可用/降级”状态，避免为了上报状态而
+    /// 常驻加载 ~120 MB 的模型。
+    pub fn probe_runtime_available() -> Result<(), EmbeddingError> {
+        resolve_ort_dylib().map(|_| ())
+    }
+
     impl FastembedProvider {
         /// 创建并加载 BGE-small-zh-v1.5 模型。
         ///
