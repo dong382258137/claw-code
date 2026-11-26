@@ -34,10 +34,14 @@ base64 = "0.22"
 # Step 4.2: LSP 官方类型定义,用于类型安全的 documentSymbol/Diagnostic 解析。
 # 替代部分手搓 serde_json,提高协议层可靠性。
 lsp-types = "0.95"
-# Step 2.4: 本地嵌入模型（BGE-small-en-v1.5,384 维）。
-# 默认关闭 — 启用后增加 ~50MB 二进制 + 首次运行下载模型。
-# SemanticRecaller 在 feature 关闭时退化到 keyword fallback。
-fastembed = { version = "5", optional = true }
+# Step 2.4 / Phase 7: 本地嵌入模型（BGE-small-zh-v1.5,512 维）。
+# 默认关闭 — 启用后不再把 ONNX Runtime 静态链接进二进制（节省 ~40MB），
+# 改为运行时从 onnxruntime.dll 动态加载；模型首次运行下载到缓存目录。
+# SemanticRecaller 在 feature 关闭或 DLL/模型不可用时退化到 keyword fallback。
+fastembed = { version = "5", optional = true, default-features = false, features = [
+    "ort-load-dynamic",
+    "hf-hub-native-tls",
+] }
 
 # bash 智能超时检测器：Windows 上用 GetProcessTimes + CreateToolhelp32Snapshot
 # 查询子进程树 CPU 时间，区分"长计算无输出"和"死锁挂起"。

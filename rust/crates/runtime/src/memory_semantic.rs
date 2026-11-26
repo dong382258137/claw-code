@@ -10,7 +10,7 @@
 //! - [`SemanticRecaller`]:统一语义召回入口,持有向量索引 + L1 索引。
 //! - [`semantic_recall`]:免费函数入口 `semantic_recall(query, k) -> Vec<MemoryHit>`。
 //! - 嵌入模型:默认 [`HashEmbeddingProvider`](简易 hash 向量,无外部依赖);
-//!   启用 `embedding` feature 后使用 [`FastembedProvider`](BGE-small-en-v1.5, 384 维)。
+//!   启用 `embedding` feature 后使用 [`FastembedProvider`](BGE-small-zh-v1.5, 512 维)。
 //! - Fallback:嵌入不可用时退化为关键词匹配。
 //!
 //! **缓存保护**(详见 §5.2):
@@ -503,8 +503,8 @@ impl std::error::Error for EmbeddingError {}
 ///
 /// 实现者:
 /// - [`HashEmbeddingProvider`]:简易 hash 向量(默认,无外部依赖,用于测试)。
-/// - [`FastembedProvider`](crate::memory_semantic::FastembedProvider):BGE-small-en-v1.5
-///   (启用 `embedding` feature,基于 ONNX Runtime)。
+/// - [`FastembedProvider`](crate::memory_semantic::FastembedProvider):BGE-small-zh-v1.5
+///   (启用 `embedding` feature,基于 ONNX Runtime 动态库)。
 ///
 /// **缓存保护**:provider 是无状态调用方,不影响主 agent 缓存。
 /// 嵌入结果通过 [`SemanticRecaller::index_embeddings`] 写入 vectors 索引,
@@ -607,16 +607,30 @@ impl EmbeddingProvider for HashEmbeddingProvider {
 
 #[cfg(feature = "embedding")]
 pub mod fastembed_provider {
-    //! Fastembed provider — 基于 BGE-small-en-v1.5 模型(384 维)。
+    //! Fastembed provider — 基于 BGE-small-zh-v1.5 模型(512 维)。
     //!
     //! 启用方式:`cargo build --features runtime/embedding`。
-    //! 首次运行会下载 ONNX 模型文件(~50MB)到缓存目录。
+    //! ONNX Runtime 不再静态链接,运行时从 `onnxruntime.dll` 动态加载
+    //! (与主程序同目录,或由 `ORT_DYLIB_PATH` 显式指定)。
+    //! 首次运行会下载 ONNX 模型文件到缓存目录。
 
     use super::{EmbeddingError, EmbeddingProvider};
 
-    use fastembed::{InitOptions, TextEmbedding};
-    use std::path::PathBuf;
+    use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+
+    /// 当前嵌入模型标识。写入 `history_meta.embedding_model`,
+    /// 模型切换后据此清空并重建历史向量索引。
+    pub const EMBEDDING_MODEL_NAME: &str = "bge-small-zh-v1.5";
+
+    /// ONNX Runtime 动态库文件名(按平台)。
+    #[cfg(target_os = "windows")]
+    const ORT_DYLIB_FILE: &str = "onnxruntime.dll";
+    #[cfg(target_os = "macos")]
+    const ORT_DYLIB_FILE: &str = "libonnxruntime.dylib";
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    const ORT_DYLIB_FILE: &str = "libonnxruntime.so";
 
     /// Fastembed provider — 持有 ONNX Runtime + 模型。
     ///
@@ -633,7 +647,7 @@ pub mod fastembed_provider {
     impl std::fmt::Debug for FastembedProvider {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("FastembedProvider")
-                .field("model", &"TextEmbedding(BGE-small-en-v1.5)")
+                .field("model", &"TextEmbedding(BGE-small-zh-v1.5)")
                 .finish()
         }
     }
@@ -642,7 +656,7 @@ pub mod fastembed_provider {
     ///
     /// fastembed 5.17.3 默认 `get_cache_dir()` 返回相对路径 `.fastembed_cache`,
     /// 导致模型被下载到当前工作目录(cwd)。每次 cwd 变化或目录被清理就会
-    /// 重复下载 ~50MB 的 ONNX 模型。这里显式指定绝对路径解决该问题。
+    /// 重复下载 ONNX 模型。这里显式指定绝对路径解决该问题。
     ///
     /// 优先级:
     /// 1. `FASTEMBED_CACHE_DIR` 环境变量(用户显式覆盖)
@@ -664,17 +678,69 @@ pub mod fastembed_provider {
         }
     }
 
+    /// 定位 ONNX Runtime 动态库,并把绝对路径写入 `ORT_DYLIB_PATH`。
+    ///
+    /// ort 2.x 在 `load-dynamic` 模式下找不到动态库会直接 panic(内部 `.expect`),
+    /// 因此必须在调用 fastembed 之前显式检查。查找顺序:
+    /// 1. `ORT_DYLIB_PATH`(用户显式指定,必须存在)
+    /// 2. 主程序所在目录(分发时 dll 与 exe 并排)
+    /// 3. 当前工作目录(开发时 `cargo run` / 测试)
+    fn resolve_ort_dylib() -> Result<PathBuf, EmbeddingError> {
+        if let Some(raw) = std::env::var_os("ORT_DYLIB_PATH") {
+            let path = PathBuf::from(raw);
+            if path.is_file() {
+                return Ok(path);
+            }
+            return Err(EmbeddingError::ModelLoad(format!(
+                "ORT_DYLIB_PATH 指向的文件不存在: {}",
+                path.display()
+            )));
+        }
+        let candidates = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            .into_iter()
+            .chain(std::iter::once(PathBuf::from(".")));
+        for dir in candidates {
+            let candidate = dir.join(ORT_DYLIB_FILE);
+            if candidate.is_file() {
+                // ort 内部按 cwd/系统 PATH 解析相对路径;写入绝对路径确保
+                // 加载的就是这里找到的文件(尤其是 dll 与 exe 并排时)。
+                let absolute = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+                std::env::set_var("ORT_DYLIB_PATH", &absolute);
+                return Ok(absolute);
+            }
+        }
+        Err(EmbeddingError::ModelLoad(format!(
+            "未找到 {ORT_DYLIB_FILE}(应与主程序同目录,或通过 ORT_DYLIB_PATH 指定)"
+        )))
+    }
+
     impl FastembedProvider {
-        /// 创建并加载 BGE-small-en-v1.5 模型。
+        /// 创建并加载 BGE-small-zh-v1.5 模型。
         ///
         /// 首次调用会下载模型文件到稳定缓存目录(默认 `~/.cache/fastembed`,
         /// 可被 `FASTEMBED_CACHE_DIR` 或 `HF_HOME` 覆盖)。后续调用从缓存
         /// 加载,~100ms。使用绝对路径避免因 cwd 变化导致的重复下载。
+        ///
+        /// ONNX Runtime 动态库缺失或版本不兼容时返回 [`EmbeddingError`],
+        /// 调用方应退化为关键词检索。
         pub fn try_new() -> Result<Self, EmbeddingError> {
+            resolve_ort_dylib()?;
             let cache_dir = stable_cache_dir();
-            let options = InitOptions::default().with_cache_dir(cache_dir);
-            let model = TextEmbedding::try_new(options)
-                .map_err(|err| EmbeddingError::ModelLoad(err.to_string()))?;
+            let options =
+                TextInitOptions::new(EmbeddingModel::BGESmallZHV15).with_cache_dir(cache_dir);
+            // ort 在动态库版本不兼容等场景内部 panic(而非返回 Err),
+            // 这里兜住以保证服务仍能启动并退化为关键词匹配。
+            let model = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                TextEmbedding::try_new(options)
+            }))
+            .map_err(|_| {
+                EmbeddingError::ModelLoad(format!(
+                    "ONNX Runtime 初始化失败({ORT_DYLIB_FILE} 版本不兼容?)"
+                ))
+            })?
+            .map_err(|err| EmbeddingError::ModelLoad(err.to_string()))?;
             Ok(Self {
                 model: Arc::new(Mutex::new(model)),
             })
@@ -709,12 +775,12 @@ pub mod fastembed_provider {
         }
 
         fn dim(&self) -> usize {
-            // BGE-small-en-v1.5 输出维度。
-            384
+            // BGE-small-zh-v1.5 输出维度。
+            512
         }
 
         fn name(&self) -> &str {
-            "fastembed-bge-small-en-v1.5"
+            EMBEDDING_MODEL_NAME
         }
     }
 }

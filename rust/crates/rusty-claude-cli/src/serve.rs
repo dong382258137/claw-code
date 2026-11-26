@@ -1294,6 +1294,11 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         spawn_session_watchdog(state.clone());
         // Phase 6:进程内 tick 线程,扫描各工作区到期的定时任务并入队。
         cron_runner::spawn_cron_runner(state.clone());
+        // Phase 7:后台预热语义检索(动态加载 onnxruntime.dll + ONNX 模型)。
+        // 不阻塞端口监听;失败时 /api/meta 上报 keyword 降级状态。
+        std::thread::spawn(|| {
+            let _ = runtime::build_embedding_provider();
+        });
         let app = Router::new()
             .route("/", get(index))
             .route("/api/sessions", get(api_sessions).post(api_create_session))
@@ -4965,6 +4970,8 @@ async fn api_meta(State(state): State<AppState>, Query(auth): Query<AuthQuery>) 
         "version": env!("CARGO_PKG_VERSION"),
         "git_sha": crate::GIT_SHA,
         "workspace": state.workspace.display().to_string(),
+        // Phase 7:语义检索状态（ready / keyword / loading / disabled）。
+        "embedding": runtime::embedding_status(),
     }))
     .into_response()
 }

@@ -10,6 +10,16 @@ export function SettingsPage({ settings, meta, onClose, onSave }) {
   const [theme, setTheme] = useState(settings.theme || 'dark')
   const [permission, setPermission] = useState(settings.permission || 'workspace-write')
   const [activeNav, setActiveNav] = useState('settings-appearance')
+  const embedding = meta.embedding || {}
+  const embeddingState = embedding.state || 'loading'
+  const embeddingLabel =
+    {
+      ready: '可用',
+      keyword: '关键词降级',
+      loading: '初始化中',
+      disabled: '未启用',
+    }[embeddingState] || embeddingState
+  const embeddingDetail = embedding.detail || '本地向量 + 全文混合检索'
 
   const jump = (id) => {
     setActiveNav(id)
@@ -104,6 +114,15 @@ export function SettingsPage({ settings, meta, onClose, onSave }) {
             <div className="settings-row">
               <div className="settings-row-label"><b>工作区</b></div>
               <span className="settings-value path">{meta.workspace || '—'}</span>
+            </div>
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <b>语义检索</b>
+                <small>{embeddingDetail}</small>
+              </div>
+              <span className={`settings-value${embeddingState === 'keyword' ? ' warn' : ''}`}>
+                {embeddingLabel}
+              </span>
             </div>
           </section>
         </div>

@@ -3313,6 +3313,7 @@ aside { padding: 10px 10px 8px; }
   text-align: right;
   word-break: break-all;
 }
+.settings-value.warn { color: var(--warn); }
 .theme-choice { display: flex; flex: none; gap: 8px; }
 .theme-option {
   display: inline-flex;

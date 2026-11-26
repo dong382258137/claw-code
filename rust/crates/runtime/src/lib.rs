@@ -443,19 +443,61 @@ use std::sync::{Arc, OnceLock};
 // ── Embedding runtime factory ──
 // Step 4.x: 将 embedding provider 的创建集中在一个工厂函数中,供 PersistentMemory、
 // TraceAnalyzer 等消费者注入。feature `embedding` 开启时优先使用 FastembedProvider
-// (BGE-small-en-v1.5,384 维),创建失败则自动降级到 HashEmbeddingProvider。
+// (BGE-small-zh-v1.5,512 维),不可用(动态库缺失/模型下载失败)时返回 None,
+// 由调用方退化为关键词检索。
 //
 // v4:改为进程级 OnceLock 单例并返回 `Arc`。PersistentMemory 与 HistoryIndex
 // 共用同一模型实例,避免 embedding feature 下重复加载 ONNX 模型(~300MB/份)。
+// Phase 7:ONNX Runtime 改为运行时从 onnxruntime.dll 动态加载,主二进制不再内嵌。
 // 首次调用可能耗时数秒(模型加载/下载),后续调用为 ~100ms。
+
+/// 语义检索运行状态(供 Web 设置页与诊断展示)。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EmbeddingStatus {
+    /// `ready` | `keyword` | `loading` | `disabled`
+    pub state: String,
+    /// 当前模型标识(未启用时为空)。
+    pub model: String,
+    /// 向量维度(未加载时为 0)。
+    pub dim: usize,
+    /// 人类可读说明(失败原因/降级提示)。
+    pub detail: String,
+}
+
+static EMBEDDING_STATUS: OnceLock<EmbeddingStatus> = OnceLock::new();
+
+/// 查询语义检索状态。模型尚未初始化时返回 `loading`,不会触发模型加载。
+#[must_use]
+pub fn embedding_status() -> EmbeddingStatus {
+    if let Some(status) = EMBEDDING_STATUS.get() {
+        return status.clone();
+    }
+    if cfg!(feature = "embedding") {
+        EmbeddingStatus {
+            state: "loading".to_owned(),
+            model: "bge-small-zh-v1.5".to_owned(),
+            dim: 0,
+            detail: "语义检索正在初始化".to_owned(),
+        }
+    } else {
+        EmbeddingStatus {
+            state: "disabled".to_owned(),
+            model: String::new(),
+            dim: 0,
+            detail: "本构建未启用语义检索".to_owned(),
+        }
+    }
+}
 
 /// 根据编译 feature 创建(或复用)进程级共享的 embedding provider。
 ///
-/// - `feature = "embedding"` 开启且 FastembedProvider 初始化成功:返回 BGE-small 384 维。
-/// - `feature = "embedding"` 开启但初始化失败(如模型下载失败):自动降级为 HashEmbeddingProvider。
+/// - `feature = "embedding"` 开启且 FastembedProvider 初始化成功:返回 BGE-small-zh 512 维。
+/// - `feature = "embedding"` 开启但初始化失败(onnxruntime.dll 缺失、模型下载失败等):
+///   返回 None,调用方退化到关键词匹配。
 /// - `feature = "embedding"` 未开启:返回 None(调用方应使用 keyword fallback)。
 ///
 /// 返回 `None` 不表示错误,调用方应检测并退化为关键词匹配。
+/// 状态可通过 [`embedding_status`] 查询。
 #[must_use]
 pub fn build_embedding_provider() -> Option<Arc<dyn EmbeddingProvider + Send + Sync>> {
     static PROVIDER: OnceLock<Option<Arc<dyn EmbeddingProvider + Send + Sync>>> = OnceLock::new();
@@ -465,19 +507,32 @@ pub fn build_embedding_provider() -> Option<Arc<dyn EmbeddingProvider + Send + S
             {
                 match memory_semantic::fastembed_provider::FastembedProvider::try_new() {
                     Ok(provider) => {
+                        let model = provider.name().to_owned();
+                        let dim = provider.dim();
                         eprintln!(
-                            "embedding provider: fastembed ({}-dim BGE-small-en-v1.5)",
-                            provider.dim()
+                            "embedding provider: fastembed ({dim}-dim {})",
+                            memory_semantic::fastembed_provider::EMBEDDING_MODEL_NAME
                         );
+                        let _ = EMBEDDING_STATUS.set(EmbeddingStatus {
+                            state: "ready".to_owned(),
+                            model,
+                            dim,
+                            detail: format!("语义检索可用（{dim} 维本地向量）"),
+                        });
                         Some(Arc::new(provider) as Arc<dyn EmbeddingProvider + Send + Sync>)
                     }
                     Err(e) => {
                         eprintln!(
-                            "fastembed init failed ({}), falling back to hash embedding",
-                            e
+                            "embedding unavailable ({e}), semantic search falls back to keyword"
                         );
-                        Some(Arc::new(HashEmbeddingProvider::default_dim())
-                            as Arc<dyn EmbeddingProvider + Send + Sync>)
+                        let _ = EMBEDDING_STATUS.set(EmbeddingStatus {
+                            state: "keyword".to_owned(),
+                            model: memory_semantic::fastembed_provider::EMBEDDING_MODEL_NAME
+                                .to_owned(),
+                            dim: 0,
+                            detail: format!("语义检索不可用，当前为关键词匹配（{e}）"),
+                        });
+                        None
                     }
                 }
             }

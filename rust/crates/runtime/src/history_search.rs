@@ -19,12 +19,23 @@
 //! - The connection is guarded by a `Mutex` because `rusqlite::Connection`
 //!   is `!Sync` but the index is shared across threads via `Arc`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::memory_semantic::{cosine_similarity, EmbeddingProvider, EmbeddingProviderRef};
+
+/// `history_meta` 中记录当前向量索引所用模型标识的键。
+///
+/// 模型切换（如 BGE-small-en 384 维 → BGE-small-zh 512 维）后旧向量与
+/// 新模型的向量空间不兼容，启动时比对不一致即清空 `history_vectors`
+/// 并在后台重建。
+const EMBEDDING_MODEL_KEY: &str = "embedding_model";
+
+/// 后台重建向量索引时每批送入 embedding 的消息数。
+const REBUILD_BATCH_SIZE: usize = 16;
 
 /// FTS5-backed history search index.
 #[derive(Debug)]
@@ -34,6 +45,8 @@ pub struct HistoryIndex {
     /// 计算向量存入 `history_vectors` 表,`hybrid_search` 走词法+稠密双路。
     /// 未注入时行为与纯 FTS5 `search` 完全一致。
     embedder: EmbeddingProviderRef,
+    /// 数据库路径：模型切换后后台重建向量需要独立连接。
+    db_path: PathBuf,
 }
 
 impl HistoryIndex {
@@ -59,6 +72,9 @@ impl HistoryIndex {
             let _ = std::fs::create_dir_all(parent);
         }
         let mut conn = Connection::open(db_path)?;
+        // Phase 7：后台重建向量会与本连接并发写同一 db，设置 busy timeout
+        // 避免 SQLITE_BUSY 直接失败。
+        conn.busy_timeout(Duration::from_secs(5))?;
         // 版本检测与迁移:
         // - v1:有 history 表但无 history_meta(未切分 CJK)→ 重建为 v4(带 content_raw)
         // - v2:有 history_meta 且 schema_version < 3(content 已切分但无 content_raw)→ 重建为 v4
@@ -93,14 +109,57 @@ impl HistoryIndex {
         Ok(Self {
             conn: Mutex::new(conn),
             embedder: EmbeddingProviderRef::default(),
+            db_path: db_path.to_path_buf(),
         })
     }
 
     /// 注入稠密检索 embedder(进程级共享实例,见 `crate::build_embedding_provider`)。
+    ///
+    /// Phase 7:注入时校验 `history_meta.embedding_model`。模型不一致
+    /// (含首次启用)时清空 `history_vectors` 并后台重建,避免用旧模型的
+    /// 384 维向量与新模型的 512 维向量混用。
     #[must_use]
     pub fn with_embedder(mut self, embedder: Arc<dyn EmbeddingProvider + Send + Sync>) -> Self {
+        let model = embedder.name().to_owned();
+        if self.reset_vector_space(&model) {
+            let db_path = self.db_path.clone();
+            let rebuild_provider = embedder.clone();
+            std::thread::spawn(move || {
+                rebuild_vectors(&db_path, rebuild_provider.as_ref(), &model);
+            });
+        }
         self.embedder = EmbeddingProviderRef::new(embedder);
         self
+    }
+
+    /// 模型变更时清空向量表并写入新模型标识。
+    ///
+    /// 返回 `true` 表示需要后台重建。读取/写入失败时保守返回 `false`
+    /// (保持现状,不阻塞会话)。
+    fn reset_vector_space(&self, model: &str) -> bool {
+        let conn = self.conn.lock().expect("history index mutex poisoned");
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT value FROM history_meta WHERE key = ?1",
+                [EMBEDDING_MODEL_KEY],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if stored.as_deref() == Some(model) {
+            return false;
+        }
+        let _ = conn.execute("DELETE FROM history_vectors", []);
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO history_meta (key, value) VALUES (?1, ?2)",
+            rusqlite::params![EMBEDDING_MODEL_KEY, model],
+        );
+        // 空库（新工作区/测试）无需重建。
+        let pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+            .unwrap_or(0);
+        pending > 0
     }
 
     /// Index a single message.
@@ -698,6 +757,64 @@ fn gzip_novelty(memory: &str, event: &str) -> f64 {
 /// f32 向量 → little-endian 字节(SQLite BLOB 存储)。
 fn f32_vec_to_le_bytes(vec: &[f32]) -> Vec<u8> {
     vec.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// 后台重建 `history_vectors`(模型切换后调用)。
+///
+/// 打开独立连接读取全部词法行,批量嵌入后写回。逐批提交,单批失败即中止
+/// (已写入的批次保留,`hybrid_search` 仍可用部分向量 + 词法兜底)。
+/// 失败只记日志,不影响主流程。
+fn rebuild_vectors(db_path: &Path, embedder: &dyn EmbeddingProvider, model: &str) {
+    let outcome = (|| -> Result<usize, HistoryIndexError> {
+        let conn = Connection::open(db_path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let rows: Vec<(i64, String)> = {
+            let mut stmt =
+                conn.prepare("SELECT rowid, COALESCE(content_raw, content) FROM history")?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let mut rebuilt = 0usize;
+        for chunk in rows.chunks(REBUILD_BATCH_SIZE) {
+            let batch: Vec<&(i64, String)> = chunk
+                .iter()
+                .filter(|(_, content)| {
+                    !content.is_empty() && content.chars().count() <= MAX_EMBED_CHARS
+                })
+                .collect();
+            if batch.is_empty() {
+                continue;
+            }
+            let texts: Vec<&str> = batch.iter().map(|(_, text)| text.as_str()).collect();
+            let vectors = embedder
+                .embed_batch(&texts)
+                .map_err(|err| HistoryIndexError::new(err.to_string()))?;
+            let tx = conn.unchecked_transaction()?;
+            for ((rowid, _), vector) in batch.iter().zip(vectors) {
+                if vector.is_empty() {
+                    continue;
+                }
+                tx.execute(
+                    // EXISTS 守卫：快照之后被 clear_session 删除的行不再写入，
+                    // 避免重建线程制造孤儿向量。
+                    "INSERT OR REPLACE INTO history_vectors (message_id, vector) \
+                     SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM history WHERE rowid = ?1)",
+                    rusqlite::params![rowid, f32_vec_to_le_bytes(&vector)],
+                )?;
+                rebuilt += 1;
+            }
+            tx.commit()?;
+        }
+        Ok(rebuilt)
+    })();
+    match outcome {
+        Ok(count) => eprintln!("[history] rebuilt {count} vector(s) for model {model}"),
+        Err(err) => eprintln!(
+            "[history] vector rebuild aborted ({err}); dense search uses partial index + lexical fallback"
+        ),
+    }
 }
 
 /// SQLite BLOB → f32 向量。
@@ -1702,6 +1819,95 @@ mod tests {
             )
             .expect("remaining vector session");
         assert_eq!(session, "sess-b");
+    }
+
+    #[test]
+    fn model_change_clears_and_rebuilds_vectors() {
+        use crate::memory_semantic::HashEmbeddingProvider;
+
+        /// 固定维度但可自定义名字的 provider，用于模拟模型切换。
+        struct NamedProvider {
+            name: &'static str,
+            inner: HashEmbeddingProvider,
+        }
+        impl EmbeddingProvider for NamedProvider {
+            fn embed(
+                &self,
+                text: &str,
+            ) -> Result<Vec<f32>, crate::memory_semantic::EmbeddingError> {
+                self.inner.embed(text)
+            }
+            fn dim(&self) -> usize {
+                self.inner.dim()
+            }
+            fn name(&self) -> &str {
+                self.name
+            }
+        }
+
+        let file = NamedTempFile::new().expect("create temp db file");
+        let path = file.path().to_path_buf();
+        let provider_a: Arc<dyn EmbeddingProvider + Send + Sync> = Arc::new(NamedProvider {
+            name: "model-a",
+            inner: HashEmbeddingProvider::new(64),
+        });
+        {
+            let index = HistoryIndex::open(&path)
+                .expect("open")
+                .with_embedder(provider_a);
+            index
+                .index_message("rust programming language", "s1", "user", 0, 1_000)
+                .expect("index 1");
+            index
+                .index_message("中文向量检索", "s1", "user", 1, 2_000)
+                .expect("index 2");
+        }
+        // 同名模型再次打开：不清空。
+        let same: Arc<dyn EmbeddingProvider + Send + Sync> = Arc::new(NamedProvider {
+            name: "model-a",
+            inner: HashEmbeddingProvider::new(64),
+        });
+        let index = HistoryIndex::open(&path)
+            .expect("reopen")
+            .with_embedder(same);
+        {
+            let conn = index.conn.lock().unwrap_or_else(|e| e.into_inner());
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM history_vectors", [], |row| row.get(0))
+                .expect("count");
+            assert_eq!(count, 2, "same model must keep vectors");
+        }
+        drop(index);
+
+        // 模型切换：清空旧向量并后台重建。
+        let changed: Arc<dyn EmbeddingProvider + Send + Sync> = Arc::new(NamedProvider {
+            name: "model-b",
+            inner: HashEmbeddingProvider::new(64),
+        });
+        let index = HistoryIndex::open(&path)
+            .expect("reopen")
+            .with_embedder(changed);
+        let mut rebuilt = 0;
+        for _ in 0..100 {
+            let conn = index.conn.lock().unwrap_or_else(|e| e.into_inner());
+            rebuilt = conn
+                .query_row("SELECT COUNT(*) FROM history_vectors", [], |row| row.get(0))
+                .expect("count");
+            if rebuilt == 2 {
+                let model: String = conn
+                    .query_row(
+                        "SELECT value FROM history_meta WHERE key = 'embedding_model'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("embedding_model");
+                assert_eq!(model, "model-b");
+                break;
+            }
+            drop(conn);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(rebuilt, 2, "background rebuild should restore both vectors");
     }
 
     #[test]
