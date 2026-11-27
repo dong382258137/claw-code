@@ -343,6 +343,11 @@ mod tests {
 
     #[test]
     fn archive_list_mark_processed_roundtrip() {
+        // env 是进程级全局状态：与 source_root / evidence 用例共享同一把锁，
+        // 否则并行跑时 A 的恢复会覆盖 B 刚设的值，表现为随机失败。
+        let _env_guard = crate::source_root::SOURCE_ROOT_ENV_LOCK
+            .lock()
+            .expect("source-root env lock");
         let tmp = std::env::temp_dir().join(format!("claw-inbox-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         // 必须真实创建目录：resolve_source_root 只在 env 指向已存在目录时才采用，
@@ -368,6 +373,53 @@ mod tests {
                 || moved.ends_with("424242-punchback.md")
         );
         assert!(list_pending(&inbox).is_empty(), "处理后 pending 应为空");
+
+        match saved {
+            Some(v) => std::env::set_var(crate::source_root::SOURCE_ROOT_ENV, v),
+            None => std::env::remove_var(crate::source_root::SOURCE_ROOT_ENV),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 证据包只落 JSON 原始事实，且**不得**写进 inbox。
+    ///
+    /// 这是本轮修复的核心契约：自动通道降级为纯采集后，若它仍往 inbox 写
+    /// 提案，那么「提案由 LLM 撰写」的设计就不成立 —— 队列会被模板垃圾重新
+    /// 灌满（实测 21 条里 20 条正是这样来的）。
+    #[test]
+    fn evidence_pack_lands_in_evidence_dir_not_inbox() {
+        // 与 archive/source_root 用例共享同一把 env 锁（进程级全局状态）。
+        let _env_guard = crate::source_root::SOURCE_ROOT_ENV_LOCK
+            .lock()
+            .expect("source-root env lock");
+        let tmp = std::env::temp_dir().join(format!("claw-evidence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+
+        let saved = std::env::var_os(crate::source_root::SOURCE_ROOT_ENV);
+        std::env::set_var(crate::source_root::SOURCE_ROOT_ENV, &tmp);
+
+        let evidence = vec!["turn: iterations=64 elapsed=880s trigger=soft_threshold".to_string()];
+        let path = write_evidence_pack(&tmp, "soft_threshold", &evidence, "sess-1", 1000)
+            .expect("写入证据包");
+
+        assert!(path.is_file(), "证据包应落盘: {path:?}");
+        assert!(
+            path.to_string_lossy().contains("evidence"),
+            "必须落在 evidence/ 目录: {path:?}"
+        );
+        // 关键：inbox 必须仍然为空 —— 自动通道不再产生提案。
+        let inbox = resolve_inbox_dir(&tmp);
+        assert!(
+            list_pending(&inbox).is_empty(),
+            "自动通道不得再往 inbox 写提案"
+        );
+
+        // 内容是结构化 JSON，且带 trigger/evidence 两个可核查字段。
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("\"trigger\""), "应含 trigger");
+        assert!(text.contains("soft_threshold"), "应含 trigger 值");
+        assert!(text.contains("\"evidence\""), "应含 evidence");
 
         match saved {
             Some(v) => std::env::set_var(crate::source_root::SOURCE_ROOT_ENV, v),

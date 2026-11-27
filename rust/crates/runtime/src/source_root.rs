@@ -25,6 +25,20 @@ pub const SOURCE_ROOT_FILE: &str = "source-root";
 /// 环境变量名:显式指定源码根(最高优先级)。
 pub const SOURCE_ROOT_ENV: &str = "CLAW_SOURCE_ROOT";
 
+/// 测试专用:串行化对 [`SOURCE_ROOT_ENV`] 的读写。
+///
+/// **为什么必须共享一把锁**：`std::env` 是**进程级**全局状态，而 cargo test
+/// 默认多线程并行跑同一 crate 内的用例。当前有三处用例会 `set_var` 这个变量
+/// （本模块 `resolve_prefers_env_then_registry`、`evolution_inbox` 的
+/// `archive_list_mark_processed_roundtrip` 与 `evidence_pack_lands_in_evidence_dir_not_inbox`），
+/// 各自「保存→改→恢复」而不互斥时，A 的恢复会覆盖 B 刚设的值，B 就会读到
+/// 错误目录 —— 表现为随机失败（实测：单独跑全过，全量跑必挂 1~2 个）。
+///
+/// 锁定义在此模块而非各测试内部，是为了让**所有**使用该 env 的用例共享同一
+/// 互斥量；各自定义 `static` 会得到多把锁，等于没锁。
+#[cfg(test)]
+pub(crate) static SOURCE_ROOT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 判断目录是否为 `claw-server` 的 cargo workspace。
 ///
 /// 判定不能用"含 Cargo.toml" —— 仓库内可能有多个含 Cargo.toml 的目录
@@ -163,6 +177,8 @@ mod tests {
 
     #[test]
     fn resolve_prefers_env_then_registry() {
+        // env 是进程级全局状态，多线程并行跑测试时必须互斥（见 SOURCE_ROOT_ENV_LOCK）。
+        let _env_guard = SOURCE_ROOT_ENV_LOCK.lock().expect("source-root env lock");
         // 注:不真的写全局注册表(避免污染),仅验证 env 分支与'null 目录被忽略'。
         let tmp = std::env::temp_dir().join(format!("claw-srcroot-env-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).ok();
