@@ -14933,6 +14933,11 @@ mod tests {
 
     #[test]
     fn repl_executes_python_code() {
+        // 2026-11-27: 必须持 env_guard —— 本测试经 PATH 解析 python，
+        // 而 powershell_* 测试会在持锁期间把 PATH 改成空目录/桩目录。
+        // 锁此前只串行化了写者，没保护读者，导致本测试在全量并行时
+        // 报 "python runtime not found"（单跑必过）。
+        let _guard = env_guard();
         let result = execute_tool(
             "REPL",
             &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 500}),
@@ -14962,6 +14967,8 @@ mod tests {
 
     #[test]
     fn given_timeout_ms_when_repl_blocks_then_returns_timeout_error() {
+        // 同上：依赖 PATH 解析 python，需与改写 PATH 的测试串行。
+        let _guard = env_guard();
         let result = execute_tool(
             "REPL",
             &json!({
