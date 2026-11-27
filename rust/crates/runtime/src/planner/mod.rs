@@ -298,7 +298,14 @@ pub fn generate_steps_with_llm(user_input: &str) -> Option<Vec<PlanStep>> {
 
 /// 构建计划生成 prompt — 要求模型输出 JSON 数组,每个元素含
 /// description / acceptance_criteria / verify_command(可选)。
+///
+/// 2026-11-27:加入**目标平台约束**。此前 prompt 只说「a concrete shell
+/// command」,LLM 按 Linux 习惯生成 POSIX-only 命令,而执行端在 Windows 上
+/// 固定用 `cmd /C`(见 `verifier::rule::execute_command`)。实测本机 7 条
+/// verify_command 有 6 条不可执行(`test` 内建、`.sh` 脚本、错误参数),
+/// 导致任务被误判失败。故在此显式声明平台与可用命令形态。
 fn build_plan_generation_prompt(user_input: &str) -> String {
+    let platform = platform_verify_hint();
     format!(
         "You are a task planner for a coding assistant. Decompose the following user request \
          into an ordered, executable plan.\n\
@@ -311,10 +318,42 @@ fn build_plan_generation_prompt(user_input: &str) -> String {
          - 3-10 steps; each step = one cohesive unit of work (e.g. one file change or one subsystem).\n\
          - description: what to do (Chinese or English, match the request language).\n\
          - acceptance_criteria: how to verify the step succeeded.\n\
-         - verify_command: a concrete shell command that checks the step (e.g. \"cargo test --no-fail-fast\"), \
+         - verify_command: a concrete shell command that checks the step, \
          or null if not applicable.\n\
-         - Do not include escaping backslashes or code fences."
+         - Do not include escaping backslashes or code fences.\n\
+         \n\
+         PLATFORM FOR verify_command (mandatory):\n\
+         {platform}"
     )
+}
+
+/// verify_command 的平台约束文本。
+///
+/// 抽成独立函数便于测试断言，也避免把平台判断散落在 prompt 字符串里。
+fn platform_verify_hint() -> String {
+    if cfg!(windows) {
+        "- Target OS: Windows. verify_command runs via `cmd /C <command>` — NOT a POSIX shell.\n\
+         - Do NOT use POSIX-only shell builtins: `test`, `[`, `[[`, `export`, `source`, \
+         `unset`, `alias`, `declare`, `local`, `trap`, `umask`. They do not exist in cmd.exe.\n\
+         - Do NOT reference `.sh` / bash scripts. Only use scripts that exist in this repo \
+         and are runnable on Windows (`.bat`, `.cmd`, `.ps1`, or `cargo`/`git`/`python` directly).\n\
+         - Prefer cross-platform commands that are already on PATH: \
+         `cargo test -p <crate>`, `cargo clippy --workspace -- -D warnings`, \
+         `git diff --check`, `python <script>.py`. Quote paths containing spaces with double quotes.\n\
+         - Use Windows path separators (`\\`) or forward slashes; never `/tmp/...` — \
+         use `%TEMP%` for temporary files.\n\
+         - A verify_command that cannot run on Windows will be recorded as SKIPPED, not as proof \
+         of success. If no runnable check exists, use null instead of guessing.\n"
+            .to_string()
+    } else {
+        "- Target OS: Unix-like. verify_command runs via `sh -c <command>`.\n\
+         - POSIX shell builtins and pipes/redirection are available.\n\
+         - Prefer cross-platform commands: `cargo test -p <crate>`, \
+         `cargo clippy --workspace -- -D warnings`, `git diff --check`.\n\
+         - A verify_command that cannot run will be recorded as SKIPPED, not as proof of success. \
+         If no runnable check exists, use null instead of guessing.\n"
+            .to_string()
+    }
 }
 
 /// 内部 JSON 结构 — 只取 LLM 提供的字段,其余字段由 [`PlanStep`] 默认值填充。
@@ -572,6 +611,62 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 计划生成提示词必须携带目标平台约束。
+    ///
+    /// 缺陷背景(2026-11-27):原 prompt 只说「a concrete shell command」,
+    /// LLM 按 Linux 习惯生成 POSIX-only 命令,而执行端在 Windows 上固定用
+    /// `cmd /C`。实测本机 7 条 verify_command 有 6 条不可执行,任务被误判失败。
+    #[test]
+    fn plan_generation_prompt_carries_platform_constraints() {
+        let prompt = build_plan_generation_prompt("重构登录模块");
+
+        assert!(
+            prompt.contains("PLATFORM FOR verify_command"),
+            "提示词必须显式声明平台约束段"
+        );
+        // 原始需求仍需完整透传，不能被平台段挤掉。
+        assert!(prompt.contains("重构登录模块"), "用户请求必须保留");
+
+        #[cfg(windows)]
+        {
+            assert!(prompt.contains("cmd /C"), "Windows 须说明执行器是 cmd /C");
+            assert!(
+                prompt.contains("Do NOT use POSIX-only shell builtins"),
+                "须显式禁止 POSIX-only 内建"
+            );
+            // 逐个点名这些内建，否则模型仍会写 `test ...`。
+            for builtin in ["`test`", "`export`", "`source`"] {
+                assert!(
+                    prompt.contains(builtin),
+                    "须点名禁止的内建 {builtin}，实际提示词缺该项"
+                );
+            }
+            assert!(
+                prompt.contains("Do NOT reference `.sh`"),
+                "须禁止引用 .sh 脚本"
+            );
+            assert!(prompt.contains("%TEMP%"), "临时文件须指向 %TEMP%");
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(prompt.contains("sh -c"), "Unix 须说明执行器是 sh -c");
+        }
+
+        // 两种平台共有：无法执行的命令记 SKIPPED 而非视为通过。
+        assert!(
+            prompt.contains("SKIPPED"),
+            "须说明不可执行命令记为 SKIPPED，避免模型以为 null/乱写都算通过"
+        );
+    }
+
+    /// 平台约束不得覆盖或破坏 JSON 输出格式要求。
+    #[test]
+    fn plan_generation_prompt_keeps_json_contract() {
+        let prompt = build_plan_generation_prompt("x");
+        assert!(prompt.contains("Output ONLY a JSON array"));
+        assert!(prompt.contains("\"verify_command\": string | null"));
+    }
 
     #[test]
     fn normalize_plan_update_maps_numeric_step_id() {
