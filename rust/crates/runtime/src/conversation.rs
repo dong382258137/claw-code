@@ -1937,6 +1937,15 @@ pub struct ConversationRuntime<C, T> {
     /// 由 `record_turn_completed` / `record_turn_failed` 在调用上报**之前**填充 ——
     /// 只有那里拿得到 `tool_results`，而 `maybe_report_framework_gap` 只收信号。
     turn_failed_tools: Cell<Vec<String>>,
+    /// 本轮连续工具失败计数（成功即清零）。
+    ///
+    /// **为什么需要**：`pending_gap_hint` 原本只在 turn 收尾设置，而消费点在
+    /// turn 循环内 —— 单轮 `-p` 会话里 turn 一结束进程就退出，模型永远看不到
+    /// 提示（实测 `framework-gap` 出现 0 次），整条「LLM 写提案」链路失效。
+    /// 连续失败是循环内就能拿到的真实信号，在此计数并即时提示，单轮也生效。
+    turn_tool_fail_streak: Cell<u32>,
+    /// 本 turn 是否已发过框架缺陷提示（防同一 turn 内反复刷）。
+    turn_gap_hinted: Cell<bool>,
     /// Harness V(验证)层:幻觉/偷懒信号扫描器。
     /// 在 PostToolUse hook 中对 write_file/edit_file 产物扫描占位标记
     /// (unimplemented!/placeholder/TODO),命中时以 warning 追加到 hook
@@ -2596,6 +2605,8 @@ where
             pending_gap_hint: Cell::new(None),
             turn_user_input: Cell::new(String::new()),
             turn_failed_tools: Cell::new(Vec::new()),
+            turn_tool_fail_streak: Cell::new(0),
+            turn_gap_hinted: Cell::new(false),
             slop_scanner: SlopScanner::new(),
             slop_scan_enabled: feature_config.slop_scan().unwrap_or(true),
             completion_verifier: crate::completion_verifier::CompletionVerifier::new(),
@@ -4125,6 +4136,10 @@ where
         // 问题」—— 这是提案质量的唯一分水岭，而 iterations/elapsed 无法提供。
         self.turn_user_input.set(user_input.clone());
         self.turn_failed_tools.set(Vec::new());
+        // 循环内即时提示的状态必须按 turn 重置：否则上一 turn 已提示过，
+        // `turn_gap_hinted` 残留为 true 会让后续所有 turn 永久静默。
+        self.turn_tool_fail_streak.set(0);
+        self.turn_gap_hinted.set(false);
 
         // 收敛契约 · 打回率埋点(基线阶段,零 LLM):本 turn 的前置若存在 assistant
         // 收尾答复(即非会话首 turn),则对该 user 输入做打回判定并落盘会话级
@@ -5974,6 +5989,15 @@ where
                         self.emit_diag(format!(
                             "[diag] tool_done iter={iterations} name={name} is_error={is_err}"
                         ));
+                        // 框架缺陷**即时**提示（循环内）。
+                        //
+                        // 此前 `pending_gap_hint` 只在 turn 收尾设置，而消费点在
+                        // turn 循环内 —— 单轮 `-p` 会话里 turn 一结束进程即退出，
+                        // 模型永远看不到提示（实测 `framework-gap` 出现 0 次），
+                        // 整条「LLM 写提案」链路在单轮场景下完全失效。
+                        // 连续工具失败是循环内就能拿到的真实信号，在此即时排队，
+                        // 下一轮请求构造即可注入。
+                        self.maybe_hint_framework_gap_in_loop(&name, is_err);
                         // 持续推进豁免:写操作成功 = 长程重构在推进(而非空转),
                         // 放宽硬上限。覆盖"确认"这类短输入但实际执行多任务重构
                         // 的 turn(EPIC-062 恰好用满 192 次被误杀的根因)。
@@ -9994,6 +10018,44 @@ where
             tool_fail_streak,
             tool_calls,
         );
+    }
+
+    /// 循环内的框架缺陷即时提示（连续工具失败触发）。
+    ///
+    /// **为什么必须在循环内**：`pending_gap_hint` 原本只在 turn 收尾设置，而
+    /// 消费点在 turn 循环内构造请求时 —— 单轮 `-p` 会话里 turn 一结束进程即
+    /// 退出，模型永远看不到提示（实测 `framework-gap` 出现 0 次），整条
+    /// 「LLM 写提案」链路在单轮场景下失效。连续失败是循环内可得的真实信号，
+    /// 在此即时排队，下一轮请求构造即可注入。
+    fn maybe_hint_framework_gap_in_loop(&mut self, tool_name: &str, is_error: bool) {
+        if !is_error {
+            // 成功即清零：只有「连续」失败才指向框架层问题（单次失败多为参数
+            // 写错，属正常试错，提示只会变噪音）。
+            self.turn_tool_fail_streak.set(0);
+            return;
+        }
+        let streak = self.turn_tool_fail_streak.get().saturating_add(1);
+        self.turn_tool_fail_streak.set(streak);
+        if self.turn_gap_hinted.get() {
+            return; // 同一 turn 只提示一次，避免刷屏
+        }
+        let threshold = crate::evolution_gate::thresholds_from_env()
+            .tool_fail_streak
+            .max(1);
+        if streak < threshold {
+            return;
+        }
+        self.turn_gap_hinted.set(true);
+        self.pending_gap_hint.set(Some(format!(
+            "[framework-gap] 连续 {streak} 次工具失败（最近一次：`{tool_name}`）。\n\
+             请判断：这是 **claw 框架自身** 的缺陷（工具/提示词/收敛/指标），\
+             而不是用户项目代码的问题吗？\n\
+             - 是 → 调用 `report_framework_gap` 提案。observation 必须写清\
+             「在做什么任务、调用哪个工具、具体报什么错」；evidence 给可复现判据\
+             （文件:行号 / 命令输出 / 指标值）；acceptance 必须是**可执行命令**\
+             （修复前应失败、修复后应通过）。\n\
+             - 否（用户代码问题 / 正常失败 / 证据不足）→ 忽略本条，不要提案。"
+        )));
     }
 
     /// P1 元认知门控:廉价信号命中时自动归档一条框架缺陷提案到 evolution inbox。
