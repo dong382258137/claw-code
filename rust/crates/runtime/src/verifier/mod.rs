@@ -25,7 +25,7 @@
 
 pub mod rule;
 
-pub use rule::{RuleVerdict, RuleVerifier};
+pub use rule::{RuleVerdict, RuleVerifier, UNEXECUTABLE_PREFIX};
 
 use crate::multi_agent::validation::JudgeClient;
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,15 @@ impl VerificationResult {
     #[must_use]
     pub fn skipped() -> Self {
         Self::passed("verification skipped — no verify_command configured")
+    }
+
+    /// 验证命令在当前平台**无法执行**（不是任务失败）。
+    ///
+    /// 调用方应据此标记 `StepStatus::Skipped`：验证没发生，任务本身可能
+    /// 是好的，不应计为 failed；但也绝不能计为通过（静默假通过）。
+    #[must_use]
+    pub fn is_unexecutable(&self) -> bool {
+        self.detail.starts_with(UNEXECUTABLE_PREFIX)
     }
 }
 

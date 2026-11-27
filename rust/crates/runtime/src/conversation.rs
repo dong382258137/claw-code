@@ -6113,7 +6113,11 @@ where
                                 &step.acceptance_criteria,
                                 step.verify_command.as_deref(),
                             );
-                            if !result.passed {
+                            // 2026-11-27: 三态分流（与 plan_update 路径一致）。
+                            // 命令无法执行 → Skipped；执行后失败 → Failed + remediation。
+                            if result.is_unexecutable() {
+                                step.mark_skipped();
+                            } else if !result.passed {
                                 step.mark_failed();
                                 failed_verifications.push(crate::planner::FailedVerification {
                                     step_id: step.id.clone(),
@@ -8621,7 +8625,16 @@ where
                 if step.status == crate::planner::StepStatus::Succeeded {
                     if let Some(cmd) = step.verify_command.clone() {
                         let result = verifier.verify("", &step.acceptance_criteria, Some(&cmd));
-                        if !result.passed {
+                        // 2026-11-27: 三态分流。命令无法执行 → Skipped（验证没发生，
+                        // 任务本身可能没问题）；执行后失败 → Failed（任务真失败）。
+                        // 二者不可混同：前者判 Failed 是假阴性，判 Succeeded 是假通过。
+                        if result.is_unexecutable() {
+                            step.mark_skipped();
+                            verify_note = format!(
+                                "\n[verify] step '{}' SKIPPED (verify_command not executable on this platform): {}",
+                                step.id, result.detail
+                            );
+                        } else if !result.passed {
                             step.mark_failed();
                             let remediation = result
                                 .remediation
