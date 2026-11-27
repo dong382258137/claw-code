@@ -216,20 +216,87 @@ const NEW_DOMAIN_PREFIX: &[&str] = &[
     "再补充一个",
 ];
 
+/// 词表命中的**左邻**排除:这些字紧邻命中词之前时,表达的是取舍而非否定。
+///
+/// 只收「而不是」。「是不是」同样是误报(疑问句),但它是**已知残留误判**
+/// (`convergence::tests::known_false_positive_of_shi_bu_shi` 显式固化,基线按
+/// x0.85 修正),本模块不动它 —— 口径变更须连同基线一起改,不属于本次缺陷范围。
+const PUNCH_LEFT_GUARDS: &[(&str, &[&str])] = &[
+    // 「而不是」= 取舍("A 而不是 B"),不是对上一轮收尾的否定。
+    ("不是", &["而"]),
+];
+
+/// 词表命中的**右邻**排除:命中词与这些字连成更长的词,语义已变。
+const PUNCH_RIGHT_GUARDS: &[(&str, &[&str])] = &[
+    // 缺陷 / 缺点 / 缺乏 —— 名词或"缺少"的另一种写法,不是「缺了东西」。
+    ("缺", &["陷", "点", "乏"]),
+    // 重新编译 / 重新安装 / 重新构建 / 重新划分 —— 常规操作动词,不是「要求重做」。
+    ("重新", &["编译", "安装", "构建", "划分"]),
+    // 无效项 / 无效数据 —— 指数据不合法,不是「你的修复无效」。
+    ("无效", &["项", "数据", "条目"]),
+];
+
+/// `text` 是否以**未被否定/嵌入**的形式包含 `word`。
+///
+/// 词表是子串匹配,对多字词天然会把「更长的词」误判成打回证据:见
+/// [`PUNCH_LEFT_GUARDS`] / [`PUNCH_RIGHT_GUARDS`]。这些嵌入形式在真实语料里
+/// 占比很高 —— 实测 222 条打回埋点中 19 条被判 `strong`,其中 10 条的命中位置
+/// **全部**落在首个分句之后(即长任务指令里的偶然子串),并非对上轮收尾的否定。
+///
+/// 只排除**明确改变语义**的紧邻字,不做「必须在开头」之类的位置裁剪:打回可以
+/// 出现在句中("我看了你的输出,根本不对"),按位置裁剪会漏掉真打回。
+fn contains_punch_word(text: &str, word: &str) -> bool {
+    let empty: &[&str] = &[];
+    let left = PUNCH_LEFT_GUARDS
+        .iter()
+        .find(|(w, _)| *w == word)
+        .map_or(empty, |(_, g)| *g);
+    let right = PUNCH_RIGHT_GUARDS
+        .iter()
+        .find(|(w, _)| *w == word)
+        .map_or(empty, |(_, g)| *g);
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(word) {
+        let start = from + rel;
+        let end = start + word.len();
+        let left_ok = !left.iter().any(|g| text[..start].ends_with(g));
+        let right_ok = !right.iter().any(|g| text[end..].starts_with(g));
+        if left_ok && right_ok {
+            return true;
+        }
+        // 跳过当前命中,继续找下一个(同一词可能既被排除又被真正使用)。
+        from = match word.chars().next() {
+            Some(c) => start + c.len_utf8(),
+            None => return false,
+        };
+    }
+    false
+}
+
 /// 分类:判定一条 user 输入是否为"打回"。
 ///
 /// 规则顺序(与基线扫描 `tools/_punchback_baseline.py` 同构,含口径改进):
-/// 1. 剔除零宽/空白;
-/// 2. 精确承接词 → None;
-/// 3. 自澄清 / 新域报告前缀 → None;
-/// 4. 命中 强/弱/疑似 词表(子串匹配)→ 对应类;
-/// 5. 长度 < 4(无命中时)→ None。
+/// 1. 剥离外壳层注入块([`crate::task_state::strip_injected_prefix`]);
+/// 2. 剔除零宽/空白;
+/// 3. 精确承接词 → None;
+/// 4. 自澄清 / 新域报告前缀 → None;
+/// 5. 命中 强/弱/疑似 词表(边界感知子串匹配)→ 对应类;
+/// 6. 长度 < 4(无命中时)→ None。
 ///
 /// 注:与 python 基线不同,此处**先命中词表再判长度**,使"不对"/"不是"等短强打回
 /// 不再被长度裁剪误剔(口径改进,量化影响极小)。
+///
+/// # 为什么要先剥离注入块
+///
+/// Web 端把「计划模式指令 / Web 计划 / Web 待办」三类块**前置拼进 user 文本**
+/// 再入库。这些块不是用户发言,但正文里常含「缺」「不是」等词 —— 不剥离就会被
+/// 判成用户对上轮收尾的否定。实测 222 条打回埋点中 12 条正是此类
+/// (正文形如 `[计划模式] …不能只在回复里写…`,被判 `weak`/`strong`)。
+/// 剥离逻辑复用 `task_state` 的既有实现,不在此另立口径。
 pub fn classify_punchback(text: &str) -> PunchbackClass {
-    let trimmed = text.replace(['\u{2028}', '\r'], "");
-    let trimmed = trimmed.trim();
+    let stripped = crate::task_state::strip_injected_prefix(text);
+    let normalized = stripped.replace(['\u{2028}', '\r'], "");
+    let trimmed = normalized.trim();
     if trimmed.is_empty() {
         return PunchbackClass::None;
     }
@@ -247,14 +314,20 @@ pub fn classify_punchback(text: &str) -> PunchbackClass {
     if NEW_DOMAIN_PREFIX.iter().any(|p| trimmed.starts_with(p)) {
         return PunchbackClass::None;
     }
-    // 词表命中(子串),优先级 强 > 弱 > 疑似。
-    if STRONG_PUNCH_WORDS.iter().any(|w| trimmed.contains(w)) {
+    // 词表命中(边界感知子串),优先级 强 > 弱 > 疑似。
+    if STRONG_PUNCH_WORDS
+        .iter()
+        .any(|w| contains_punch_word(trimmed, w))
+    {
         return PunchbackClass::Strong;
     }
-    if WEAK_PUNCH_WORDS.iter().any(|w| trimmed.contains(w)) {
+    if WEAK_PUNCH_WORDS
+        .iter()
+        .any(|w| contains_punch_word(trimmed, w))
+    {
         return PunchbackClass::Weak;
     }
-    if FORCE_WORDS.iter().any(|w| trimmed.contains(w)) {
+    if FORCE_WORDS.iter().any(|w| contains_punch_word(trimmed, w)) {
         return PunchbackClass::Force;
     }
     if n < 4 {
@@ -483,6 +556,82 @@ mod tests {
     fn force_is_separate_bucket() {
         assert_eq!(cls("还有另外一个问题需要排查"), PunchbackClass::Force); // "还有"/"另外一个"
         assert_eq!(cls("继续修复才能收尾"), PunchbackClass::Force); // "继续修"
+    }
+
+    /// 回归(实测缺陷):词表子串匹配把**更长的词**误判成打回证据。
+    ///
+    /// 证据:inbox 提案 `1795807351104` trigger=punchback,该 turn 的真实 user
+    /// 输入为「我认为你的建议的处理顺序是正确的，但是关于第三点…这个提案要 llm
+    /// 去写，**而不是**要系统自动去判定…」。命中 `STRONG_PUNCH_WORDS` 的只有
+    /// 「不是」二字,且它是「而不是」的一部分 —— 表达取舍,不是对上一轮收尾的否定。
+    /// 该 turn 因此被判 `strong` → `punchback` 门控命中 → 生成一条无信息量的提案。
+    ///
+    /// 注:「是不是」疑问句是**已知残留误判**,由
+    /// [`known_false_positive_of_shi_bu_shi`] 显式固化(基线按 x0.85 修正),
+    /// 不在本次修复范围内 —— 改它须连同基线一起改。
+    #[test]
+    fn punch_words_embedded_in_longer_words_are_not_punchback() {
+        // 「而不是」= 取舍,不是否定。
+        assert_eq!(
+            cls("这个提案要 llm 去写，而不是要系统自动去判定，都是有缺陷的"),
+            PunchbackClass::None
+        );
+        // 「无效项」是名词(数据不合法),不是「你的修复无效」。
+        assert_eq!(
+            cls("对 15 条任务批量跑 validate，剔除无效项后再用作 pass^1 判据"),
+            PunchbackClass::None
+        );
+        // 「重新编译 / 重新安装 / 重新划分」是常规动作,不是「要求重做上轮结论」。
+        assert_eq!(
+            cls("必要的时候可以自己做工具或者脚本启动自进化重新编译二进制再继续执行任务"),
+            PunchbackClass::None
+        );
+        assert_eq!(
+            cls("你的重新编译安装没有使用热升级功能？我看到现在运行的还是旧版本"),
+            PunchbackClass::None
+        );
+        // 「缺陷」是名词,不是「缺了东西」。
+        assert_eq!(
+            cls("定位这个热升级缺陷的根因，先看退出路径"),
+            PunchbackClass::None
+        );
+    }
+
+    /// 排除只针对**紧邻**的语义改变字:真打回仍须判出,不能被排除规则放过。
+    #[test]
+    fn genuine_punchback_survives_boundary_guards() {
+        // 「不是」独立使用(前无「是/而」)= 真否定。
+        assert_eq!(cls("不是这样，你理解错了"), PunchbackClass::Strong);
+        assert_eq!(cls("这不是我要的结果"), PunchbackClass::Strong);
+        // 「重新」后接非动作名词 = 要求重做。
+        assert_eq!(cls("你先重新设计方案"), PunchbackClass::Strong);
+        assert_eq!(cls("重新执行#2回测验证"), PunchbackClass::Strong);
+        // 「缺」后不接「陷/点/乏」= 真缺漏。
+        assert_eq!(cls("结果缺少了关键字段"), PunchbackClass::Weak);
+        // 「无效」后不接「项/数据/条目」= 真否定。
+        assert_eq!(cls("这个修复无效，问题依旧"), PunchbackClass::Strong);
+    }
+
+    /// 回归(实测缺陷):外壳层注入块被当成用户发言参与打回判定。
+    ///
+    /// Web 端把「计划模式指令 / Web 计划 / Web 待办」三类块前置拼进 user 文本
+    /// 再入库。这些块不是用户发言,但正文含「缺」「不是」等词。实测 222 条埋点
+    /// 中 12 条正是此类:正文形如 `[计划模式] …不能只在回复里写…`、
+    /// `[Web 计划…] 任务: …重新划分…`,被判 `weak`/`strong` → 误触发 punchback。
+    #[test]
+    fn injected_shell_blocks_are_not_punchback() {
+        let plan_mode = "[计划模式] 当前会话处于计划模式：计划必须用工具登记，不能只在回复里写。\n\
+                         - 尚无计划：先调用 create_plan 建立计划（任务理解、步骤、每步验收标准）\n\n\
+                         这个方案你重新划分一下职责";
+        assert_eq!(cls(plan_mode), PunchbackClass::None);
+        let web_plan = "[Web 计划（用户在 Web 端维护，作为当前执行计划）]\n\
+                        任务: 第一性原理回答并实施 5 项：①子智能体只读权限合理性 ②职责划分合理性\n\n\
+                        先把第一项做完";
+        assert_eq!(cls(web_plan), PunchbackClass::None);
+        // 注入块剥离后剩下的正文若确实是打回,仍须判出 —— 剥离不等于免检。
+        let plan_mode_then_punch = "[计划模式] 当前会话处于计划模式。\n\n\
+                                     你上次改的完全不对，重新做";
+        assert_eq!(cls(plan_mode_then_punch), PunchbackClass::Strong);
     }
 
     fn temp_sessions_dir(tag: &str) -> std::path::PathBuf {
