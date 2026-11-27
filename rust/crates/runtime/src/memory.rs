@@ -1952,6 +1952,15 @@ mod tests {
     use super::*;
 
     fn temp_path() -> PathBuf {
+        // 进程内单调序号：保证并发测试的目录**严格唯一**。
+        //
+        // 2026-11-27 修复：原先只用纳秒时间戳命名，但 Windows 时钟分辨率不足
+        // （实测连续 50 次 `as_nanos()` 仅 36 个唯一值），并发测试会撞同一目录，
+        // 互相覆盖 memory.json 并回放对方的 memory_pending.jsonl，表现为
+        // `hits.len()==0` 而日志显示 "indexed 2 entries"。
+        // 违反铁律 I7（测试不得依赖精确计时）。
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time should be after epoch")
@@ -1959,7 +1968,8 @@ mod tests {
         // 每个测试独占一个目录：崩溃回放的 journal 落在 memory.json 同目录
         // (`memory_pending.jsonl`)，共用临时根目录会让测试之间互相回放对方的
         // 待应用 op。
-        let dir = std::env::temp_dir().join(format!("claw-memory-{nanos}"));
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("claw-memory-{nanos}-{seq}"));
         let _ = std::fs::create_dir_all(&dir);
         dir.join("memory.json")
     }
