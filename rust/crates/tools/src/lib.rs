@@ -1704,9 +1704,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "category": { "type": "string", "enum": ["bug", "perf", "feature", "dx"] },
                     "severity": { "type": "string", "enum": ["low", "medium", "high"] },
                     "suggestion": { "type": "string", "description": "可选:初步修改方向" },
-                    "acceptance": { "type": "string", "description": "可选:改完怎么算成功(可执行)" }
+                    "acceptance": { "type": "string", "description": "必填:**可执行命令**,修复前应失败、修复后应通过(如 `cargo test -p runtime --lib <name>`)。管道会先跑一次确认能复现,再在修复后跑一次确认通过;无法验证的提案不予部署" }
                 },
-                "required": ["observation", "evidence"],
+                "required": ["observation", "evidence", "acceptance"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::WorkspaceWrite,
@@ -2553,6 +2553,35 @@ fn run_report_framework_gap(input: FrameworkGapInput, workspace: &Path) -> Resul
             "evidence 不能为空:请提供可执行/可复现判据(文件:行号 / 命令输出 / 指标数值)"
                 .to_string(),
         );
+    }
+    // 验收判据必填且必须是可执行命令。
+    //
+    // **为什么不能只靠 schema 的 `required`**：schema 是给模型的**提示**，
+    // 不是防线 —— 模型可以不带这个字段就调用工具，服务端照样会收到。
+    // 而验收判据是整个自动进化的**唯一裁决依据**：没有它，管道无法判断
+    // 「修好了没有」，只能盲改盲部署。审计发现 inbox 21 条提案里有 20 条
+    // 根本没有验收判据（只有 iterations/elapsed 两个数字），这正是
+    // 「自动进化零产出」的直接原因。
+    let acceptance = input
+        .acceptance
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            "acceptance 不能为空:必须给**可执行命令**(修复前应失败、修复后应通过),\
+             例如 `cargo test -p runtime --lib <name>`。\
+             没有验收判据的提案无法验证,管道不会部署"
+                .to_string()
+        })?;
+    // 粗筛「像命令」：含空白分隔的首个 token 且不是纯自然语言句子。
+    // 不做严格解析(那是管道执行器的事),只挡住明显的非命令文本。
+    if !acceptance.split_whitespace().next().is_some_and(|head| {
+        head.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./\\:".contains(c))
+    }) {
+        return Err(format!(
+            "acceptance 必须是可执行命令(首 token 应为程序名),当前为: `{acceptance}`"
+        ));
     }
     let cwd = workspace.to_path_buf();
     let now_ms = std::time::SystemTime::now()
@@ -15653,13 +15682,37 @@ printf 'pwsh:%s' "$1"
         let saved = std::env::var_os(runtime::source_root::SOURCE_ROOT_ENV);
         std::env::set_var(runtime::source_root::SOURCE_ROOT_ENV, &tmp);
 
+        // 缺 acceptance → 拒绝（验收判据是自动进化的唯一裁决依据）
+        let no_accept = super::execute_tool(
+            "report_framework_gap",
+            &json!({
+                "observation": "收敛信号对推理型长尾失效",
+                "evidence": ["runtime-6f4c0e4b: 60 轮 1784s, 95.6% 在推理"]
+            }),
+        )
+        .expect_err("缺 acceptance 应被拒");
+        assert!(no_accept.contains("acceptance 不能为空"), "err={no_accept}");
+
+        // acceptance 是自然语言句子而非命令 → 拒绝
+        let prose = super::execute_tool(
+            "report_framework_gap",
+            &json!({
+                "observation": "收敛信号对推理型长尾失效",
+                "evidence": ["runtime-6f4c0e4b: 60 轮 1784s"],
+                "acceptance": "改完之后应该会更快一些"
+            }),
+        )
+        .expect_err("非命令的 acceptance 应被拒");
+        assert!(prose.contains("必须是可执行命令"), "err={prose}");
+
         let out = super::execute_tool(
             "report_framework_gap",
             &json!({
                 "observation": "收敛信号对推理型长尾失效",
                 "evidence": ["runtime-6f4c0e4b: 60 轮 1784s, 95.6% 在推理"],
                 "category": "perf",
-                "severity": "high"
+                "severity": "high",
+                "acceptance": "cargo test -p runtime --lib convergence"
             }),
         )
         .expect("valid gap should archive");
@@ -15668,6 +15721,12 @@ printf 'pwsh:%s' "$1"
         let path = parsed["path"].as_str().expect("path");
         assert!(path.contains("evolution"), "path={path}");
         assert!(std::path::Path::new(path).is_file(), "提案文件应存在");
+        // 验收判据必须落盘进提案正文（进化子智能体要靠它自证）。
+        let body = std::fs::read_to_string(path).expect("read proposal");
+        assert!(
+            body.contains("cargo test -p runtime --lib convergence"),
+            "提案应含验收判据, body={body}"
+        );
 
         match saved {
             Some(v) => std::env::set_var(runtime::source_root::SOURCE_ROOT_ENV, v),
