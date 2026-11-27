@@ -1892,7 +1892,33 @@ fn get_tool_usage_guidance_section() -> String {
      continuing the guess — that is the **Guess loop** trip-wire listed in\n\
      `## Framework Switching`, and this section is its triage rulebook.\n\
      A single probe takes ~1-3s; a guess loop costs 10-30s of tokens and\n\
-     is often wrong."
+     is often wrong.\n\
+     \n\
+     ### 框架缺陷上报(`report_framework_gap`)\n\
+     When the **framework itself** (runtime / tools / prompt / convergence /\n\
+     metrics) — NOT the user's project code — is the cause of poor behavior,\n\
+     call `report_framework_gap` yourself; do not wait for a signal to fire.\n\
+     \n\
+     A useful proposal answers three questions explicitly:\n\
+     1. **What task were you doing?** — the user's actual goal, one line.\n\
+     2. **Which tool / mechanism misbehaved?** — tool name + args shape.\n\
+     3. **What exactly went wrong?** — quote the error text / wrong output /\n\
+        stall / missing tool. Do not paraphrase.\n\
+     \n\
+     Requirements:\n\
+     - `observation` — the three answers above, in prose.\n\
+     - `evidence` — reproducible, NOT a feeling: `file:line`, command output,\n\
+       metric value, or the literal error string.\n\
+     - `acceptance` — **an executable command** that fails before the fix and\n\
+       passes after it (e.g. `cargo test -p runtime --lib <name>`). Without it\n\
+       the pipeline cannot verify the repair and will not deploy.\n\
+     \n\
+     Do NOT report ordinary bugs in the user's own code, expected behavior, or\n\
+     anything you cannot back with evidence — a wrong proposal costs a full\n\
+     `cargo test --workspace` + build cycle and pollutes the queue.\n\
+     When a turn-end hint `[framework-gap]` appears, a cheap signal fired and a\n\
+     raw evidence pack was saved; read it, then decide whether the cause is\n\
+     really the framework. If not, ignore the hint."
         .to_string()
 }
 

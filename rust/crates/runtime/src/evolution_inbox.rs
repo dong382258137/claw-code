@@ -97,6 +97,43 @@ pub fn resolve_inbox_dir(workspace_cwd: &Path) -> PathBuf {
     workspace_cwd.join(INBOX_REL)
 }
 
+/// 证据包目录（相对源码根）：自动通道只在这里留原始信号，不写提案。
+pub const EVIDENCE_DIR: &str = ".claw/evolution/evidence";
+
+/// 把一次自动信号的原始证据落盘（JSON），供 LLM 诊断时读取。
+///
+/// **为什么不直接写提案**：自动通道只知道「第 N 轮、耗时 M 秒」，无法回答
+/// 「在做什么任务、用了哪个工具、具体报什么错」。把它写成提案，只会让进化
+/// 子智能体拿数字猜缺陷 —— 实测 inbox 21 条里 20 条正是如此（正文全部是同一
+/// 句模板，只有 iterations/elapsed 两个数字），提案质量为零。
+///
+/// 故此处只保存**可核查的原始事实**，判断与措辞交给 LLM 通过
+/// `report_framework_gap` 撰写。
+pub fn write_evidence_pack(
+    workspace_cwd: &Path,
+    trigger: &str,
+    evidence: &[String],
+    session_id: &str,
+    now_ms: i64,
+) -> Result<PathBuf, String> {
+    let dir = resolve_inbox_dir(workspace_cwd)
+        .parent()
+        .map(|parent| parent.join("evidence"))
+        .unwrap_or_else(|| workspace_cwd.join(EVIDENCE_DIR));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建证据目录失败: {e}"))?;
+    let path = dir.join(format!("{now_ms}-{}.json", slugify(trigger)));
+    let body = serde_json::json!({
+        "created_at_ms": now_ms,
+        "trigger": trigger,
+        "session_id": session_id,
+        "evidence": evidence,
+        "note": "自动信号原始证据；提案须由 LLM 调用 report_framework_gap 撰写",
+    });
+    let text = serde_json::to_string_pretty(&body).map_err(|e| format!("序列化证据失败: {e}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("写入证据失败: {e}"))?;
+    Ok(path)
+}
+
 /// 归档结果:新立案 vs 与**待处理**提案重复。
 ///
 /// 调用方必须据此决定是否拉起进化管道 —— 重复立项再各拉起一次

@@ -1917,6 +1917,14 @@ pub struct ConversationRuntime<C, T> {
     /// 防止一次长任务在其每个 turn 收尾都触发软阈值信号,刷屏 inbox。
     /// 默认最小间隔见 [`GAP_REPORT_MIN_INTERVAL_MS`]。
     last_gap_report_ms: Cell<i64>,
+    /// 待注入的元认知上报提示。
+    ///
+    /// **为什么需要**：自动通道已降级为「只落证据包、不写提案」，但证据包
+    /// 本身不会让模型知道该去看它。这条提示在 turn 收尾写入、下次请求构造时
+    /// 经 [`Self::render_runtime_hints`] 注入尾部槽位，把「命中框架信号 +
+    /// 证据路径 + 提案要求」一并交给模型，由模型判断是否调用
+    /// `report_framework_gap`。用 `Cell` 是因为写入点持有 `&self`。
+    pending_gap_hint: Cell<Option<String>>,
     /// Harness V(验证)层:幻觉/偷懒信号扫描器。
     /// 在 PostToolUse hook 中对 write_file/edit_file 产物扫描占位标记
     /// (unimplemented!/placeholder/TODO),命中时以 warning 追加到 hook
@@ -2573,6 +2581,7 @@ where
             branch_retry_attempted: false,
             turn_punchback: false,
             last_gap_report_ms: Cell::new(0),
+            pending_gap_hint: Cell::new(None),
             slop_scanner: SlopScanner::new(),
             slop_scan_enabled: feature_config.slop_scan().unwrap_or(true),
             completion_verifier: crate::completion_verifier::CompletionVerifier::new(),
@@ -7600,6 +7609,15 @@ where
             slots.push(("Failure Advice", advice.clone()));
         }
 
+        // 槽位 7b-2:元认知上报提示(2026-11-28)。
+        // 自动通道已降级为「只落证据包、不写提案」，本条把「命中框架信号 +
+        // 证据路径 + 提案要求」交给模型，由模型判断是否调用
+        // `report_framework_gap`。用 Cell 因为写入点(`maybe_report_framework_gap`)
+        // 持有 `&self`。读取后由请求构造清空(一次性消费)。
+        if let Some(hint) = self.pending_gap_hint.take() {
+            slots.push(("Framework Gap Report", hint));
+        }
+
         // 槽位 7c:双大脑上一会话 digest(批次 3)——新会话首 turn 感知遗留。
         // run_turn_async 开头读取最近一份管理脑 digest 存入 pending_session_digest;
         // 此处注入让执行脑感知上一会话的失败模式(架构守护的跨会话面)。
@@ -9988,36 +10006,42 @@ where
         if let Some(msg) = failure {
             evidence.push(format!("failure: {msg}"));
         }
-        let gap = crate::evolution_inbox::FrameworkGap {
-            trigger: trigger.to_string(),
-            severity: if high_value { "high" } else { "low" }.to_string(),
-            category: if failure.is_some() { "bug" } else { "perf" }.to_string(),
-            observation: format!(
-                "turn 收尾命中廉价信号 `{trigger}`(iterations={iterations}, \
-                 elapsed={elapsed_secs}s) —— 可能指向框架层缺陷/优化点,待进化子智能体复核。"
-            ),
-            evidence,
-            suggestion: None,
-            acceptance: None,
-            source_cwd: root.display().to_string(),
-            source_session: self.session.session_id.clone(),
-        };
-        // 归档到源码根 inbox(源码根未登记则落回工作区)。
-        // 仅**新立案**才拉起管道:同 trigger 已有待处理提案时 archive_gap 返回
-        // `Duplicate`,再拉一次 `evolve-source auto` 纯属重复跑 cargo build
-        // (实测 9 条同源 soft_threshold 提案正文 md5 全同)。
-        let archived =
-            crate::evolution_inbox::archive_gap(root, &gap, now_ms).is_ok_and(|o| o.is_created());
-        // 上报即触发(用户构思): 归档成功后立刻在后台拉起进化管道。
+        // ── 自动通道：只落「证据包」，不再写提案 ──
+        // 审计结论（2026-11-28）：inbox 21 条里 20 条出自此处，正文全部是同一句
+        // 模板，只有 iterations/elapsed 两个数字 —— 进化子智能体拿这种提案只能
+        // 猜缺陷，实测零产出。真正能写出「在做什么任务、调用哪个工具、报什么错」
+        // 的，只有经历过该 turn 的模型自己。
         //
-        // 此前只有 agent 主动调 `report_framework_gap` 才触发, 而**占绝大多数的**
-        // turn 收尾自动上报(soft_threshold/punchback, 实测 38 条中 36 条)归档后
-        // 无人处理 —— 这正是"38 条积压 8 天"的主因。两条上报通道必须一致。
-        //
-        // 递归/锁/冷却三道防护在 spawn_pipeline_detached 内部:
-        // 进化子进程内(CLAW_EVOLUTION_ACTIVE)不会二次拉起。
-        if archived {
-            let _ = crate::evolution_auto::spawn_pipeline_detached(root);
+        // 故此处降级为纯采集：把可核查的原始事实写入 .claw/evolution/evidence/，
+        // 判断与措辞交给模型通过 `report_framework_gap` 撰写（见 prompt 的
+        // 「元认知上报」段）。模型判断是用户代码问题时会自然不提案 —— 噪声在
+        // 源头被过滤，而不是靠 slug 去重。
+        let pack_path = crate::evolution_inbox::write_evidence_pack(
+            root,
+            trigger,
+            &evidence,
+            &self.session.session_id,
+            now_ms,
+        );
+        match pack_path {
+            Ok(path) => {
+                // 提示落在本 turn 的工具结果里，模型当场就能决定要不要提案。
+                self.pending_gap_hint.set(Some(format!(
+                    "[framework-gap] 本 turn 命中框架信号 `{trigger}`\
+                     (iterations={iterations}, elapsed={elapsed_secs}s)。原始证据已存：{}\n\
+                     请判断：这是 **claw 框架自身** 的缺陷（而非用户项目代码的问题）吗？\n\
+                     - 是 → 调用 `report_framework_gap` 提案。observation 必须写清\
+                     「在做什么任务、调用哪个工具、具体报什么错/什么异常行为」；\
+                     evidence 给可复现判据（文件:行号 / 命令输出 / 指标值）；\
+                     acceptance 必须是**可执行命令**（修复前应失败、修复后应通过）。\n\
+                     - 否（用户代码问题 / 正常行为 / 证据不足）→ 忽略本条，不要提案。",
+                    path.display()
+                )));
+            }
+            Err(error) => {
+                // 证据落盘失败不阻断主流程，也不退化为写模板提案。
+                eprintln!("[evolution] 证据包落盘失败: {error}");
+            }
         }
     }
 

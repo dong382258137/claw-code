@@ -8980,6 +8980,13 @@ pub fn progressive_always_injected_tool_names() -> &'static [&'static str] {
         "TeamCreate",
         "rollback_transaction",
         "transaction_status",
+        // 元认知上报通道(2026-11-28 补):提案质量审计发现 inbox 21 条里
+        // 20 条来自 turn 收尾的模板化自动上报(只有 iterations/elapsed 两个
+        // 数字),唯一有真实信息的通道是这个 LLM 主动上报工具 —— 但它既不在
+        // 常驻集、prompt 也从未提及,导致模型根本不知道何时该用。
+        // 点名即指令:prompt 现在明文要求「框架自身出问题时调用它」,
+        // 若被渐进模式延迟,模型会看到指引却调不到工具。
+        "report_framework_gap",
     ]
 }
 
