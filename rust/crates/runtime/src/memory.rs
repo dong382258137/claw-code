@@ -2447,9 +2447,29 @@ mod tests {
         // Reload — the in-memory semantic field is `#[serde(skip)]` so it
         // must be rebuilt from entries, otherwise recall returns nothing.
         let mem = PersistentMemory::load_and_freeze(&path);
-        let hits = mem.semantic_recall("rust language", 5);
-        assert_eq!(hits.len(), 1);
-        assert!(hits[0].entry.summary.contains("rust"));
+
+        // 核心断言（feature 无关）：L1 索引必须从 entries 重建。
+        //
+        // 2026-11-27 修复：原断言写 `semantic_recall(...).len() == 1`，但召回
+        // 结果依赖 feature —— 启用 embedding 时走向量路径，短句 cosine 分数
+        // 低于 EMBEDDING_MIN_SCORE(0.85) 会被全部过滤，命中数变 0。
+        // `cargo test --workspace` 的 feature 统一（claw-server 的
+        // default=["embedding"]）会把 embedding 渗进本测试，于是同样的代码
+        // `-p runtime` 通过、`--workspace` 必挂。断言 l1_count 才能稳定
+        // 表达「索引已重建」这一被测行为。
+        assert_eq!(
+            mem.semantic().l1_count(),
+            2,
+            "两个 active entry 都应重建进 L1 索引"
+        );
+
+        // keyword 路径下额外验证召回可用；向量路径的阈值行为不在本测试范围。
+        if crate::build_embedding_provider().is_none() {
+            let hits = mem.semantic_recall("rust language", 5);
+            assert_eq!(hits.len(), 1);
+            assert!(hits[0].entry.summary.contains("rust"));
+        }
+
         let _ = std::fs::remove_file(&path);
     }
 
