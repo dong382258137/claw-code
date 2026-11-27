@@ -136,10 +136,17 @@ export function useSessionEvents({
       try {
         const data = JSON.parse(event.data)
         if (data.kind === 'delta') setLive((previous) => previous + data.text)
-        else if (data.kind === 'start') setRunning(true)
+        else if (data.kind === 'start') { setRunning(true); setUpgrading('') }
         else if (data.kind === 'thinking') setLiveThinking((previous) => (data.done && data.text ? data.text : previous + (data.done ? '' : data.text)))
         else if (data.kind === 'approval_request') setApprovals((list) => (list.some((item) => item.id === data.id) ? list : [...list, data]))
-        else if (data.kind === 'tool_use') setLiveTools((list) => [...list, { id: data.id, name: data.name, input: data.input, output: '', done: false, is_error: false }])
+        else if (data.kind === 'tool_use') {
+          setLiveTools((list) => [...list, { id: data.id, name: data.name, input: data.input, output: '', done: false, is_error: false }])
+          // P0:模型一调用 HotUpgrade 就提示"完成后自动继续",不等进程退出。
+          if (data.name === 'HotUpgrade') {
+            setUpgrading('正在热升级：重建并重启 Web 服务，完成后自动继续当前任务…')
+            setRunning(false)
+          }
+        }
         else if (data.kind === 'tool_result') {
           setLiveTools((list) => {
             // runtime 的 ToolResult 事件可能不带 id：退化为匹配最近的同名未完成工具。
@@ -182,6 +189,9 @@ export function useSessionEvents({
         }
         else if (data.kind === 'reset') { loadSnapshot() }
         else if (data.kind === 'upgrading') { setUpgrading(data.message || '正在热升级：重建并重启 Web 服务…'); setRunning(false) }
+        // P0:放弃升级(其它会话忙/helper 失败)后服务不重启,续跑随即开始。
+        else if (data.kind === 'upgrade_aborted') { setUpgrading(''); push(data.message || '热升级已取消，继续当前任务', 'info') }
+        else if (data.kind === 'upgrade_resumed') { setUpgrading('') }
         else if (data.kind === 'error') {
           // 可恢复错误（传输层已做退避重试、runtime 还可能再恢复一次）不清屏：
           // 清空已流式内容会让用户误以为整轮作废，而且恢复成功后内容会从空开始。

@@ -192,9 +192,16 @@ fn enqueue_cron(
         permission: cron_permission(),
         model: None,
         cron_id: Some(entry.cron_id.clone()),
+        resume: None,
     };
     let enqueued = match state.scheduler.enqueue(job) {
         Ok(enqueued) => enqueued,
+        Err(EnqueueError::UpgradePending) => {
+            return Err((
+                StatusCode::CONFLICT,
+                "该定时任务会话正在热升级，本次跳过".to_string(),
+            ))
+        }
         Err(EnqueueError::QueueFull) => {
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,

@@ -1103,6 +1103,9 @@ pub(crate) struct LiveCli {
     /// prepare_turn_runtime 注入到本轮工具注册表，worker 退出 / 看门狗回收 /
     /// 会话删除时由调度器统一终止登记的进程树。
     session_processes: Option<std::sync::Arc<runtime::process_registry::SessionProcesses>>,
+    /// 热升级挂起现场(P0):本轮 `HotUpgrade` 命中后由 runtime 生成,
+    /// worker 收尾时取走并写入 `upgrade-request.json`。
+    last_upgrade_suspension: Option<runtime::UpgradeSuspension>,
 }
 
 pub(crate) struct BuiltRuntime {
@@ -1195,6 +1198,16 @@ impl BuiltRuntime {
             .take()
             .expect("runtime should exist before installing steer inbox");
         self.runtime = Some(runtime.with_steer_inbox(steer_inbox));
+        self
+    }
+
+    /// P0:打开 Web 热升级断点续跑(工具循环遇到 `HotUpgrade` 即挂起)。
+    fn with_hot_upgrade_suspend(mut self, suspend: bool) -> Self {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before installing hot upgrade suspend");
+        self.runtime = Some(runtime.with_hot_upgrade_suspend(suspend));
         self
     }
 
@@ -1326,6 +1339,7 @@ impl LiveCli {
             status_emitter: None,
             upgrade_signal: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             steer_inbox: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            last_upgrade_suspension: None,
             external_abort_signal: None,
             session_processes: None,
         };
@@ -1387,7 +1401,9 @@ impl LiveCli {
         .with_hook_abort_signal(hook_abort_signal.clone())
         .with_session_processes(self.session_processes.clone())
         .with_upgrade_signal(self.upgrade_signal.clone())
-        .with_steer_inbox(self.steer_inbox.clone());
+        .with_steer_inbox(self.steer_inbox.clone())
+        // P0:Web 专用 —— 工具循环遇到 `HotUpgrade` 即挂起,由进程重启续跑。
+        .with_hot_upgrade_suspend(true);
         // 推理状态同步：AnthropicRuntimeClient 每轮 turn 都会在
         // prepare_turn_runtime 中重建(见 run_turn → replace_runtime 生命周期),
         // 新 client 上 reasoning_effort / thinking_mode 均为默认值。
@@ -1431,11 +1447,42 @@ impl LiveCli {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime()?;
         let result = runtime.run_turn(input, Some(prompter));
+        // P0:先取走挂起现场(取一次即清空),再替换 runtime。
+        self.last_upgrade_suspension = runtime.take_upgrade_suspension();
         hook_abort_monitor.stop();
         let _summary = result?;
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         Ok(())
+    }
+
+    /// 热升级续跑(P0):由新进程在补齐挂起工具结果之后调用。
+    ///
+    /// 与 [`run_turn_silent_with`](Self::run_turn_silent_with) 的差异仅是
+    /// 不把 `notice` 当用户消息,而是注入 `[runtime]` 升级完成注记。
+    pub(crate) fn run_turn_continue_silent_with(
+        &mut self,
+        notice: &str,
+        prompter: &mut dyn runtime::PermissionPrompter,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime()?;
+        let result = runtime.run_turn_continue(notice, Some(prompter));
+        self.last_upgrade_suspension = runtime.take_upgrade_suspension();
+        hook_abort_monitor.stop();
+        let _summary = result?;
+        self.replace_runtime(runtime)?;
+        self.persist_session()?;
+        Ok(())
+    }
+
+    /// 取走本轮挂起现场(worker 收尾用)。
+    pub(crate) fn take_upgrade_suspension(&mut self) -> Option<runtime::UpgradeSuspension> {
+        self.last_upgrade_suspension.take()
+    }
+
+    /// 恢复旧进程的活跃计划(热升级续跑前调用;幂等,已有计划不覆盖)。
+    pub(crate) fn restore_active_plan(&mut self, plan: runtime::planner::PlanArtifact) {
+        self.runtime.restore_active_plan(plan);
     }
 
     pub(crate) fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {

@@ -21,6 +21,7 @@ pub mod serve;
 pub mod session_mgr;
 pub mod tool_executor;
 pub mod upgrade_helper;
+pub mod upgrade_resume;
 pub mod voice;
 
 pub use commands::plugin_market;
@@ -231,7 +232,7 @@ fn help_text() -> String {
     )
 }
 
-/// `claw` / `claw-plus` binary 的统一入口。
+/// `claw` binary 的唯一入口。
 ///
 /// 只处理三件事：`--upgrade-helper`、`serve`、`--version/--help`。
 pub fn main_entry() {

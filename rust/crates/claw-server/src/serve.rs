@@ -35,7 +35,7 @@ use api::{
     SystemContent,
 };
 
-use crate::session_mgr::PRIMARY_SESSION_EXTENSION;
+use crate::session_mgr::{QueuedPrompt, PRIMARY_SESSION_EXTENSION};
 
 mod cron_expr;
 mod cron_runner;
@@ -48,6 +48,38 @@ use scheduler::{ConcurrencyConfig, EnqueueError, EventHub, PromptJob, Scheduler,
 const INDEX_HTML: &str = include_str!("../web/dist/index.html");
 const MAX_SESSIONS: usize = 50;
 const STREAM_INTERVAL: Duration = Duration::from_millis(900);
+
+/// 每会话连续热升级计数：防止模型在坏代码上无限"修复→重建"循环。
+///
+/// 计数在每次挂起升级时 +1，在用户发送新消息或普通成功轮次后清零；
+/// 连续超过 [`MAX_CONSECUTIVE_UPGRADES`] 次则拒绝再升级，改为把错误回传
+/// 给模型并继续当前任务，由用户确认后再重试。
+#[derive(Default)]
+struct UpgradeAttempts {
+    counters: Mutex<HashMap<String, u32>>,
+}
+
+impl UpgradeAttempts {
+    fn record(&self, session: &str) -> u32 {
+        let mut counters = self
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let counter = counters.entry(session.to_string()).or_insert(0);
+        *counter += 1;
+        *counter
+    }
+
+    fn reset(&self, session: &str) {
+        self.counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session);
+    }
+}
+
+/// 连续热升级次数上限（超过后要求用户确认）。
+const MAX_CONSECUTIVE_UPGRADES: u32 = 3;
 
 #[derive(Clone)]
 struct AppState {
@@ -80,6 +112,8 @@ struct AppState {
     session_indexes: Arc<Mutex<HashMap<PathBuf, Arc<runtime::SessionIndex>>>>,
     /// Phase 5：流式快照缓存，按会话文件缓存已解析内容与增量偏移。
     session_views: Arc<Mutex<HashMap<PathBuf, CachedSessionView>>>,
+    /// 每会话连续热升级计数（防止坏代码上无限重建循环）。
+    upgrade_attempts: Arc<UpgradeAttempts>,
 }
 
 /// 一次完整解析的会话视图缓存。
@@ -1290,8 +1324,11 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             crons_lock: Arc::new(Mutex::new(())),
             session_indexes: Arc::new(Mutex::new(HashMap::new())),
             session_views: Arc::new(Mutex::new(HashMap::new())),
+            upgrade_attempts: Arc::new(UpgradeAttempts::default()),
         };
         spawn_session_watchdog(state.clone());
+        // P0-4:若上次进程因热升级挂起,新进程启动后补齐工具结果并续跑。
+        spawn_upgrade_resume(state.clone());
         // Phase 6:进程内 tick 线程,扫描各工作区到期的定时任务并入队。
         cron_runner::spawn_cron_runner(state.clone());
         // Phase 8:启动时只探测语义检索可用性（检查 onnxruntime.dll），
@@ -1340,6 +1377,8 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .route("/api/client-error", post(api_client_error))
             .route("/api/upload", post(api_upload))
             .route("/api/meta", get(api_meta))
+            // 热升级 P1：helper 构建成功后确认切换（旧进程写 exited 并退出）。
+            .route("/api/upgrade/commit", post(api_upgrade_commit))
             .route("/api/skills", get(api_skills))
             .route(
                 "/api/skills/{name}",
@@ -2106,6 +2145,19 @@ fn permission_label(mode: runtime::PermissionMode) -> &'static str {
     }
 }
 
+/// 与 [`PERMISSION_MODES`] 一致的稳定键值（用于落盘/跨进程恢复）。
+///
+/// 不能把 [`permission_label`]（给人看的中文）写进升级请求：恢复时必须
+/// 解析回枚举，用展示文案会降级为默认值甚至触发 panic。
+fn permission_key(mode: runtime::PermissionMode) -> &'static str {
+    match mode {
+        runtime::PermissionMode::ReadOnly => "read-only",
+        runtime::PermissionMode::WorkspaceWrite => "workspace-write",
+        runtime::PermissionMode::DangerFullAccess => "danger-full-access",
+        _ => "workspace-write",
+    }
+}
+
 impl runtime::PermissionPrompter for WebPermissionPrompter {
     fn decide(
         &mut self,
@@ -2286,13 +2338,17 @@ impl SessionWorker {
     fn cli_for_turn(&mut self, job: &PromptJob) -> Result<&mut crate::app::LiveCli, String> {
         let model = Self::effective_model(&job.model, &job.workspace);
         let epoch = self.state.scheduler.epoch(&self.session_id);
-        let reusable = self.cached.as_ref().is_some_and(|cached| {
-            cached.model == model
-                && cached.mode == job.permission
-                && cached.workspace == job.workspace
-                && cached.session_path == job.session_path
-                && cached.epoch == epoch
-        });
+        // 续跑轮次必须从磁盘重载会话：升级/放弃升级会由另一个线程把
+        // `HotUpgrade` 的 tool_result 补进会话文件，而缓存里的 LiveCli 仍持有
+        // 挂起前的旧消息。复用会导致模型看不到补的结果，再次触发升级（死循环）。
+        let reusable = job.resume.is_none()
+            && self.cached.as_ref().is_some_and(|cached| {
+                cached.model == model
+                    && cached.mode == job.permission
+                    && cached.workspace == job.workspace
+                    && cached.session_path == job.session_path
+                    && cached.epoch == epoch
+            });
         if reusable {
             // 复用证据：日志里出现 `reuse` 即表示本轮没有重建 LiveCli。
             eprintln!(
@@ -2329,7 +2385,10 @@ impl SessionWorker {
 
     /// 在常驻 worker 里跑一轮：进程 cwd 保持中性临时目录，所有路径都由
     /// `workspace` 显式传入，不再需要全局 turn 锁。
-    fn run_turn(&mut self, turn: &scheduler::TakenPrompt) -> Result<(), String> {
+    fn run_turn(
+        &mut self,
+        turn: &scheduler::TakenPrompt,
+    ) -> Result<Option<runtime::UpgradeSuspension>, String> {
         let events = Arc::clone(&self.state.events);
         let approvals = Arc::clone(&self.state.approvals);
         let scheduler = Arc::clone(&self.state.scheduler);
@@ -2465,8 +2524,23 @@ impl SessionWorker {
             generation: turn.generation,
             signal: prompter_signal,
         };
-        cli.run_turn_silent_with(&job.text, &mut prompter)
-            .map_err(|error| error.to_string())
+        // P0-4:续跑前恢复旧进程的活跃计划(幂等;缺失/损坏静默跳过)。
+        if let Some(plan_id) = job.resume.as_ref().and_then(|spec| spec.plan_id.as_deref()) {
+            let plan_path = job
+                .workspace
+                .join(".claw")
+                .join("plans")
+                .join(format!("{plan_id}.json"));
+            if let Ok(plan) = runtime::planner::load_plan_artifact(&plan_path) {
+                cli.restore_active_plan(plan);
+            }
+        }
+        let result = match &job.resume {
+            Some(spec) => cli.run_turn_continue_silent_with(&spec.notice, &mut prompter),
+            None => cli.run_turn_silent_with(&job.text, &mut prompter),
+        };
+        result.map_err(|error| error.to_string())?;
+        Ok(cli.take_upgrade_suspension())
     }
 }
 
@@ -2578,6 +2652,12 @@ fn spawn_session_worker(state: AppState, session_id: String) {
                     worker.panic_streak = 0;
                 }
                 let failed = outcome.is_err();
+                // P0:本轮是否因 `HotUpgrade` 挂起(仅正常返回的 Ok(Some))。
+                let suspension = outcome
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .cloned();
                 if let Err(message) = &outcome {
                     // 迟到错误同样按代际丢弃。
                     if task_state
@@ -2685,16 +2765,91 @@ fn spawn_session_worker(state: AppState, session_id: String) {
                     return;
                 }
 
-                // Agent 在 turn 里调用了 `HotUpgrade`：只有全服务已安静
-                // （无执行中、无排队）时才允许重启，否则把请求留在原地。
-                if !failed && task_state.scheduler.is_quiet() && tools::take_hot_upgrade_request() {
-                    begin_web_upgrade(
+                // P0:Agent 在工具批调用了 `HotUpgrade` → 挂起本会话并转交
+                // 升级协调线程;旧路径(全局信号 + is_quiet)对 Web 已停用,
+                // 避免两条升级路径并存。
+                if let Some(suspension) = suspension {
+                    // P1:连续升级保护 —— 坏代码上反复"修复→重建"时暂停自动
+                    // 升级，把原因回传给模型并继续任务，等用户确认后再重试。
+                    let attempts = task_state.upgrade_attempts.record(&worker_session);
+                    let mut request = crate::session_mgr::UpgradeRequest {
+                        session_id: worker_session.clone(),
+                        plan_id: session_active_plan_id(&turn.job.session_path),
+                        requested_at_ms: now_ms() as i64,
+                        from_version: crate::version_label(),
+                        old_pid: std::process::id(),
+                        web_port: Some(task_state.port),
+                        web_token: Some(task_state.token.clone()),
+                        session_path: Some(turn.job.session_path.to_string_lossy().to_string()),
+                        workspace: Some(turn.job.workspace.to_string_lossy().to_string()),
+                        permission: Some(permission_key(turn.job.permission).to_string()),
+                        model: turn.job.model.clone(),
+                        suspended_tool_use_id: Some(suspension.tool_use_id),
+                        suspended_tool_name: Some(suspension.tool_name),
+                        pending_after: suspension.pending_after,
+                        phase: Some(crate::session_mgr::UpgradePhase::Suspended),
+                        queued_prompts: Vec::new(),
+                    };
+                    if attempts > MAX_CONSECUTIVE_UPGRADES {
+                        let output = format!(
+                            "热升级已暂停：连续 {} 次升级未成功。当前进程仍在运行，任务继续。\
+                             请先向用户说明情况并确认修复已生效；用户再次发送消息后可重试热升级。",
+                            MAX_CONSECUTIVE_UPGRADES
+                        );
+                        abort_suspended_upgrade_output(&task_state, &request, &output);
+                    } else {
+                        // P1:一并取出排队中的用户消息，随升级请求落盘，重启后重新入队。
+                        let queued_jobs = task_state.scheduler.mark_suspended(&worker_session);
+                        request.queued_prompts = queued_jobs
+                            .iter()
+                            .map(|job| QueuedPrompt {
+                                text: job.text.clone(),
+                                permission: Some(permission_key(job.permission).to_string()),
+                                model: job.model.clone(),
+                            })
+                            .collect();
+                        if let Err(error) = crate::session_mgr::write_upgrade_request(
+                            &turn.job.workspace,
+                            &request,
+                        ) {
+                            // 写请求失败 → 放弃升级、恢复会话可入队状态，并把排队的
+                            // 用户消息放回队列（本 worker 继续消费）。
+                            task_state.scheduler.clear_suspended(&worker_session);
+                            for job in queued_jobs {
+                                let _ = task_state.scheduler.enqueue(job);
+                            }
+                            task_state.events.emit(
+                                &worker_session,
+                                json!({
+                                    "kind": "error",
+                                    "message": format!("热升级请求写入失败：{error}"),
+                                }),
+                            );
+                        } else {
+                            task_state.events.emit(
+                                &worker_session,
+                                json!({
+                                    "kind": "upgrading",
+                                    "port": task_state.port,
+                                    "message": "正在热升级：重建并重启 Web 服务，完成后自动继续当前任务…",
+                                }),
+                            );
+                            spawn_upgrade_coordinator(task_state.clone(), request);
+                        }
+                    }
+                } else if turn.job.resume.is_some() && !failed {
+                    // P0-4:续跑 turn 正常收尾后才算消费完升级标记;
+                    // 失败保留标记,下次启动可幂等重试。
+                    crate::session_mgr::clear_upgrade_request_if(
                         &turn.job.workspace,
-                        task_state.port,
-                        &task_state.token,
                         &worker_session,
-                        &task_state.events,
                     );
+                    task_state
+                        .events
+                        .emit(&worker_session, json!({ "kind": "upgrade_resumed" }));
+                } else if !failed {
+                    // 非续跑的正常成功轮次 = 升级循环已中断，重置连续计数。
+                    task_state.upgrade_attempts.reset(&worker_session);
                 }
             }
         });
@@ -2737,6 +2892,8 @@ async fn api_prompt(
         )
             .into_response();
     }
+    // 用户重新发消息 = 明确确认，重置连续热升级计数，允许再次尝试。
+    state.upgrade_attempts.reset(&id);
 
     // `@path:12-40` 这类引用直接展开成带行号的代码块，省掉 agent 首轮 read_file 往返。
     let expanded_text = expand_mentions(&session_workspace, &body.text);
@@ -2749,9 +2906,15 @@ async fn api_prompt(
         permission: crate::permission_mode_from_label(permission),
         model: body.model.clone(),
         cron_id: None,
+        resume: None,
     };
 
     match state.scheduler.enqueue(job) {
+        Err(EnqueueError::UpgradePending) => (
+            StatusCode::CONFLICT,
+            "该会话正在热升级，升级完成后会自动继续当前任务".to_string(),
+        )
+            .into_response(),
         Err(EnqueueError::QueueFull) => (
             StatusCode::TOO_MANY_REQUESTS,
             format!(
@@ -2990,6 +3153,44 @@ async fn api_status(
         "running": status.state != SessionState::Idle,
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct UpgradeCommitQuery {
+    t: Option<String>,
+    /// 发起升级的会话工作区（可能不同于 serve 启动目录）。
+    workspace: Option<String>,
+}
+
+/// 热升级助手构建成功后调用：旧进程确认切换（写 exited 标记后退出）。
+///
+/// 只接受仍在 `Building` 阶段的请求；升级已被取消（其它会话超时 / 构建超时）
+/// 时返回 409，helper 据此放弃启动新进程，避免把正在续跑的旧进程错误退出。
+async fn api_upgrade_commit(
+    State(state): State<AppState>,
+    Query(query): Query<UpgradeCommitQuery>,
+) -> Response {
+    if !authorize(&state, &AuthQuery { t: query.t.clone() }) {
+        return unauthorized();
+    }
+    let workspace = query
+        .workspace
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.workspace.clone());
+    let building = crate::session_mgr::read_upgrade_request(&workspace)
+        .is_some_and(|req| req.phase == Some(crate::session_mgr::UpgradePhase::Building));
+    if !building {
+        return (StatusCode::CONFLICT, "upgrade cancelled").into_response();
+    }
+    let exited_workspace = workspace;
+    tokio::task::spawn_blocking(move || {
+        let _ = crate::session_mgr::write_upgrade_exited(&exited_workspace, std::process::id());
+        // 给 HTTP 响应与 SSE 一点时间刷出，再退出进程。
+        std::thread::sleep(Duration::from_millis(300));
+        std::process::exit(0);
+    });
+    (StatusCode::OK, "ok").into_response()
 }
 
 // ---------------- P3：终端面板（PTY + WebSocket） ----------------
@@ -4856,6 +5057,7 @@ fn enqueue_session_prompt(
         permission: crate::permission_mode_from_label(permission),
         model,
         cron_id: None,
+        resume: None,
     };
     match state.scheduler.enqueue(job) {
         Ok(enqueued) => {
@@ -4869,6 +5071,10 @@ fn enqueue_session_prompt(
                 "session": id,
             }))
         }
+        Err(EnqueueError::UpgradePending) => Err((
+            StatusCode::CONFLICT,
+            "该会话正在热升级，升级完成后会自动继续当前任务".to_string(),
+        )),
         Err(EnqueueError::QueueFull) => Err((
             StatusCode::TOO_MANY_REQUESTS,
             "该会话排队已满，请等待前面的消息处理完成后再确认".to_string(),
@@ -4966,6 +5172,8 @@ async fn api_meta(State(state): State<AppState>, Query(auth): Query<AuthQuery>) 
     }
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
+        // 构建指纹:页面轮询时只有它可以区分"旧进程还活着"与"新进程已就绪"。
+        "build_id": crate::version_label(),
         "git_sha": crate::GIT_SHA,
         "workspace": state.workspace.display().to_string(),
         // Phase 7:语义检索状态（ready / keyword / loading / disabled）。
@@ -6604,61 +6812,260 @@ fn web_token_from_env() -> Option<String> {
         .filter(|token| token.len() == 32 && token.chars().all(|ch| ch.is_ascii_hexdigit()))
 }
 
-/// Web 热升级：写请求 → spawn helper → 通知页面 → 退出旧进程。
-///
-/// 新进程由 helper 以 `serve --port <同端口>` 启动，并继承旧 token；页面上的
-/// EventSource 会在服务恢复后自动重连，随后前端轮询 `/api/meta` 成功即 reload。
-fn begin_web_upgrade(
-    workspace: &Path,
-    port: u16,
-    token: &str,
-    session_id: &str,
-    events: &EventHub,
-) {
-    let old_pid = std::process::id();
-    let request = crate::session_mgr::UpgradeRequest {
-        session_id: session_id.to_string(),
-        plan_id: None,
-        requested_at_ms: now_ms() as i64,
-        from_version: crate::version_label(),
-        old_pid,
-        web_port: Some(port),
-        web_token: Some(token.to_string()),
-    };
-    if let Err(error) = crate::session_mgr::write_upgrade_request(workspace, &request) {
-        events.emit(
-            session_id,
-            json!({
-                "kind": "error",
-                "message": format!("热升级请求写入失败：{error}"),
-            }),
-        );
-        return;
-    }
-    if let Err(error) = crate::upgrade_helper::spawn(workspace) {
-        crate::session_mgr::clear_upgrade_request(workspace);
-        events.emit(
-            session_id,
-            json!({
-                "kind": "error",
-                "message": format!("热升级助手启动失败：{error}"),
-            }),
-        );
-        return;
-    }
+/// 构建阶段最长等待（编译可能较久；超时后取消升级并继续任务）。
+const UPGRADE_BUILD_TIMEOUT_SECS: u64 = 60 * 60;
 
-    events.emit(
-        session_id,
-        json!({
-            "kind": "upgrading",
-            "port": port,
-            "message": "正在热升级：重建并重启 Web 服务，页面会自动恢复…",
+/// Web 热升级协调线程：等其它会话空闲 → 让 helper 在旧进程存活时构建
+/// → 构建成功才切换，失败则补编译错误并原地继续任务。
+///
+/// 超时 / helper 启动失败 / 编译失败：补 `HotUpgrade` 错误结果 + 未执行调用
+/// 错误结果，再重新入队续跑 —— 不丢失当前轮（补结果与入队均幂等）。
+fn spawn_upgrade_coordinator(state: AppState, request: crate::session_mgr::UpgradeRequest) {
+    std::thread::spawn(move || {
+        let workspace = PathBuf::from(request.workspace.clone().unwrap_or_default());
+        let session_id = request.session_id.clone();
+        // 清掉上次升级残留的构建结果，避免一启动就误读旧结果。
+        crate::session_mgr::clear_upgrade_result(&workspace);
+        // 1. 其它会话空闲(本会话已 Suspended,不计入)。
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        while !state.scheduler.is_quiet_except(&session_id) {
+            if std::time::Instant::now() >= deadline {
+                abort_suspended_upgrade(&state, &request, "其它会话仍在运行，升级已取消");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        // 2. 进入构建阶段：helper 在旧进程存活时改名释放 exe 路径并编译，
+        //    旧进程保持运行（会话 Suspended），等构建结果决定是否切换。
+        crate::session_mgr::update_upgrade_phase(
+            &workspace,
+            crate::session_mgr::UpgradePhase::Building,
+        );
+        if let Err(error) = crate::upgrade_helper::spawn(&workspace) {
+            abort_suspended_upgrade(&state, &request, &format!("升级助手启动失败：{error}"));
+            return;
+        }
+        state.events.emit(
+            &session_id,
+            json!({
+                "kind": "upgrading",
+                "port": state.port,
+                "message": "正在构建新版本：构建完成后自动切换并继续当前任务…",
+            }),
+        );
+        // 3. 轮询构建结果（helper 成功/失败都会写 `.claw/upgrade-result.json`）。
+        let build_deadline =
+            std::time::Instant::now() + Duration::from_secs(UPGRADE_BUILD_TIMEOUT_SECS);
+        loop {
+            if let Some(result) = crate::session_mgr::read_upgrade_result(&workspace) {
+                // 消费后不立即删除：新进程启动恢复时还要用它决定
+                // "升级完成(含耗时)" 还是 "编译失败(带错误)"，由恢复流程清理。
+                if result.ok {
+                    // 构建成功：先终止本会话登记的后台子进程释放文件锁，再退出。
+                    state.scheduler.kill_processes(&session_id);
+                    state.events.emit(
+                        &session_id,
+                        json!({
+                            "kind": "upgrading",
+                            "port": state.port,
+                            "message": "新版本构建完成，正在切换进程…",
+                        }),
+                    );
+                    let _ =
+                        crate::session_mgr::write_upgrade_exited(&workspace, std::process::id());
+                    std::thread::sleep(Duration::from_millis(700));
+                    std::process::exit(0);
+                }
+                // 构建失败：补一条带编译错误的 HotUpgrade 结果，原地继续任务。
+                abort_suspended_upgrade_output(&state, &request, &upgrade_failure_output(&result));
+                return;
+            }
+            if std::time::Instant::now() >= build_deadline {
+                abort_suspended_upgrade(&state, &request, "等待构建结果超时，升级已取消");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
+}
+
+/// 构建失败时回传给模型的工具结果文案。
+fn upgrade_failure_output(result: &crate::session_mgr::UpgradeResult) -> String {
+    let detail = result
+        .stderr_tail
+        .as_deref()
+        .or(result.message.as_deref())
+        .unwrap_or("（无构建输出）");
+    format!(
+        "热升级失败：新版本构建未通过，当前仍在旧版本中运行，任务已自动继续。\n\
+         请根据下面的错误修复后，再次调用 HotUpgrade。\n\
+         --- 构建输出（末尾） ---\n{}",
+        truncate_middle(detail, 6000)
+    )
+}
+
+/// 放弃升级：补齐 `HotUpgrade` 与未执行调用的错误结果,重新入队续跑。
+fn abort_suspended_upgrade(
+    state: &AppState,
+    request: &crate::session_mgr::UpgradeRequest,
+    reason: &str,
+) {
+    abort_suspended_upgrade_output(state, request, &format!("热升级未执行：{reason}"));
+}
+
+/// 以自定义工具结果文案放弃升级（构建失败时带编译错误）。
+fn abort_suspended_upgrade_output(
+    state: &AppState,
+    request: &crate::session_mgr::UpgradeRequest,
+    output: &str,
+) {
+    let request_workspace = request
+        .workspace
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.workspace.clone());
+    match crate::upgrade_resume::resolve_session(request, output, true) {
+        Ok(plan) => {
+            crate::session_mgr::clear_upgrade_request_if(&request_workspace, &request.session_id);
+            state.events.emit(
+                &request.session_id,
+                json!({ "kind": "upgrade_aborted", "message": output }),
+            );
+            enqueue_resume_job(state, plan);
+        }
+        Err(error) => {
+            eprintln!("[serve] upgrade abort failed: {error}");
+            crate::session_mgr::clear_upgrade_request_if(&request_workspace, &request.session_id);
+            state.scheduler.clear_suspended(&request.session_id);
+            state.events.emit(
+                &request.session_id,
+                json!({
+                    "kind": "error",
+                    "message": format!("热升级取消后恢复失败：{error}"),
+                }),
+            );
+        }
+    }
+}
+
+/// 新进程启动恢复：读取 `Suspended` 标记 → 补齐工具结果 → 入队续跑。
+fn spawn_upgrade_resume(state: AppState) {
+    std::thread::spawn(move || {
+        let Some(request) = crate::upgrade_resume::load_pending(&state.workspace) else {
+            return;
+        };
+        let workspace = request
+            .workspace
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| state.workspace.clone());
+        // 恢复完成前先把会话钉在 Suspended:页面此时已连上新进程,必须拒绝
+        // 新消息,避免用户抢在续跑 turn 之前插入一轮输入。
+        let _ = state.scheduler.mark_suspended(&request.session_id);
+        // 页面就绪闸门(P0 简化):给 EventSource 一点时间订阅,避免模型先
+        // 输出、页面后刷新导致过程看起来像卡住。
+        let grace_ms = std::env::var("CLAW_UPGRADE_READY_GRACE_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(3000);
+        std::thread::sleep(Duration::from_millis(grace_ms));
+        // P1:构建结果区分成功/失败。失败时把编译错误作为 HotUpgrade 的错误
+        // 结果回传，模型在旧版本里直接修复重试（无需用户再次下指令）。
+        let result = crate::session_mgr::read_upgrade_result(&workspace);
+        let (output, is_error) = match &result {
+            Some(result) if !result.ok => (upgrade_failure_output(result), true),
+            Some(result) => (
+                format!(
+                    "热升级完成：版本 {}（构建耗时 {:.0}s）。请继续原任务。",
+                    crate::version_label(),
+                    result.elapsed_ms.unwrap_or(0) as f64 / 1000.0
+                ),
+                false,
+            ),
+            None => (
+                format!(
+                    "热升级完成：版本 {}。请继续原任务。",
+                    crate::version_label()
+                ),
+                false,
+            ),
+        };
+        match crate::upgrade_resume::resolve_session(&request, &output, is_error) {
+            Ok(plan) => {
+                crate::session_mgr::update_upgrade_phase(
+                    &state.workspace,
+                    crate::session_mgr::UpgradePhase::Resuming,
+                );
+                crate::session_mgr::clear_upgrade_result(&workspace);
+                enqueue_resume_job(&state, plan);
+            }
+            Err(error) => {
+                eprintln!("[serve] hot upgrade resume failed: {error}");
+                crate::session_mgr::clear_upgrade_request(&state.workspace);
+                crate::session_mgr::clear_upgrade_result(&workspace);
+                state.scheduler.clear_suspended(&request.session_id);
+            }
+        }
+    });
+}
+
+/// 构造续跑 `PromptJob` 并入队(按需拉起 worker)。
+///
+/// P1:挂起期间排队的用户消息在续跑任务之后重新入队，保持原先后顺序。
+fn enqueue_resume_job(state: &AppState, plan: crate::upgrade_resume::ResumePlan) {
+    state.scheduler.clear_suspended(&plan.session_id);
+    let session_id = plan.session_id.clone();
+    let resume_job = PromptJob {
+        session_id: plan.session_id.clone(),
+        session_path: plan.session_path.clone(),
+        workspace: plan.workspace.clone(),
+        text: String::new(),
+        permission: plan.permission,
+        model: plan.model.clone(),
+        cron_id: None,
+        resume: Some(scheduler::ResumeSpec {
+            notice: plan.notice,
+            plan_id: plan.plan_id,
         }),
-    );
-    // 给 SSE 一点时间把升级通知刷到浏览器，再写 exited 让 helper 开始迁移。
-    std::thread::sleep(Duration::from_millis(700));
-    let _ = crate::session_mgr::write_upgrade_exited(workspace, old_pid);
-    std::process::exit(0);
+    };
+    let mut worker_started;
+    match state.scheduler.enqueue(resume_job) {
+        Ok(enqueued) => worker_started = enqueued.start_worker,
+        Err(error) => {
+            state.events.emit(
+                &session_id,
+                json!({
+                    "kind": "error",
+                    "message": format!("热升级后恢复续跑失败：{error:?}"),
+                }),
+            );
+            return;
+        }
+    }
+    for prompt in plan.queued_prompts {
+        let job = PromptJob {
+            session_id: session_id.clone(),
+            session_path: plan.session_path.clone(),
+            workspace: plan.workspace.clone(),
+            text: prompt.text,
+            // 防御式解析：升级请求可能是旧版本/手工编辑的，未知标签按
+            // workspace-write 处理，不能在这里 panic（否则整个服务退出）。
+            permission: match prompt.permission.as_deref() {
+                Some("read-only") => runtime::PermissionMode::ReadOnly,
+                Some("danger-full-access") => runtime::PermissionMode::DangerFullAccess,
+                _ => runtime::PermissionMode::WorkspaceWrite,
+            },
+            model: prompt.model,
+            cron_id: None,
+            resume: None,
+        };
+        if let Ok(enqueued) = state.scheduler.enqueue(job) {
+            worker_started |= enqueued.start_worker;
+        }
+    }
+    if worker_started {
+        spawn_session_worker(state.clone(), session_id);
+    }
 }
 
 /// 禁止监听 socket 被后续子进程继承（Windows 热升级必需）。
@@ -6710,6 +7117,32 @@ fn open_browser(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_key_round_trips_through_parser() {
+        for (mode, key) in [
+            (runtime::PermissionMode::ReadOnly, "read-only"),
+            (runtime::PermissionMode::WorkspaceWrite, "workspace-write"),
+            (
+                runtime::PermissionMode::DangerFullAccess,
+                "danger-full-access",
+            ),
+        ] {
+            assert_eq!(permission_key(mode), key);
+            assert_eq!(crate::permission_mode_from_label(key), mode);
+        }
+    }
+
+    #[test]
+    fn upgrade_attempts_increment_per_session_and_reset() {
+        let attempts = UpgradeAttempts::default();
+        assert_eq!(attempts.record("s1"), 1);
+        assert_eq!(attempts.record("s1"), 2);
+        assert_eq!(attempts.record("s2"), 1);
+        attempts.reset("s1");
+        assert_eq!(attempts.record("s1"), 1);
+        assert_eq!(attempts.record("s2"), 2, "重置只影响指定会话");
+    }
 
     #[test]
     fn token_is_32_hex_chars() {

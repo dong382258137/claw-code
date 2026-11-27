@@ -33,7 +33,7 @@ git clone https://github.com/dong382258137/claw-code
 cd claw-code/rust
 cargo build --workspace
 cargo test --workspace
-.\target\debug\claw-plus.exe doctor
+.\target\debug\claw.exe doctor
 ```
 
 ## Contribution workflow

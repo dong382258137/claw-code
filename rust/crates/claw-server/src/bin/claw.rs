@@ -1,7 +1,7 @@
 //! `claw` binary 入口（thin wrapper）。
 //!
-//! 与 `claw-plus` binary (`src/main.rs`) 共享 `claw_server::main_entry()`。
-//! 这是推荐的入口名；`claw-plus` 仅为向后兼容保留。
+//! 实际入口逻辑在 `claw_server::main_entry()`；`claw-plus` 兼容入口已移除，
+//! 需要一个二进制同时服务命令行与桌面快捷方式。
 
 fn main() {
     claw_server::main_entry();

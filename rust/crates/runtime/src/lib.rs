@@ -222,7 +222,7 @@ pub use conversation::{
     default_subagent_tool_catalog, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
     ConversationRuntime, PromptCacheEvent, RequestKind, RuntimeError, StaticToolExecutor,
     StatusEmitter, StatusEvent, ToolError, ToolExecutor, ToolResultCallback, ToolSummary,
-    TurnSummary,
+    TurnSummary, UpgradeSuspension,
 };
 pub use file_ops::{
     edit_file, edit_file_in_workspace, edit_file_in_workspace_with_roots, glob_search,

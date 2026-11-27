@@ -21,14 +21,15 @@
 //! 5. 清理 exited 标记,本助手退出。
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::session_mgr::{
     clear_upgrade_exited, clear_upgrade_request, read_upgrade_exited, read_upgrade_request,
-    UPGRADE_EXITED_REL,
+    read_upgrade_result, write_upgrade_result, UpgradeRequest, UpgradeResult, UPGRADE_EXITED_REL,
 };
 
 /// 轮询"旧进程已退出"标记的间隔。
@@ -77,6 +78,16 @@ fn truncate(text: &str, max_chars: usize) -> String {
     } else {
         head
     }
+}
+
+/// 保留末尾 N 个字符（编译错误通常在输出末尾，头部是进度/警告）。
+fn truncate_tail(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let tail: String = text.chars().skip(count - max_chars).collect();
+    format!("…（前 {} 字符已截断）…\n{tail}", count - max_chars)
 }
 
 /// 记录关键环境变量到日志(诊断编译失败时的环境差异)。
@@ -136,7 +147,38 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     );
     log_key_env(&log_file);
 
-    // 1. 等旧进程写 exited 标记(校验 old_pid 归属)。
+    // P1:Web 模式改为"构建成功才切换" —— helper 在旧进程存活时构建，
+    // 构建结果写 `.claw/upgrade-result.json` 回传；失败时旧进程补一条带
+    // 编译错误的工具结果并原地续跑，不再"先退出后构建"导致任务死亡。
+    let web_request = read_upgrade_request(user_cwd).filter(|req| req.web_port.is_some());
+    let outcome = run_helper_flow(user_cwd, web_request.as_ref(), log_file);
+    if let Some(request) = web_request.as_ref() {
+        let workspace = request_workspace(request, user_cwd);
+        if outcome.is_err() && read_upgrade_result(&workspace).is_none() {
+            // helper 自身异常(定位源码根失败/备份失败等)也要回传，
+            // 否则旧进程会一直等构建结果直到超时。
+            let message = outcome
+                .as_ref()
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "升级助手异常退出".to_string());
+            let _ = write_upgrade_result(
+                &request_workspace(request, user_cwd),
+                &UpgradeResult::failure(message),
+            );
+        }
+    }
+    outcome
+}
+
+/// 升级助手主流程(Web / CLI-TUI 共用构建与部署步骤)。
+fn run_helper_flow(
+    user_cwd: &Path,
+    web_request: Option<&UpgradeRequest>,
+    log_file: Option<File>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // 1. CLI/TUI：等旧进程写 exited 标记后再迁移；Web(P1)：旧进程保持运行，
+    //    构建成功后由结果文件/commit 请求触发退出。
     //    注意:不能在启动时无条件 clear exited —— 那会与旧进程的
     //    write_upgrade_exited 竞态:旧进程若已写好标记(如 shutdown 很快),
     //    clear 会误删,本助手随后轮询永远等不到 → 卡满 180s 超时
@@ -144,26 +186,15 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     //    上次升级失败残留的 exited 携带旧 old_pid,与本次 request.old_pid
     //    不匹配,判定为残留并清除,不会误触发本次迁移。
     let expected_old_pid = read_upgrade_request(user_cwd).map(|req| req.old_pid);
-    let started = Instant::now();
-    loop {
-        if let Some(exited) = read_upgrade_exited(user_cwd) {
-            if exited_belongs(&exited, expected_old_pid) {
-                break;
-            }
-            // 上次升级失败残留:清除并继续等本次标记。
-            clear_upgrade_exited(user_cwd);
-        }
-        if started.elapsed() > WAIT_TIMEOUT {
-            return Err(format!(
-                "等待旧进程退出标记超时({}s): 未出现 {}",
-                WAIT_TIMEOUT.as_secs(),
-                user_cwd.join(UPGRADE_EXITED_REL).display()
-            )
-            .into());
-        }
-        std::thread::sleep(POLL_INTERVAL);
+    if web_request.is_none() {
+        wait_for_exited(user_cwd, expected_old_pid, &log_file)?;
+        log_out(&log_file, "[upgrade-helper] 旧进程已退出,开始迁移");
+    } else {
+        log_out(
+            &log_file,
+            "[upgrade-helper] Web 构建先行：旧进程保持运行，构建成功后切换",
+        );
     }
-    log_out(&log_file, "[upgrade-helper] 旧进程已退出,开始迁移");
 
     // 2. 备份当前 exe → exe.old（**复制**而不是改名）。
     //    历史事故：部署版从 claw-web.exe 启动时，旧实现先把入口改名成 .old，
@@ -209,6 +240,8 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
         })?;
     // 定位成功即自动登记(P0):源码树内首次热升级后,后续任意目录都能定位。
     let _ = runtime::source_root::register_source_root(&workspace_root);
+    // 2b. 前端源码比 web/dist 新时先构建前端（dist 会在 cargo build 时内联进二进制）。
+    ensure_frontend_built(&workspace_root, &log_file)?;
 
     // 3. cargo build。产物路径必须与"当前 exe 运行场景"对齐:
     //    - exe 在 `target/debug`(源码 debug 布局) → 默认 build(debug),产物已在原位
@@ -218,7 +251,10 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     let in_target_debug = exe.starts_with(workspace_root.join("target").join("debug"));
     let in_target_release = exe.starts_with(workspace_root.join("target").join("release"));
     let target_layout = in_target_debug || in_target_release;
-    if target_layout {
+    // Web 构建先行：旧进程仍在运行，必须先改名释放 exe 路径（Windows 允许
+    // 重命名运行中的镜像），否则 cargo 无法把新产物写回原位。
+    let release_first = web_request.is_some();
+    if target_layout || release_first {
         // target 布局下 cargo 会把新产物写到 exe 原路径；helper 自身正运行于
         // 该路径，Windows 不允许覆盖运行中的镜像。先把自身改名为 .old
         // （Windows 允许 rename 运行中的 exe），构建失败时再改回来。
@@ -233,6 +269,7 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
             ),
         );
     }
+    let build_started = Instant::now();
     let use_release = !in_target_debug;
     let profile_dir = if use_release { "release" } else { "debug" };
     log_out(
@@ -261,6 +298,10 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
                 &log_file,
                 &format!("[upgrade-helper] 启动 cargo 失败: {err}(cargo 是否在 PATH?)"),
             );
+            // 已释放 exe 路径时必须还原，否则入口消失。
+            if target_layout || release_first {
+                let _ = std::fs::rename(&old_exe, &exe);
+            }
             err
         })?;
     if !output.status.success() {
@@ -276,15 +317,37 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
         );
         log_out(&log_file, &msg);
         eprintln!("{msg}");
-        if target_layout {
+        if target_layout || release_first {
             // 构建失败：把旧镜像改回原路径，保证入口仍可启动旧版本。
             let _ = std::fs::rename(&old_exe, &exe);
+        }
+        if let Some(request) = web_request {
+            // P1:把编译错误回传旧进程，由它补一条 HotUpgrade 错误结果并
+            // 原地续跑（模型当场修代码重试），不再需要人工重启。
+            let detail = if stderr.trim().is_empty() {
+                stdout.to_string()
+            } else {
+                stderr.to_string()
+            };
+            let _ = write_upgrade_result(
+                &request_workspace(request, user_cwd),
+                &UpgradeResult {
+                    ok: false,
+                    elapsed_ms: Some(build_started.elapsed().as_millis() as u64),
+                    stderr_tail: Some(truncate_tail(&detail, 6000)),
+                    message: None,
+                },
+            );
+            log_out(
+                &log_file,
+                "[upgrade-helper] 已回传编译错误，旧进程继续当前任务",
+            );
         }
         return Err("cargo build failed".into());
     }
 
     // 3b. 部署版(非源码 target 布局):把构建产物回拷到 exe 原路径。
-    if !in_target_debug && !in_target_release {
+    if !target_layout {
         let exe_name = exe
             .file_name()
             .and_then(|name| name.to_str())
@@ -292,18 +355,28 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
         // 入口名不一定是 cargo 产物名：桌面快捷方式用 claw-web.exe，但
         // `cargo build -p claw-server` 只产出 claw.exe。按产物名解析，
         // 避免再次出现“构建成功却找不到产物、入口已被改名”的事故。
-        let built =
-            resolve_built_product(&workspace_root, profile_dir, exe_name).ok_or_else(|| {
-                format!(
+        let built = match resolve_built_product(&workspace_root, profile_dir, exe_name) {
+            Some(built) => built,
+            None => {
+                // 路径已释放时先还原，避免入口消失。
+                if release_first {
+                    let _ = std::fs::rename(&old_exe, &exe);
+                }
+                return Err(format!(
                     "构建产物缺失: {}/{}（入口={exe_name}, profile={profile_dir}）",
                     workspace_root.join("target").join(profile_dir).display(),
                     "claw.exe"
                 )
-            })?;
+                .into());
+            }
+        };
         // helper 自身就运行在 exe 路径上，不能直接覆盖；先把自身改名成
         // .old 释放路径（备份副本已存在，这里覆盖它），再落新产物。
-        let _ = std::fs::remove_file(&old_exe);
-        std::fs::rename(&exe, &old_exe)?;
+        // Web 构建先行时路径已在构建前释放，无需再次改名。
+        if !release_first {
+            let _ = std::fs::remove_file(&old_exe);
+            std::fs::rename(&exe, &old_exe)?;
+        }
         if let Err(error) = copy_with_retry(&built, &exe, Duration::from_secs(15)) {
             // 失败回滚：把旧镜像改回原路径，快捷方式仍然可用。
             let _ = std::fs::rename(&old_exe, &exe);
@@ -322,6 +395,30 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
         sync_launcher_siblings(&exe, &built, &log_file);
     }
 
+    // 3c. Web(P1)：构建成功才切换。写结果 → 通知旧进程确认切换 → 等它退出。
+    if let Some(request) = web_request {
+        let workspace = request_workspace(request, user_cwd);
+        let _ = write_upgrade_result(
+            &workspace,
+            &UpgradeResult {
+                ok: true,
+                elapsed_ms: Some(build_started.elapsed().as_millis() as u64),
+                stderr_tail: None,
+                message: None,
+            },
+        );
+        let port = request.web_port.expect("filtered web_port");
+        if matches!(
+            notify_upgrade_commit(port, request.web_token.as_deref(), &workspace),
+            CommitOutcome::Cancelled
+        ) {
+            log_out(&log_file, "[upgrade-helper] 旧进程已取消升级，不启动新进程");
+            return Ok(());
+        }
+        // 旧进程读到结果（或收到 commit）后写 exited 标记并退出。
+        wait_for_exited(user_cwd, Some(request.old_pid), &log_file)?;
+    }
+
     // 4. 启动新 exe(user_cwd 为工作目录 → 自动检测标记 → resume 会话)。
     log_out(
         &log_file,
@@ -335,7 +432,6 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
 
     // Web 模式：旧进程是 `claw serve`。启动新进程继续跑 serve（同端口、同 token），
     // 并脱离 helper 的控制台，避免用户关掉升级窗口时把 Web 服务一起带走。
-    let web_request = read_upgrade_request(user_cwd).filter(|req| req.web_port.is_some());
     if let Some(request) = web_request {
         let port = request.web_port.expect("filtered web_port");
         std::thread::sleep(Duration::from_millis(1200));
@@ -366,7 +462,7 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
             const DETACHED_PROCESS: u32 = 0x0000_0008;
             web_cmd.creation_flags(DETACHED_PROCESS);
         }
-        let child = web_cmd.spawn()?;
+        let mut child = web_cmd.spawn()?;
         log_out(
             &log_file,
             &format!(
@@ -375,9 +471,78 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
                 port
             ),
         );
+        // 健康检查：新版本起不来时自动回滚旧版本，避免服务彻底不可用。
+        let healthy = match request.web_token.as_deref() {
+            Some(token) => wait_web_healthy(port, token, Duration::from_secs(90)),
+            None => true,
+        };
+        if !healthy {
+            log_out(&log_file, "[upgrade-helper] 新版本健康检查失败，回滚旧版本");
+            let _ = child.kill();
+            let workspace = request_workspace(request, user_cwd);
+            let _ = write_upgrade_result(
+                &workspace,
+                &UpgradeResult::failure("新版本启动失败，已回滚旧版本"),
+            );
+            let restored =
+                std::fs::remove_file(&exe).is_ok() && std::fs::rename(&old_exe, &exe).is_ok();
+            if restored {
+                let mut rollback_cmd = Command::new(&exe);
+                rollback_cmd.current_dir(user_cwd);
+                for arg in web_restart_args(port, user_cwd) {
+                    rollback_cmd.arg(arg);
+                }
+                if let Some(token) = request.web_token.as_deref() {
+                    rollback_cmd.env("CLAW_WEB_TOKEN", token);
+                }
+                rollback_cmd.stdin(Stdio::null());
+                match open_web_server_log(user_cwd) {
+                    Some(file) => {
+                        if let Ok(clone) = file.try_clone() {
+                            rollback_cmd.stdout(Stdio::from(file));
+                            rollback_cmd.stderr(Stdio::from(clone));
+                        }
+                    }
+                    None => {
+                        rollback_cmd.stdout(Stdio::null());
+                        rollback_cmd.stderr(Stdio::null());
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    const DETACHED_PROCESS: u32 = 0x0000_0008;
+                    rollback_cmd.creation_flags(DETACHED_PROCESS);
+                }
+                match rollback_cmd.spawn() {
+                    Ok(old_child) => log_out(
+                        &log_file,
+                        &format!(
+                            "[upgrade-helper] 已回滚旧版本: pid={} port={}",
+                            old_child.id(),
+                            port
+                        ),
+                    ),
+                    Err(error) => log_out(
+                        &log_file,
+                        &format!("[upgrade-helper] 回滚旧版本启动失败: {error}"),
+                    ),
+                }
+            } else {
+                log_out(
+                    &log_file,
+                    &format!(
+                        "[upgrade-helper] 回滚失败，请手动用 {} 恢复",
+                        old_exe.display()
+                    ),
+                );
+            }
+            clear_upgrade_exited(user_cwd);
+            return Ok(());
+        }
         clear_upgrade_exited(user_cwd);
-        // 请求标记已消费：避免下次手动启动 CLI 时误 resume 旧会话。
-        clear_upgrade_request(user_cwd);
+        // Web 断点续跑(P0):请求标记由新 serve 进程消费(恢复会话后清理),
+        // 此处不能清 —— 否则新进程启动时读不到挂起现场。
         return Ok(());
     }
 
@@ -449,6 +614,230 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
         );
     }
     Ok(())
+}
+
+/// 前端源码(`web/src`)比已构建的 `web/dist/index.html` 新时先执行
+/// `npm run build`，避免 Rust 修复生效但前端仍是旧产物。
+///
+/// - 找不到 npm：记录日志并沿用现有 dist（不阻断升级）；
+/// - npm 执行失败：中止升级并把构建错误回传，让模型修复后重试。
+fn ensure_frontend_built(
+    workspace_root: &Path,
+    log_file: &Option<File>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let web_dir = workspace_root
+        .join("crates")
+        .join("claw-server")
+        .join("web");
+    if !web_dir.join("package.json").is_file() {
+        return Ok(());
+    }
+    let Some(newest_src) = newest_mtime(&web_dir.join("src")) else {
+        return Ok(());
+    };
+    let dist_mtime = std::fs::metadata(web_dir.join("dist").join("index.html"))
+        .ok()
+        .and_then(|meta| meta.modified().ok());
+    if let Some(dist_mtime) = dist_mtime {
+        if newest_src <= dist_mtime {
+            return Ok(());
+        }
+    }
+
+    log_out(
+        log_file,
+        "[upgrade-helper] 检测到前端源码更新，执行 npm run build",
+    );
+    match npm_build(&web_dir) {
+        Ok(output) if output.status.success() => {
+            log_out(log_file, "[upgrade-helper] 前端构建完成");
+            Ok(())
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let detail = if stderr.trim().is_empty() {
+                stdout.to_string()
+            } else {
+                stderr.to_string()
+            };
+            log_out(
+                log_file,
+                &format!(
+                    "[upgrade-helper] 前端构建失败(exit={:?}): {}",
+                    output.status.code(),
+                    truncate(&detail, 2000)
+                ),
+            );
+            Err(format!(
+                "前端构建失败(npm run build):\n{}",
+                truncate_tail(&detail, 4000)
+            )
+            .into())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            log_out(
+                log_file,
+                "[upgrade-helper] 未找到 npm，跳过前端构建(沿用现有 dist)",
+            );
+            Ok(())
+        }
+        Err(error) => {
+            log_out(
+                log_file,
+                &format!("[upgrade-helper] 启动 npm 失败: {error}，跳过前端构建"),
+            );
+            Ok(())
+        }
+    }
+}
+
+fn npm_build(web_dir: &Path) -> std::io::Result<std::process::Output> {
+    #[cfg(windows)]
+    {
+        // Windows 下 npm 是 .cmd，必须经由 cmd /C 启动。
+        Command::new("cmd")
+            .args(["/C", "npm", "run", "build"])
+            .current_dir(web_dir)
+            .output()
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("npm")
+            .args(["run", "build"])
+            .current_dir(web_dir)
+            .output()
+    }
+}
+
+/// 目录树里最新文件修改时间（不存在/为空返回 None）。
+fn newest_mtime(dir: &Path) -> Option<SystemTime> {
+    let mut newest: Option<SystemTime> = None;
+    let mut stack: Vec<PathBuf> = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
+                newest = Some(match newest {
+                    Some(previous) if previous >= modified => previous,
+                    _ => modified,
+                });
+            }
+        }
+    }
+    newest
+}
+
+/// 轮询旧进程"已退出"标记（校验 old_pid 归属；上次失败残留会被清除）。
+fn wait_for_exited(
+    user_cwd: &Path,
+    expected_old_pid: Option<u32>,
+    log_file: &Option<File>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    loop {
+        if let Some(exited) = read_upgrade_exited(user_cwd) {
+            if exited_belongs(&exited, expected_old_pid) {
+                return Ok(());
+            }
+            // 上次升级失败残留:清除并继续等本次标记。
+            clear_upgrade_exited(user_cwd);
+        }
+        if started.elapsed() > WAIT_TIMEOUT {
+            let message = format!(
+                "等待旧进程退出标记超时({}s): 未出现 {}",
+                WAIT_TIMEOUT.as_secs(),
+                user_cwd.join(UPGRADE_EXITED_REL).display()
+            );
+            log_out(log_file, &format!("[upgrade-helper] {message}"));
+            return Err(message.into());
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// 升级请求所属工作区（缺省退回 user_cwd）。
+fn request_workspace(request: &UpgradeRequest, user_cwd: &Path) -> PathBuf {
+    request
+        .workspace
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| user_cwd.to_path_buf())
+}
+
+/// helper 通知旧进程"构建成功，可以切换"的结果。
+enum CommitOutcome {
+    /// 旧进程确认切换（写 exited 后退出）。
+    Accepted,
+    /// 旧进程已取消升级（409），helper 不应再启动新进程。
+    Cancelled,
+    /// 连不上旧进程（通常它已按结果文件自行退出），继续等 exited 即可。
+    Unreachable,
+}
+
+fn notify_upgrade_commit(port: u16, token: Option<&str>, workspace: &Path) -> CommitOutcome {
+    let Some(token) = token else {
+        return CommitOutcome::Unreachable;
+    };
+    let path = format!(
+        "/api/upgrade/commit?t={token}&workspace={}",
+        percent_encode(&workspace.display().to_string())
+    );
+    match http_status(port, "POST", &path, Duration::from_secs(5)) {
+        Some(409) => CommitOutcome::Cancelled,
+        Some(_) => CommitOutcome::Accepted,
+        None => CommitOutcome::Unreachable,
+    }
+}
+
+/// 健康检查：轮询 `/api/meta`，确认新进程已就绪。
+fn wait_web_healthy(port: u16, token: &str, timeout: Duration) -> bool {
+    let started = Instant::now();
+    let path = format!("/api/meta?t={token}");
+    while started.elapsed() < timeout {
+        if http_status(port, "GET", &path, Duration::from_secs(2)) == Some(200) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    false
+}
+
+/// 极简本地 HTTP 请求，只读取状态码（与同端口 serve 通信，避免 HTTP 客户端依赖）。
+fn http_status(port: u16, method: &str, path: &str, timeout: Duration) -> Option<u16> {
+    let address = ("127.0.0.1", port).to_socket_addrs().ok()?.next()?;
+    let mut stream = TcpStream::connect_timeout(&address, timeout).ok()?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut buffer = [0u8; 256];
+    let read = stream.read(&mut buffer).ok()?;
+    let head = String::from_utf8_lossy(&buffer[..read]);
+    let mut parts = head.split_whitespace();
+    let _version = parts.next()?;
+    parts.next()?.parse::<u16>().ok()
+}
+
+/// 查询参数最小百分号编码（工作区路径可能含中文/空格/反斜杠）。
+fn percent_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(*byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 /// Web 热升级：新 serve 的启动参数（纯函数便于测试）。
@@ -817,6 +1206,45 @@ mod tests {
         let err =
             workspace_root_from_user_cwd(dir.path()).expect_err("should reject non-workspace dir");
         assert!(err.to_string().contains("无法从工作目录"), "got: {err}");
+    }
+
+    #[test]
+    fn truncate_tail_keeps_the_end_of_build_output() {
+        assert_eq!(truncate_tail("short", 10), "short");
+        let text = "aaaaaaaaaabbbbbbbbbbcccccccccc";
+        let truncated = truncate_tail(text, 12);
+        assert!(truncated.ends_with("cccccccccc"), "got: {truncated}");
+        assert!(!truncated.contains("aaaaaaaaaa"), "head should be dropped");
+    }
+
+    #[test]
+    fn newest_mtime_tracks_deepest_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.path().join("old.txt"), "old").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(nested.join("new.txt"), "new").unwrap();
+
+        let newest = newest_mtime(dir.path()).expect("mtime");
+        let new_mtime = std::fs::metadata(nested.join("new.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(newest, new_mtime);
+    }
+
+    #[test]
+    fn newest_mtime_missing_dir_is_none() {
+        assert!(newest_mtime(Path::new("__definitely_missing__")).is_none());
+    }
+
+    #[test]
+    fn percent_encode_escapes_windows_path_and_cjk() {
+        assert_eq!(
+            percent_encode("D:\\work dir\\子"),
+            "D%3A%5Cwork%20dir%5C%E5%AD%90"
+        );
     }
 
     #[test]

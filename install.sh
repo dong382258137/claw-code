@@ -2,7 +2,7 @@
 # Claw Plus installer
 #
 # Detects the host OS, verifies the Rust toolchain (rustc + cargo),
-# builds the `claw-plus` binary from the `rust/` workspace, and runs a
+# builds the `claw` binary from the `rust/` workspace, and runs a
 # post-install verification step. Supports Linux, macOS, and WSL.
 #
 # Usage:

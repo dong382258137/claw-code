@@ -1557,6 +1557,26 @@ pub struct AutoCompactionEvent {
     pub removed_message_count: usize,
 }
 
+/// Web 热升级挂起现场(P0-1)。
+///
+/// 模型在工具批中调用 `HotUpgrade` 时,运行时**不执行**该工具、不写
+/// tool_result,而是记录本批中其后未执行的调用后直接结束本 turn。上层
+/// (Web server)据此退出旧进程;新进程补上 `HotUpgrade` 的工具结果与
+/// 未执行调用的错误结果后,以 [`run_turn_continue`](ConversationRuntime::run_turn_continue)
+/// 续跑同一会话。
+///
+/// 仅在 `suspend_on_hot_upgrade` 打开时产生(Web),CLI/TUI 保持旧语义。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeSuspension {
+    /// 被挂起的 `HotUpgrade` 工具调用 id。
+    pub tool_use_id: String,
+    /// 被挂起的工具名(固定 `HotUpgrade`,保留字段便于上层透传)。
+    pub tool_name: String,
+    /// 同批次中排在 `HotUpgrade` 之后、未执行的工具调用 `(id, name)`,
+    /// 按原顺序。新进程需为它们补「未执行」错误结果。
+    pub pending_after: Vec<(String, String)>,
+}
+
 /// Tracks how far the reactive-compaction recovery has progressed within a
 /// single [`ConversationRuntime::run_turn`] call. The state machine prevents
 /// infinite retry loops when the upstream API keeps returning prompt-too-long
@@ -1770,6 +1790,13 @@ pub struct ConversationRuntime<C, T> {
     /// 收尾(不走 Err 路径)。新进程 resume 后注入"继续任务通知"。
     /// 与 `hook_abort_signal`(硬中断,return Err)互补:本信号是优雅收尾。
     upgrade_pending: Arc<AtomicBool>,
+    /// Web 热升级断点续跑(P0-1):`true` 时工具循环遇到 `HotUpgrade` 即挂起
+    /// (不执行、不写结果、结束本 turn),由上层重启进程后续跑。
+    /// 默认 `false`,仅 Web 的 `LiveCli` 打开;CLI/TUI 保持"turn 收尾后升级"。
+    suspend_on_hot_upgrade: bool,
+    /// 本 turn 因 `HotUpgrade` 挂起时的现场;由上层
+    /// [`take_upgrade_suspension`](Self::take_upgrade_suspension) 取走。
+    upgrade_suspension: Option<UpgradeSuspension>,
     /// 主会话 mid-turn steering 收件箱(inject 模式)。
     ///
     /// 用户在本 turn 执行期间输入的插话消息经 CLI/TUI 投入此队列。`run_turn`
@@ -2518,6 +2545,8 @@ where
             context_window: None,
             hook_abort_signal: HookAbortSignal::default(),
             upgrade_pending: Arc::new(AtomicBool::new(false)),
+            suspend_on_hot_upgrade: false,
+            upgrade_suspension: None,
             steer_inbox: Arc::new(Mutex::new(Vec::new())),
             hook_progress_reporter: None,
             diag_callback: None,
@@ -2631,6 +2660,21 @@ where
     /// 设置热升级优雅中断信号(由 `/upgrade` 命令调用,旧进程内)。
     pub fn request_upgrade(&self) {
         self.upgrade_pending.store(true, Ordering::SeqCst);
+    }
+
+    /// 打开 Web 热升级断点续跑(P0-1):工具循环遇到 `HotUpgrade` 即挂起。
+    ///
+    /// 仅 Web 服务端打开;默认关闭时 `HotUpgrade` 走原有工具执行路径
+    /// (置位跨 crate 信号并立即返回),CLI/TUI 语义不变。
+    #[must_use]
+    pub fn with_hot_upgrade_suspend(mut self, suspend: bool) -> Self {
+        self.suspend_on_hot_upgrade = suspend;
+        self
+    }
+
+    /// 取走本 turn 的热升级挂起现场(取一次即清空,幂等)。
+    pub fn take_upgrade_suspension(&mut self) -> Option<UpgradeSuspension> {
+        self.upgrade_suspension.take()
     }
 
     /// 注入主会话 mid-turn steering 收件箱(inject 模式)。
@@ -3872,9 +3916,62 @@ where
     pub async fn run_turn_async(
         &mut self,
         user_input: impl Into<String>,
-        mut prompter: Option<&mut dyn PermissionPrompter>,
+        prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
-        let user_input = user_input.into();
+        self.run_turn_inner(user_input.into(), prompter, None).await
+    }
+
+    /// Web 热升级续跑入口(P0-1)。
+    ///
+    /// 与 [`run_turn_async`](Self::run_turn_async) 共用同一套主循环,差异:
+    /// - **不**把 `notice` 当作用户消息写入会话(它不是用户意图);
+    /// - 以 `runtime_note("upgrade", ...)` 注记注入,告知模型"升级完成,继续原任务";
+    /// - 跳过打回率判定、语义召回与 goal 提取(这些只对真实用户输入有意义)。
+    ///
+    /// 调用方(新进程)应在此之前用 `Session::resolve_tool_use` 补齐挂起的
+    /// `HotUpgrade` 结果与未执行调用的错误结果,保证消息序列合法。
+    #[allow(clippy::too_many_lines)]
+    pub async fn run_turn_continue_async(
+        &mut self,
+        notice: impl Into<String>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        self.run_turn_inner(String::new(), prompter, Some(notice.into()))
+            .await
+    }
+
+    /// [`run_turn_continue_async`](Self::run_turn_continue_async) 的同步入口。
+    ///
+    /// 与 [`run_turn`](Self::run_turn) 同构:内部创建 `current_thread`
+    /// runtime 并 `block_on`;已在 tokio runtime 中时返回 `Err` 而非 panic。
+    pub fn run_turn_continue(
+        &mut self,
+        notice: impl Into<String>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(RuntimeError::new(
+                "run_turn_continue (sync) called from within a tokio runtime — \
+                 use run_turn_continue_async instead to avoid nested runtime overhead",
+            ));
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("failed to create tokio runtime: {e}"))
+            .map_err(RuntimeError::new)?;
+        rt.block_on(self.run_turn_continue_async(notice, prompter))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_turn_inner(
+        &mut self,
+        user_input: String,
+        mut prompter: Option<&mut dyn PermissionPrompter>,
+        continue_notice: Option<String>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        // 新 turn 清空上一轮的挂起现场(取走由上层完成;此处兜底防残留)。
+        self.upgrade_suspension = None;
 
         // Phase 1 记忆闭环：turn 头 drain worker 已产出的 op（纯内存 + 落盘，
         // 不含 embedding）。失败静默，绝不阻塞或影响本轮回答。
@@ -3955,7 +4052,7 @@ where
         // §6.1.3 口径一致)。非关键路径:任何失败静默忽略,不阻断主流程。
         // 注:last_assistant_text() 在 turn 开头返回上一 turn 收尾答复(跨 turn
         // 时无工具循环隔断);首 turn messages 为空 → 返回 None → 不计入。
-        if self.last_assistant_text().is_some() {
+        if continue_notice.is_none() && self.last_assistant_text().is_some() {
             let class = crate::convergence::classify_punchback(&user_input);
             // P1 元认知门控:留存打回判定,供 turn 收尾的门控消费。
             // 强/弱打回均为"上一轮答复被否定"的信号(Force/None 不计)。
@@ -3977,53 +4074,67 @@ where
             }
         }
 
-        self.session
-            .push_user_text(user_input.clone())
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if let Some(notice) = continue_notice.as_deref() {
+            // 热升级续跑:notice 不是用户意图,不得伪装成 user_text 写入会话;
+            // 走既有 [runtime] 注记通道,模型据此"带着上下文继续原任务"。
+            self.session
+                .push_message(ConversationMessage::user_text(runtime_note(
+                    "upgrade", notice,
+                )))
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+        } else {
+            self.session
+                .push_user_text(user_input.clone())
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
 
-        // G9.1: UserPromptSubmit lifecycle hook — 用户输入已入 session 后触发,
-        // 让外部观察者(敏感词过滤、prompt 审计、telemetry 等)看到原始 prompt。
-        // 异步 fire-and-forget:不阻塞对话循环,返回值不影响主流程。
-        self.hook_runner
-            .spawn_lifecycle_event(HookEvent::UserPromptSubmit, user_input.clone());
-
-        // BUG-6 修复:Harness C(Memory)层接入 — 语义召回。
-        // 当 persistent_memory 存在时,调用 semantic_recall 获取 top-3 相关记忆,
-        // 渲染成文本块存到 pending_semantic_context,供 request 构造时注入。
-        // 详见 docs/harness-engineering-optimization-plan.md Step 2.4。
-        if let Some(memory) = &self.persistent_memory {
-            let hits = memory.semantic_recall(&user_input, 3);
-            if !hits.is_empty() {
-                let mut rendered = String::from("# Relevant Memories\n\n");
-                let mut has_shadow = false;
-                for (idx, hit) in hits.iter().enumerate() {
-                    if hit.entry.source == "shadow" {
-                        has_shadow = true;
-                    }
-                    rendered.push_str(&format!(
-                        "{}. [{}] {}\n   source: {}\n   score: {:.3}\n",
-                        idx + 1,
-                        hit.entry.id,
-                        hit.entry.summary,
-                        hit.entry.source,
-                        hit.score,
-                    ));
-                }
-                if has_shadow {
-                    // visible 模式不得静默注入：显式标注来源与撤销方式。
-                    rendered.push_str(
-                        "\n注：带 [影子·未确认] 的条目为影子记忆，尚未写入持久记忆；\
-                         如不符合预期可用 `/memory rm <关键词>` 当场撤销。\n",
-                    );
-                }
-                self.pending_semantic_context = Some(rendered);
-            }
+            // G9.1: UserPromptSubmit lifecycle hook — 用户输入已入 session 后触发,
+            // 让外部观察者(敏感词过滤、prompt 审计、telemetry 等)看到原始 prompt。
+            // 异步 fire-and-forget:不阻塞对话循环,返回值不影响主流程。
+            self.hook_runner
+                .spawn_lifecycle_event(HookEvent::UserPromptSubmit, user_input.clone());
         }
 
-        // A'(任务锚点生命周期):请求构造前先从 user_input 提取 goal 到会话级
-        // task_state(goal-only)。create_plan 之前 Current Task 槽位即有任务
-        // 锚点,模型不再依赖 NOTEBOOK(旧任务)推断而反复自我定位"新任务"。
-        self.maybe_extract_goal_at_turn_start(&user_input);
+        // 热升级续跑(continue_notice 非空)跳过:语义召回与 goal 提取只对
+        // 真实用户输入有意义,notice 不是用户意图。
+        if continue_notice.is_none() {
+            // BUG-6 修复:Harness C(Memory)层接入 — 语义召回。
+            // 当 persistent_memory 存在时,调用 semantic_recall 获取 top-3 相关记忆,
+            // 渲染成文本块存到 pending_semantic_context,供 request 构造时注入。
+            // 详见 docs/harness-engineering-optimization-plan.md Step 2.4。
+            if let Some(memory) = &self.persistent_memory {
+                let hits = memory.semantic_recall(&user_input, 3);
+                if !hits.is_empty() {
+                    let mut rendered = String::from("# Relevant Memories\n\n");
+                    let mut has_shadow = false;
+                    for (idx, hit) in hits.iter().enumerate() {
+                        if hit.entry.source == "shadow" {
+                            has_shadow = true;
+                        }
+                        rendered.push_str(&format!(
+                            "{}. [{}] {}\n   source: {}\n   score: {:.3}\n",
+                            idx + 1,
+                            hit.entry.id,
+                            hit.entry.summary,
+                            hit.entry.source,
+                            hit.score,
+                        ));
+                    }
+                    if has_shadow {
+                        // visible 模式不得静默注入：显式标注来源与撤销方式。
+                        rendered.push_str(
+                            "\n注：带 [影子·未确认] 的条目为影子记忆，尚未写入持久记忆；\
+                             如不符合预期可用 `/memory rm <关键词>` 当场撤销。\n",
+                        );
+                    }
+                    self.pending_semantic_context = Some(rendered);
+                }
+            }
+
+            // A'(任务锚点生命周期):请求构造前先从 user_input 提取 goal 到会话级
+            // task_state(goal-only)。create_plan 之前 Current Task 槽位即有任务
+            // 锚点,模型不再依赖 NOTEBOOK(旧任务)推断而反复自我定位"新任务"。
+            self.maybe_extract_goal_at_turn_start(&user_input);
+        }
 
         // Harness O(编排)层接入:Plan/Execute/Review 三段循环入口。
         // 详见 docs/harness-engineering-optimization-plan.md Step 2.1。
@@ -5047,7 +5158,41 @@ where
             self.cost_meter.add_tool_calls(tool_count);
             // 收敛停滞判定的批起点:本批结束后只看新增的 tool 结果。
             let batch_start = tool_results.len();
-            for (tool_use_id, tool_name, input) in pending_tool_uses {
+            // P0-1(Web 热升级断点续跑):本批中若含 `HotUpgrade` 且已打开
+            // `suspend_on_hot_upgrade`,在该调用处挂起 —— 不执行它、不写
+            // tool_result,并记录同批后续未执行的调用,由新进程补结果后续跑。
+            // 注意在 `into_iter` 之前算好下标与后续清单。
+            let hot_upgrade_index = if self.suspend_on_hot_upgrade {
+                pending_tool_uses
+                    .iter()
+                    .position(|(_, name, _)| name == "HotUpgrade")
+            } else {
+                None
+            };
+            let hot_upgrade_pending_after: Vec<(String, String)> =
+                hot_upgrade_index.map_or_else(Vec::new, |idx| {
+                    pending_tool_uses[idx + 1..]
+                        .iter()
+                        .map(|(id, name, _)| (id.clone(), name.clone()))
+                        .collect()
+                });
+            for (idx, (tool_use_id, tool_name, input)) in pending_tool_uses.into_iter().enumerate()
+            {
+                // P0-1:命中挂起点 —— 置位升级信号(复用既有"优雅收尾跳过
+                // plan stale"语义),记录现场后结束本批次,本 turn 不再请求 LLM。
+                if Some(idx) == hot_upgrade_index {
+                    self.upgrade_pending.store(true, Ordering::SeqCst);
+                    self.emit_diag(format!(
+                        "[diag] hot_upgrade_suspended iter={iterations} tool_use_id={tool_use_id} pending_after={}",
+                        hot_upgrade_pending_after.len()
+                    ));
+                    self.upgrade_suspension = Some(UpgradeSuspension {
+                        tool_use_id,
+                        tool_name,
+                        pending_after: hot_upgrade_pending_after,
+                    });
+                    break;
+                }
                 // 细粒度中断检查：执行下一个工具前检查 abort signal。
                 // 若上一个工具执行时间较长（如 cargo build），用户在等待期间
                 // 按了 Ctrl+C，此检查能阻止后续工具继续执行。
@@ -5764,6 +5909,12 @@ where
                 tool_results.push(result_message);
             }
 
+            // P0-1:热升级挂起 —— 本批不做收敛统计/注记,不再发起下一轮 LLM
+            // 请求,直接退出主循环,由上层读取挂起现场并完成进程切换。
+            if self.upgrade_suspension.is_some() {
+                break;
+            }
+
             // 收敛停滞判定:本批是否产生任何进度信号。写文件/测试通过都是
             // "任务在推进"的客观证据 —— 此时不该催收尾。全部无信号才累加,
             // 一旦有进展立即清零。
@@ -5862,7 +6013,12 @@ where
         // 3. ReplanTriggered 分支把 remediation 保存到 pending_remediation,
         //    下次 request 构造时注入 system_prompt(修复 remediation 丢失缺陷)
         // 详见 docs/harness-engineering-optimization-plan.md Step 3.1。
-        if let Some(mut plan) = self.active_plan.take() {
+        // P0-1:热升级挂起时跳过 Review —— 本 turn 因进程切换而中断,不是任务
+        // 失败或收尾;计划状态由新进程从 plan artifact 恢复,不能在此标记失败
+        // 或清空(否则消息序号/步骤状态会被误判)。
+        if self.upgrade_suspension.is_some() {
+            // 保留 active_plan,等待进程切换。
+        } else if let Some(mut plan) = self.active_plan.take() {
             if !plan.steps.is_empty() {
                 // v2.0:收集失败 step 的验证详情,供 reviewer 透传 + 下轮 prompt 注入。
                 let mut failed_verifications: Vec<crate::planner::FailedVerification> = Vec::new();
@@ -6179,8 +6335,12 @@ where
         // reason 描述结束原因(此处为正常完成);异常路径由各自分支的
         // record_turn_failed 处理,不在此触发 Stop(避免与失败信号竞争)。
         // 异步 fire-and-forget:不阻塞对话循环,返回值不影响主流程。
-        self.hook_runner
-            .spawn_lifecycle_event(HookEvent::Stop, "turn_completed".to_string());
+        // P0-1:热升级挂起不是会话结束,而是进程切换 —— 不触发 Stop hook,
+        // 避免外部观察者(完成通知/telemetry/UI)误判任务已完成。
+        if self.upgrade_suspension.is_none() {
+            self.hook_runner
+                .spawn_lifecycle_event(HookEvent::Stop, "turn_completed".to_string());
+        }
 
         // 方案 C(P1-7 源头结构省略):会话结束时标记 NOTEBOOK <plan> 为 stale,
         // 但**仅当本会话 <plan> 段真有内容**(见 notebook::mark_plan_stale_if_content)。
@@ -11914,6 +12074,195 @@ mod tests {
             })
         });
         assert!(has_notice, "应注入热升级暂停通知给 LLM");
+    }
+
+    /// P0-1:Web 热升级挂起 —— 同批次中 HotUpgrade 之前的工具正常执行并落结果,
+    /// HotUpgrade 与之后的工具不执行、不写结果;挂起现场可被上层取走。
+    #[test]
+    fn hot_upgrade_suspend_stops_batch_and_records_pending_after() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct BatchApi {
+            calls: Arc<AtomicUsize>,
+        }
+        impl ApiClient for BatchApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![
+                    AssistantEvent::TextDelta("准备热升级".to_string()),
+                    AssistantEvent::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "echo".to_string(),
+                        input: "a".to_string(),
+                    },
+                    AssistantEvent::ToolUse {
+                        id: "call_2".to_string(),
+                        name: "HotUpgrade".to_string(),
+                        input: "{}".to_string(),
+                    },
+                    AssistantEvent::ToolUse {
+                        id: "call_3".to_string(),
+                        name: "echo".to_string(),
+                        input: "b".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            BatchApi {
+                calls: Arc::clone(&calls),
+            },
+            StaticToolExecutor::new()
+                .register("echo", |input| Ok(format!("ok {input}")))
+                .register("HotUpgrade", |_| panic!("HotUpgrade 挂起时不应被执行")),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_hot_upgrade_suspend(true);
+        runtime
+            .execute_create_plan(r#"{"plan_description": "热升级续跑测试"}"#)
+            .expect("create_plan");
+
+        let summary = runtime
+            .run_turn("执行任务", None)
+            .expect("挂起应优雅返回 Ok");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "挂起后不应再请求 LLM");
+        assert_eq!(
+            summary.tool_results.len(),
+            1,
+            "只应有 HotUpgrade 之前那个工具的结果"
+        );
+        let suspension = runtime.take_upgrade_suspension().expect("应有挂起现场");
+        assert_eq!(suspension.tool_use_id, "call_2");
+        assert_eq!(suspension.tool_name, "HotUpgrade");
+        assert_eq!(
+            suspension.pending_after,
+            vec![("call_3".to_string(), "echo".to_string())]
+        );
+        assert!(
+            runtime.take_upgrade_suspension().is_none(),
+            "挂起现场取一次即清空"
+        );
+        assert!(runtime.upgrade_pending(), "挂起应置位升级信号");
+        assert!(
+            runtime.active_plan().is_some(),
+            "挂起不是任务收尾,不能清空/评审 active plan"
+        );
+    }
+
+    /// P0-1:默认(Web 以外)保持旧语义 —— HotUpgrade 正常执行,循环继续请求 LLM。
+    #[test]
+    fn hot_upgrade_executes_normally_when_suspend_disabled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TwoStepApi {
+            calls: Arc<AtomicUsize>,
+        }
+        impl ApiClient for TwoStepApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "call_1".to_string(),
+                            name: "HotUpgrade".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("完成".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            TwoStepApi {
+                calls: Arc::clone(&calls),
+            },
+            StaticToolExecutor::new().register("HotUpgrade", |_| Ok("已登记热升级".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime.run_turn("升级", None).expect("正常 turn");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "未开启挂起时应继续下一轮模型请求"
+        );
+        assert!(runtime.take_upgrade_suspension().is_none());
+    }
+
+    /// P0-1:续跑入口不伪造用户消息,只注入 `[runtime]` 升级完成注记。
+    #[test]
+    fn run_turn_continue_injects_runtime_note_without_user_text() {
+        struct ContinueApi;
+        impl ApiClient for ContinueApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let has_runtime_note = request.messages.iter().any(|m| {
+                    m.role == MessageRole::User
+                        && m.blocks.iter().any(|b| match b {
+                            ContentBlock::Text { text } => {
+                                text.contains("<runtime-note") && text.contains("kind=\"upgrade\"")
+                            }
+                            _ => false,
+                        })
+                });
+                assert!(has_runtime_note, "续跑请求应包含 upgrade runtime 注记");
+                Ok(vec![
+                    AssistantEvent::TextDelta("继续执行下一步".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ContinueApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn_continue("热升级完成：版本 2026.11.27，请继续原任务", None)
+            .expect("续跑应成功");
+
+        let user_texts: Vec<&str> = runtime
+            .session
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .flat_map(|m| {
+                m.blocks.iter().filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert_eq!(
+            user_texts.len(),
+            1,
+            "续跑只注入一条运行时注记,不应追加用户消息"
+        );
+        assert!(user_texts[0].starts_with("<runtime-note"));
     }
 
     /// B:主会话 mid-turn steering(inject 模式)—— 预置插话队列,run_turn

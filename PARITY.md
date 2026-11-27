@@ -8,7 +8,7 @@
 ## 当前产品形态
 
 - 唯一产品界面：本地 Web UI；唯一启动入口 `claw serve`。
-- 主二进制 `claw`（兼容名 `claw-plus` 保留一个版本周期）；独立二进制 `im-bridge`。
+- 主二进制 `claw`（唯一构建产物，兼容名 `claw-plus` 已移除）；独立二进制 `im-bridge`。
 - 前端源码 `rust/crates/claw-server/web`，构建产物 `dist/index.html` 内嵌进二进制。
 - 语义检索：可选 `onnxruntime.dll` + `bge-small-zh-v1.5`（512 维）；缺失时降级关键词匹配。
 

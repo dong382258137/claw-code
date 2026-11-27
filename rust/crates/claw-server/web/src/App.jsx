@@ -25,6 +25,8 @@ export default function App() {
   // 侧栏轮询看到的调度状态（服务端每行返回 state/position/queued），
   // 用于「任务跑完」的提示；sessions state 本身供 Sidebar 渲染。
   const busyRef = useRef(new Map())
+  // Web 热升级:当前页面加载时的构建指纹;轮询 /api/meta 只有指纹变化才 reload。
+  const buildIdRef = useRef(null)
   const sessionsRef = useRef([])
   sessionsRef.current = sessions
   // 已加载条数：点过「加载更多」后轮询仍按这个数量拉，避免翻出来的页被冲掉。
@@ -111,7 +113,10 @@ export default function App() {
       setPanelWidth(clampWidth(settings.panel_width, settings.panel_side === 'left' ? 'left' : 'right', Boolean(settings.sidebar_collapsed)))
       document.documentElement.dataset.theme = settings.theme || 'dark'
     }).catch(() => {})
-    api('/api/meta').then(setMeta).catch(() => {})
+    api('/api/meta').then((next) => {
+      buildIdRef.current = next?.build_id || null
+      setMeta(next)
+    }).catch(() => {})
   }, [])
 
   const loadSessions = useCallback(async () => {
@@ -229,6 +234,8 @@ export default function App() {
       api(`/api/session/${encodeURIComponent(currentId)}/status`)
         .then((state) => {
           setRunning(Boolean(state.running))
+          // 热升级后页面先连上新进程、续跑稍后才开始:用等待横幅解释这段空档。
+          if (state.state === 'suspended') setUpgrading('正在热升级：服务重启后会自动继续当前任务…')
           setQueue((current) => ({
             state: state.state || 'idle',
             position: state.position || 0,
@@ -261,10 +268,12 @@ export default function App() {
       }
       try {
         const response = await fetch(withToken('/api/meta'))
-        if (response.ok) {
-          clearInterval(timer)
-          location.reload()
-        }
+        if (!response.ok) return
+        const next = await response.json().catch(() => null)
+        // 旧进程可能尚未退出:构建指纹没变就不刷新,避免 reload 后又掉线。
+        if (buildIdRef.current && next?.build_id === buildIdRef.current) return
+        clearInterval(timer)
+        location.reload()
       } catch (_) {}
     }, 1500)
     return () => clearInterval(timer)

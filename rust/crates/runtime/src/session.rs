@@ -416,6 +416,91 @@ impl Session {
         repaired
     }
 
+    /// 为末尾 assistant 消息中的某个工具调用补写结果(P0-2:Web 热升级续跑)。
+    ///
+    /// 场景:旧进程在工具批中调用 `HotUpgrade` 后退出,`assistant(tool_use...)`
+    /// 之后只落了部分工具结果。新进程必须在注入「继续任务」之前补齐**全部**
+    /// 结果(否则 API 以 400 拒绝整段历史)。
+    ///
+    /// - 只在**最后一条 assistant 消息**中查找该 `tool_use_id`;
+    /// - 已存在对应结果时返回 `false`(幂等,崩溃重启后可安全重入);
+    /// - 成功追加一条 `MessageRole::Tool` 结果并返回 `true`。
+    pub fn resolve_tool_use(
+        &mut self,
+        tool_use_id: &str,
+        tool_name: &str,
+        output: impl Into<String>,
+        is_error: bool,
+    ) -> bool {
+        let Some(assistant_index) = self
+            .messages
+            .iter()
+            .rposition(|m| m.role == MessageRole::Assistant)
+        else {
+            return false;
+        };
+        let has_tool_use = self.messages[assistant_index]
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == tool_use_id));
+        if !has_tool_use {
+            return false;
+        }
+        let already_answered = self.messages[assistant_index + 1..]
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .any(|block| {
+                matches!(block, ContentBlock::ToolResult { tool_use_id: id, .. } if id == tool_use_id)
+            });
+        if already_answered {
+            return false;
+        }
+        self.push_message(ConversationMessage::tool_result(
+            tool_use_id,
+            tool_name,
+            output,
+            is_error,
+        ))
+        .is_ok()
+    }
+
+    /// 返回末尾 assistant 消息中排在 `tool_use_id` 之后、且尚无结果的工具调用。
+    ///
+    /// 仅作兜底:正常情况下调用方直接使用运行时挂起现场里的 `pending_after`。
+    /// 顺序与 assistant 消息中的声明顺序一致。
+    #[must_use]
+    pub fn unresolved_tool_uses_after(&self, tool_use_id: &str) -> Vec<(String, String)> {
+        let Some(assistant_index) = self
+            .messages
+            .iter()
+            .rposition(|m| m.role == MessageRole::Assistant)
+        else {
+            return Vec::new();
+        };
+        let answered: HashSet<&str> = self.messages[assistant_index + 1..]
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut seen_target = false;
+        let mut unresolved = Vec::new();
+        for block in &self.messages[assistant_index].blocks {
+            let ContentBlock::ToolUse { id, name, .. } = block else {
+                continue;
+            };
+            if seen_target && !answered.contains(id.as_str()) {
+                unresolved.push((id.clone(), name.clone()));
+            }
+            if id == tool_use_id {
+                seen_target = true;
+            }
+        }
+        unresolved
+    }
+
     /// Bind this session to the workspace root it was created in.
     ///
     /// This is the per-worktree counterpart to the global session store and
@@ -1987,6 +2072,86 @@ mod tests {
         // 幂等：补齐后再调用一次不应重复插入。
         assert_eq!(session.repair_dangling_tool_uses(), 0);
         assert_eq!(session.messages.len(), 3);
+    }
+
+    /// P0-2:补结果顺序正确、可幂等重入,补完后 repair 不再报告悬空调用。
+    #[test]
+    fn resolve_tool_use_appends_results_in_order_and_is_idempotent() {
+        let mut session = Session::new();
+        session.messages.push(ConversationMessage {
+            role: MessageRole::Assistant,
+            blocks: vec![
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "edit_file".to_string(),
+                    input: "{}".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_2".to_string(),
+                    name: "HotUpgrade".to_string(),
+                    input: "{}".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_3".to_string(),
+                    name: "bash".to_string(),
+                    input: "{}".to_string(),
+                },
+            ],
+            usage: None,
+            created_at_ms: 1,
+        });
+        // call_1 在旧进程已执行并落盘。
+        session.messages.push(ConversationMessage::tool_result(
+            "call_1",
+            "edit_file",
+            "ok",
+            false,
+        ));
+
+        assert_eq!(
+            session.unresolved_tool_uses_after("call_1"),
+            vec![
+                ("call_2".to_string(), "HotUpgrade".to_string()),
+                ("call_3".to_string(), "bash".to_string()),
+            ]
+        );
+
+        // 补 HotUpgrade 完成结果。
+        assert!(session.resolve_tool_use("call_2", "HotUpgrade", "热升级完成", false));
+        assert_eq!(session.messages[2].role, MessageRole::Tool);
+        // 幂等:重复调用不追加。
+        assert!(!session.resolve_tool_use("call_2", "HotUpgrade", "热升级完成", false));
+        assert_eq!(session.messages.len(), 3);
+
+        // 补 call_3 未执行错误结果,顺序保持在末尾。
+        assert!(session.resolve_tool_use("call_3", "bash", "未执行:热升级中断", true));
+        assert_eq!(session.messages.len(), 4);
+        assert_eq!(
+            session.unresolved_tool_uses_after("call_2"),
+            Vec::<(String, String)>::new()
+        );
+        // 全部补齐后 repair 应为 0。
+        assert_eq!(session.repair_dangling_tool_uses(), 0);
+    }
+
+    /// P0-2:未知 tool_use_id 不写入任何消息。
+    #[test]
+    fn resolve_tool_use_ignores_unknown_id() {
+        let mut session = Session::new();
+        session.messages.push(ConversationMessage {
+            role: MessageRole::Assistant,
+            blocks: vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "echo".to_string(),
+                input: "{}".to_string(),
+            }],
+            usage: None,
+            created_at_ms: 1,
+        });
+
+        assert!(!session.resolve_tool_use("call_404", "echo", "x", true));
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.unresolved_tool_uses_after("call_404"), Vec::new());
     }
 
     #[test]

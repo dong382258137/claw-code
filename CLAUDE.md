@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `src/` and `tests/` are both present; update both surfaces together when behavior changes.
 
 ## Repository shape
-- `rust/` contains the Rust workspace and the Web server/runtime implementation. The product surface is the local Web UI; the only entry point is `claw serve` (CLI/TUI/REPL were removed in Phase 3). The server crate is `rust/crates/claw-server` (renamed from `rusty-claude-cli` in Phase 9); binaries are `claw` and the compatibility name `claw-plus`.
+- `rust/` contains the Rust workspace and the Web server/runtime implementation. The product surface is the local Web UI; the only entry point is `claw serve` (CLI/TUI/REPL were removed in Phase 3). The server crate is `rust/crates/claw-server` (renamed from `rusty-claude-cli` in Phase 9); the single binary is `claw` (the legacy `claw-plus` bin has been removed).
 - `rust/crates/claw-server/web` is the single-page frontend; run `npm run build` there after frontend changes (the bundle is embedded into the binary).
 - `src/` contains source files that should stay consistent with generated guidance and tests.
 - `tests/` contains validation surfaces that should be reviewed alongside code changes.

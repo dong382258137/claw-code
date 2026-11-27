@@ -306,7 +306,7 @@ After `cargo build --release -p claw-server` in `claw-code/rust/`:
 - **macOS/Linux:** `rust/target/release/claw`
 - **Windows:** `rust/target/release/claw.exe`
 
-`claw-plus` / `claw-plus.exe` 是同 crate 的兼容产物，保留一个版本周期；新脚本请使用 `claw`。
+只构建 `claw` 一个二进制；历史兼容入口 `claw-plus` 已移除，桌面快捷方式统一指向 `claw.exe serve`。
 
 If you ran `cargo build` without `--release`, the binary is in the `debug/` folder.
 

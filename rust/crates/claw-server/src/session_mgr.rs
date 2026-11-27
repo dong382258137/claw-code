@@ -51,12 +51,97 @@ pub(crate) struct UpgradeRequest {
     /// Web 热升级:新 serve 复用旧 token,使已打开页面无需重新拿 URL。
     #[serde(default)]
     pub(crate) web_token: Option<String>,
+
+    // ---- Web 断点续跑现场(全部默认值兼容旧标记) ----
+    /// 会话 JSONL 绝对路径。
+    #[serde(default)]
+    pub(crate) session_path: Option<String>,
+    /// 会话所属工作区根。
+    #[serde(default)]
+    pub(crate) workspace: Option<String>,
+    /// 权限模式标签(`read-only` / `workspace-write` / `danger-full-access`)。
+    #[serde(default)]
+    pub(crate) permission: Option<String>,
+    /// 本轮生效模型(缺省按工作区配置解析)。
+    #[serde(default)]
+    pub(crate) model: Option<String>,
+    /// 被挂起的 `HotUpgrade` 工具调用 id(新进程补"升级完成"结果)。
+    #[serde(default)]
+    pub(crate) suspended_tool_use_id: Option<String>,
+    #[serde(default)]
+    pub(crate) suspended_tool_name: Option<String>,
+    /// 同批次中排在 `HotUpgrade` 之后、未执行的调用(新进程补"未执行"错误)。
+    #[serde(default)]
+    pub(crate) pending_after: Vec<(String, String)>,
+    /// 阶段;旧标记为 `None`(按 CLI/TUI 语义处理,不恢复)。
+    #[serde(default)]
+    pub(crate) phase: Option<UpgradePhase>,
+    /// P1:挂起时该会话仍排在队列里的用户消息。重启恢复后排在续跑任务之后
+    /// 重新入队,避免切换过程中丢消息。
+    #[serde(default)]
+    pub(crate) queued_prompts: Vec<QueuedPrompt>,
+}
+
+/// 挂起期间排队等待的用户消息快照(随升级请求落盘)。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct QueuedPrompt {
+    pub(crate) text: String,
+    /// 权限模式标签;缺省按 `workspace-write` 处理。
+    #[serde(default)]
+    pub(crate) permission: Option<String>,
+    #[serde(default)]
+    pub(crate) model: Option<String>,
+}
+
+/// 升级构建结果(`.claw/upgrade-result.json`)。
+///
+/// 旧进程在构建期间保持存活,轮询该文件决定"切换"还是"回退并继续任务":
+/// - `ok=true`:新版本构建完成,写 exited 标记并退出;
+/// - `ok=false`:编译失败,补 `HotUpgrade` 错误结果后原地继续(不重启)。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct UpgradeResult {
+    pub(crate) ok: bool,
+    /// 构建耗时(毫秒)。
+    #[serde(default)]
+    pub(crate) elapsed_ms: Option<u64>,
+    /// 编译失败时的 stderr 末尾(截断)。
+    #[serde(default)]
+    pub(crate) stderr_tail: Option<String>,
+    /// 其它失败原因(定位 workspace 失败、helper 异常等)。
+    #[serde(default)]
+    pub(crate) message: Option<String>,
+}
+
+impl UpgradeResult {
+    /// 失败结果:优先使用编译 stderr,否则用通用消息。
+    pub(crate) fn failure(detail: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            elapsed_ms: None,
+            stderr_tail: None,
+            message: Some(detail.into()),
+        }
+    }
+}
+
+/// 热升级阶段(Web 断点续跑)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UpgradePhase {
+    /// 旧进程已挂起会话,等待其它会话空闲后开始构建。
+    Suspended,
+    /// 正在构建/切换进程。
+    Building,
+    /// 新进程正在恢复会话并续跑。
+    Resuming,
 }
 
 /// upgrade-request.json 相对工作区的路径。
 pub(crate) const UPGRADE_REQUEST_REL: &str = ".claw/upgrade-request.json";
 /// 旧进程"已退出"标记(升级助手轮询此文件确认可开始迁移 exe)。
 pub(crate) const UPGRADE_EXITED_REL: &str = ".claw/upgrade-exited.json";
+/// 构建结果标记(helper 写、旧进程轮询;P1 "构建成功才切换")。
+pub(crate) const UPGRADE_RESULT_REL: &str = ".claw/upgrade-result.json";
 /// 升级标记陈旧阈值:超过此毫秒数的标记视为失效(崩溃残留),启动时忽略并清理。
 pub(crate) const UPGRADE_REQUEST_STALE_MS: i64 = 10 * 60 * 1000;
 
@@ -86,6 +171,21 @@ pub(crate) fn read_upgrade_request(workspace_root: &Path) -> Option<UpgradeReque
 pub(crate) fn clear_upgrade_request(workspace_root: &Path) {
     let path = workspace_root.join(UPGRADE_REQUEST_REL);
     let _ = fs::remove_file(path);
+}
+
+/// 更新升级请求的阶段(读改写,失败静默)。
+pub(crate) fn update_upgrade_phase(workspace_root: &Path, phase: UpgradePhase) {
+    if let Some(mut request) = read_upgrade_request(workspace_root) {
+        request.phase = Some(phase);
+        let _ = write_upgrade_request(workspace_root, &request);
+    }
+}
+
+/// 仅当标记属于指定会话时才清理,避免误删其它会话的新请求。
+pub(crate) fn clear_upgrade_request_if(workspace_root: &Path, session_id: &str) {
+    if read_upgrade_request(workspace_root).is_some_and(|req| req.session_id == session_id) {
+        clear_upgrade_request(workspace_root);
+    }
 }
 
 /// 旧进程退出时写"已退出"标记(任务 2 一键化:旧进程自动退出前调用)。
@@ -123,6 +223,32 @@ pub(crate) fn read_upgrade_exited(workspace_root: &Path) -> Option<serde_json::V
 /// 清理"已退出"标记(升级助手完成迁移后调用,幂等)。
 pub(crate) fn clear_upgrade_exited(workspace_root: &Path) {
     let path = workspace_root.join(UPGRADE_EXITED_REL);
+    let _ = fs::remove_file(path);
+}
+
+/// 写入构建结果(`.claw/upgrade-result.json`)。
+pub(crate) fn write_upgrade_result(
+    workspace_root: &Path,
+    result: &UpgradeResult,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = workspace_root.join(UPGRADE_RESULT_REL);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, serde_json::to_string_pretty(result)?)?;
+    Ok(())
+}
+
+/// 读取构建结果。不存在/解析失败返回 None(视为"仍在构建")。
+pub(crate) fn read_upgrade_result(workspace_root: &Path) -> Option<UpgradeResult> {
+    let path = workspace_root.join(UPGRADE_RESULT_REL);
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// 清理构建结果(消费后 / 新一轮升级开始前,幂等)。
+pub(crate) fn clear_upgrade_result(workspace_root: &Path) {
+    let path = workspace_root.join(UPGRADE_RESULT_REL);
     let _ = fs::remove_file(path);
 }
 

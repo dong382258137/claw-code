@@ -55,6 +55,9 @@ pub enum SessionState {
     Idle,
     Queued,
     Running,
+    /// 热升级挂起:本会话已停在工具调用边界,等待进程重启后续跑。
+    /// 此状态下不接受新 prompt(返回 [`EnqueueError::UpgradePending`])。
+    Suspended,
 }
 
 impl SessionState {
@@ -63,6 +66,7 @@ impl SessionState {
             SessionState::Idle => "idle",
             SessionState::Queued => "queued",
             SessionState::Running => "running",
+            SessionState::Suspended => "suspended",
         }
     }
 }
@@ -102,6 +106,17 @@ pub struct PromptJob {
     /// Phase 6：由定时任务触发时带上 cron_id，worker 收尾时写回执行状态；
     /// 普通会话消息为 `None`。
     pub cron_id: Option<String>,
+    /// 热升级续跑：`Some` 时本轮不是用户消息，而是新进程恢复后继续原任务。
+    pub resume: Option<ResumeSpec>,
+}
+
+/// 热升级续跑规格。
+#[derive(Clone, Debug)]
+pub struct ResumeSpec {
+    /// 注入模型的「升级完成,继续原任务」通知。
+    pub notice: String,
+    /// 旧进程活跃计划 id(新进程从 `.claw/plans/<id>.json` 恢复)。
+    pub plan_id: Option<String>,
 }
 
 /// 已接受的排队结果：`position` 从 1 开始（第 1 位即最先执行）。
@@ -115,6 +130,8 @@ pub struct Enqueued {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnqueueError {
     QueueFull,
+    /// 会话正在热升级挂起中，重启完成前拒绝新 prompt。
+    UpgradePending,
     /// 僵死 worker 已达上限，拒绝继续接收新 prompt。
     OrphanLimit {
         active: usize,
@@ -366,6 +383,9 @@ impl Scheduler {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let slot = sessions.entry(session).or_default();
+        if slot.state == SessionState::Suspended {
+            return Err(EnqueueError::UpgradePending);
+        }
         if slot.queue.len() >= MAX_QUEUE_PER_SESSION {
             return Err(EnqueueError::QueueFull);
         }
@@ -397,6 +417,10 @@ impl Scheduler {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let slot = sessions.get_mut(session)?;
+        // 热升级挂起:不消费队列、不把状态改回 Idle(否则挂起标记丢失)。
+        if slot.state == SessionState::Suspended {
+            return None;
+        }
         let Some(job) = slot.queue.pop_front() else {
             slot.state = SessionState::Idle;
             slot.pending_head = false;
@@ -653,7 +677,9 @@ impl Scheduler {
             Some(slot) if !slot.queue.is_empty() => return false,
             Some(slot) => {
                 slot.worker_present = false;
-                slot.state = SessionState::Idle;
+                if slot.state != SessionState::Suspended {
+                    slot.state = SessionState::Idle;
+                }
             }
         }
         drop(sessions);
@@ -697,7 +723,7 @@ impl Scheduler {
         };
         SessionStatus {
             state: slot.state,
-            position: if slot.state == SessionState::Idle {
+            position: if matches!(slot.state, SessionState::Idle | SessionState::Suspended) {
                 0
             } else {
                 1
@@ -725,6 +751,48 @@ impl Scheduler {
         sessions.values().all(|slot| {
             slot.state == SessionState::Idle && slot.queue.is_empty() && !slot.pending_head
         })
+    }
+
+    /// 除指定会话外，是否全部空闲 —— Web 热升级协调线程的等待条件。
+    pub fn is_quiet_except(&self, session: &str) -> bool {
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sessions.iter().all(|(id, slot)| {
+            id == session
+                || (slot.state == SessionState::Idle && slot.queue.is_empty() && !slot.pending_head)
+        })
+    }
+
+    /// 热升级挂起：取出该会话待执行队列并标记 `Suspended`。
+    ///
+    /// 返回的排队项由调用方序列化进升级请求（P1 队列持久化），重启恢复后
+    /// 排在续跑任务之后重新入队；不持久化时直接丢弃即可。
+    pub fn mark_suspended(&self, session: &str) -> Vec<PromptJob> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = sessions.entry(session.to_string()).or_default();
+        let drained: Vec<PromptJob> = slot.queue.drain(..).collect();
+        slot.state = SessionState::Suspended;
+        slot.pending_head = false;
+        slot.signal = None;
+        drained
+    }
+
+    /// 取消挂起（放弃升级时）：仅 `Suspended` 回落到 `Idle`。
+    pub fn clear_suspended(&self, session: &str) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(slot) = sessions.get_mut(session) {
+            if slot.state == SessionState::Suspended {
+                slot.state = SessionState::Idle;
+            }
+        }
     }
 
     /// 中断：清空排队项并中止当前轮。
@@ -934,6 +1002,7 @@ mod tests {
             permission: runtime::PermissionMode::ReadOnly,
             model: None,
             cron_id: None,
+            resume: None,
         }
     }
 
@@ -1084,6 +1153,57 @@ mod tests {
             TurnOutcome::Done
         );
         assert!(scheduler.is_quiet());
+    }
+
+    /// 热升级挂起:拒绝新消息、不被 worker 误清回 idle,且等待条件只看其它会话。
+    #[test]
+    fn suspended_session_rejects_enqueue_and_keeps_state() {
+        let scheduler = Scheduler::new(ConcurrencyConfig {
+            global: 1,
+            per_workspace: 1,
+        });
+        scheduler.mark_suspended("s1");
+        assert_eq!(scheduler.status("s1").state, SessionState::Suspended);
+        assert_eq!(scheduler.status("s1").position, 0);
+        assert!(matches!(
+            scheduler.enqueue(job("s1", "blocked")),
+            Err(EnqueueError::UpgradePending)
+        ));
+        // take_next 不清除 Suspended(否则旧进程退出前会话会被误标 idle)。
+        assert!(scheduler.take_next("s1").is_none());
+        assert_eq!(scheduler.status("s1").state, SessionState::Suspended);
+        // 除本会话外全空闲 —— 升级协调线程可继续。
+        assert!(scheduler.is_quiet_except("s1"));
+
+        scheduler.clear_suspended("s1");
+        assert_eq!(scheduler.status("s1").state, SessionState::Idle);
+        assert!(scheduler.enqueue(job("s1", "ok")).is_ok());
+    }
+
+    /// P1 队列持久化：挂起时把排队中的用户消息交给调用方落盘。
+    #[test]
+    fn mark_suspended_returns_drained_queue_in_order() {
+        let scheduler = Scheduler::new(ConcurrencyConfig {
+            global: 1,
+            per_workspace: 1,
+        });
+        scheduler.enqueue(job("s1", "head")).expect("accepted");
+        let taken = scheduler.take_next("s1").expect("head taken");
+        assert!(scheduler.begin_turn("s1", taken.generation, Path::new(".")));
+        scheduler.enqueue(job("s1", "b")).expect("accepted");
+        scheduler.enqueue(job("s1", "c")).expect("accepted");
+
+        let drained = scheduler.mark_suspended("s1");
+        assert_eq!(
+            drained
+                .iter()
+                .map(|job| job.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "c"],
+            "挂起时应按原顺序交出排队消息"
+        );
+        assert_eq!(scheduler.status("s1").state, SessionState::Suspended);
+        assert_eq!(scheduler.queued_len("s1"), 0);
     }
 
     /// 幂等：第一次中断取走 signal 后本轮仍在收尾路上，重复点「停止」

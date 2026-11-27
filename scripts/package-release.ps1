@@ -39,8 +39,6 @@ if (Test-Path $package) { Remove-Item -Recurse -Force $package }
 New-Item -ItemType Directory -Force $package | Out-Null
 
 Copy-Item $exe $package
-$legacy = Join-Path $releaseDir "claw-plus.exe"
-if (Test-Path $legacy) { Copy-Item $legacy $package }
 
 $dll = Join-Path $releaseDir "onnxruntime.dll"
 if (-not (Test-Path $dll)) {

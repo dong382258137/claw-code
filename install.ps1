@@ -1,7 +1,7 @@
 ﻿# Claw Plus Windows one-click installer
 #
 # Mirrors install.sh (Unix): detect environment -> check Rust toolchain ->
-# build claw binaries -> deploy to ~/.cargo/bin (already on PATH) -> verify ->
+# build the claw binary -> deploy to ~/.cargo/bin (already on PATH) -> verify ->
 # guide API key setup.
 #
 # Usage (PowerShell, from repo root):
@@ -124,7 +124,7 @@ if ($MISSING.Count -gt 0) {
 # Step 3: build claw binaries
 # =========================================================
 Step "Building claw ($BUILD_PROFILE)"
-$CARGO_FLAGS = @('build', '-p', 'claw-server')
+$CARGO_FLAGS = @('build', '-p', 'claw-server', '--bin', 'claw')
 if ($BUILD_PROFILE -eq 'release') { $CARGO_FLAGS += '--release' }
 Info "Running: cargo $($CARGO_FLAGS -join ' ')"
 Info "First build may take a few minutes. Please wait..."
@@ -149,9 +149,10 @@ if (-not (Test-Path $DEPLOY_DIR)) {
     New-Item -ItemType Directory -Path $DEPLOY_DIR -Force | Out-Null
 }
 $BIN_SRC = Join-Path $RUST_DIR "target\$BUILD_PROFILE"
-# claw.exe / claw-plus.exe 是 cargo 产物；claw-web.exe 是 claw.exe 的入口副本，
-# 桌面快捷方式「CLAW Web UI」直接启动它，必须同步更新，否则快捷方式仍是旧版。
-$BINARIES = @('claw.exe', 'claw-plus.exe')
+# 只编译、只部署一个 claw.exe。claw-plus / claw-web 是历史兼容入口，
+# 部署时清理；桌面快捷方式统一指向 `claw.exe serve`。
+$BINARIES = @('claw.exe')
+$LEGACY_ENTRIES = @('claw-plus.exe', 'claw-web.exe')
 
 # 部署前停止占用目标文件的进程。
 # Windows 会锁定正在运行的 exe，直接覆盖可能失败或留下旧版本 —— 必须先停进程，
@@ -160,7 +161,7 @@ $PROCESS_NAMES = @('claw', 'claw-plus', 'claw-web')
 $RESTART_WEB = $false
 $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $PROCESS_NAMES -contains $_.ProcessName })
 if ($running.Count -gt 0) {
-    $RESTART_WEB = [bool]($running | Where-Object { $_.ProcessName -eq 'claw-web' })
+    $RESTART_WEB = $true
     foreach ($proc in $running) {
         Info "Stopping $($proc.ProcessName) (PID $($proc.Id)) to release file lock"
         try {
@@ -204,31 +205,47 @@ foreach ($bin in $BINARIES) {
         exit 1
     }
     Ok "Deployed $bin -> $DEPLOY_DIR"
-    if ($bin -eq 'claw.exe') {
-        $webDst = Join-Path $DEPLOY_DIR 'claw-web.exe'
+}
+
+# 清理历史兼容入口，避免旧版本从 claw-plus / claw-web 被启动。
+foreach ($legacy in $LEGACY_ENTRIES) {
+    $path = Join-Path $DEPLOY_DIR $legacy
+    if (Test-Path $path) {
         try {
-            Copy-Item -LiteralPath $src -Destination $webDst -Force -ErrorAction Stop
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+            Ok "Removed legacy entry $legacy"
         } catch {
-            Error2 "Failed to deploy claw-web.exe: $($_.Exception.Message)"
+            Error2 "Failed to remove legacy ${legacy}: $($_.Exception.Message)"
             exit 1
         }
-        $webHash = (Get-FileHash -LiteralPath $webDst -Algorithm SHA256).Hash
-        if ($srcHash -ne $webHash) {
-            Error2 "Deployed claw-web.exe hash mismatch (src=$srcHash dst=$webHash)"
-            exit 1
-        }
-        Ok "Deployed claw-web.exe -> $DEPLOY_DIR"
     }
 }
 
 if ($RESTART_WEB) {
     try {
-        Start-Process -FilePath (Join-Path $DEPLOY_DIR 'claw-web.exe') -WorkingDirectory $HOME -ErrorAction Stop
-        Ok "Restarted claw-web.exe"
+        Start-Process -FilePath (Join-Path $DEPLOY_DIR 'claw.exe') -ArgumentList 'serve' -WorkingDirectory $HOME -ErrorAction Stop
+        Ok "Restarted Web UI (claw.exe serve)"
     } catch {
-        Error2 "Failed to restart claw-web.exe: $($_.Exception.Message)"
+        Error2 "Failed to restart Web UI: $($_.Exception.Message)"
         exit 1
     }
+}
+
+# 桌面快捷方式：每次部署后重建，固定指向 claw.exe serve。
+$shortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'CLAW Web UI.lnk'
+try {
+    $shell = New-Object -ComObject WScript.Shell
+    $lnk = $shell.CreateShortcut($shortcutPath)
+    $lnk.TargetPath = Join-Path $DEPLOY_DIR 'claw.exe'
+    $lnk.Arguments = 'serve'
+    $lnk.WorkingDirectory = $HOME
+    $lnk.IconLocation = (Join-Path $DEPLOY_DIR 'claw.exe') + ',0'
+    $lnk.Description = 'CLAW Web UI'
+    $lnk.Save()
+    Ok "Desktop shortcut -> $shortcutPath"
+} catch {
+    Error2 "Failed to create desktop shortcut: $($_.Exception.Message)"
+    exit 1
 }
 Write-Host ""
 Info "If 'claw' is not on this terminal yet, open a new PowerShell window ($DEPLOY_DIR is on PATH)."
@@ -283,6 +300,6 @@ Write-Host ""
 Write-Host "${ColorGreen}Claw Plus installed successfully!${ColorReset}"
 Write-Host ""
 Write-Host "  Try these commands:"
-Write-Host "    ${ColorBold}claw${ColorReset}                  # interactive REPL"
-Write-Host "    ${ColorBold}claw prompt TEXT${ColorReset}      # one-shot prompt"
+Write-Host "    ${ColorBold}claw serve${ColorReset}          # start the Web UI"
+Write-Host "    ${ColorBold}claw --version${ColorReset}      # print build version"
 Write-Host ""
