@@ -116,7 +116,26 @@ fn preflight_unexecutable(command: &str) -> Option<String> {
         return None;
     }
 
-    // 3) 裸命令名：查 PATH。带路径分隔符的交给系统解析。
+    // 3) cmd.exe 内建命令：不在 PATH 中，但确实可执行。
+    //
+    // 2026-11-27 修复（我上一版引入的误判）：`cd rust && cargo test ...`
+    // 被误判为 "`cd` not found in PATH"，导致真实验证被静默跳过 ——
+    // 比假阴性更糟（验证根本没发生，却看起来像通过了）。
+    // cmd.exe 内建命令没有对应 .exe，PATH 查找必然失败，故必须先白名单放行。
+    #[cfg(windows)]
+    {
+        const CMD_BUILTINS: &[&str] = &[
+            "cd", "chdir", "cls", "copy", "date", "del", "dir", "echo", "erase", "exit", "for",
+            "goto", "if", "md", "mkdir", "move", "path", "pause", "popd", "prompt", "pushd", "rd",
+            "rem", "ren", "rename", "rmdir", "set", "setlocal", "shift", "start", "time", "title",
+            "type", "ver", "verify", "vol", "call", "break", "color",
+        ];
+        if CMD_BUILTINS.contains(&lower.as_str()) {
+            return None;
+        }
+    }
+
+    // 4) 裸命令名：查 PATH。带路径分隔符的交给系统解析。
     if !head.contains('/') && !head.contains('\\') && !resolves_in_path(head) {
         return Some(format!("`{head}` not found in PATH"));
     }
@@ -501,6 +520,32 @@ mod tests {
         // Should mention spawn failure or similar
         let rem = verdict.remediation.unwrap();
         assert!(rem.contains("Command:") || rem.contains("Error:"));
+    }
+
+    /// cmd.exe 内建命令（cd/set/echo…）不得被判为 unexecutable。
+    ///
+    /// 2026-11-27 回归：上一版预检只查 PATH，而 `cd` 是 cmd 内建、没有 .exe，
+    /// PATH 查找必然失败 → 把 `cd rust && cargo test ...` 误判为不可执行，
+    /// 真实验证被静默跳过（比假阴性更糟：验证没发生却看起来通过）。
+    #[test]
+    fn cmd_builtins_are_not_classified_unexecutable() {
+        let v = RuleVerifier::new();
+        // 用真实会成功的 cmd 内建组合，确认既非 unexecutable 也确实执行了。
+        let verdict = v.verify("output", "criteria", Some("cd . && exit 0"));
+        #[cfg(windows)]
+        {
+            assert!(
+                !verdict.is_unexecutable(),
+                "cd 是 cmd 内建，不得判为 unexecutable，实际: {}",
+                verdict.detail
+            );
+            assert!(verdict.passed, "`cd . && exit 0` 应真的执行并通过");
+        }
+        #[cfg(not(windows))]
+        {
+            // Unix 下 `cd` 由 sh 提供，同样不应误判。
+            assert!(!verdict.is_unexecutable(), "detail: {}", verdict.detail);
+        }
     }
 
     /// 平台无法执行的命令 → 标记为 unexecutable（由调用方转 Skipped），
