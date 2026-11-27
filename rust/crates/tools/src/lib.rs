@@ -13253,26 +13253,31 @@ mod tests {
         assert!(!matches.iter().any(|value| value == "WebSearch"));
         assert!(!matches.iter().any(|value| value == "WebFetch"));
 
-        let selected = execute_tool("ToolSearch", &json!({"query": "select:Agent,Skill"}))
-            .expect("ToolSearch should succeed");
+        let selected = execute_tool(
+            "ToolSearch",
+            &json!({"query": "select:WorkerCreate,CronCreate"}),
+        )
+        .expect("ToolSearch should succeed");
         let selected_output: serde_json::Value =
             serde_json::from_str(&selected).expect("valid json");
-        assert_eq!(selected_output["matches"][0], "Agent");
-        assert_eq!(selected_output["matches"][1], "Skill");
+        assert_eq!(selected_output["matches"][0], "WorkerCreate");
+        assert_eq!(selected_output["matches"][1], "CronCreate");
 
-        let aliased = execute_tool("ToolSearch", &json!({"query": "AgentTool"}))
+        let aliased = execute_tool("ToolSearch", &json!({"query": "WorkerCreateTool"}))
             .expect("ToolSearch should support tool aliases");
         let aliased_output: serde_json::Value = serde_json::from_str(&aliased).expect("valid json");
-        assert_eq!(aliased_output["matches"][0], "Agent");
-        assert_eq!(aliased_output["normalized_query"], "agent");
+        assert_eq!(aliased_output["matches"][0], "WorkerCreate");
+        assert_eq!(aliased_output["normalized_query"], "workercreate");
 
-        let selected_with_alias =
-            execute_tool("ToolSearch", &json!({"query": "select:AgentTool,Skill"}))
-                .expect("ToolSearch alias select should succeed");
+        let selected_with_alias = execute_tool(
+            "ToolSearch",
+            &json!({"query": "select:WorkerCreateTool,CronCreate"}),
+        )
+        .expect("ToolSearch alias select should succeed");
         let selected_with_alias_output: serde_json::Value =
             serde_json::from_str(&selected_with_alias).expect("valid json");
-        assert_eq!(selected_with_alias_output["matches"][0], "Agent");
-        assert_eq!(selected_with_alias_output["matches"][1], "Skill");
+        assert_eq!(selected_with_alias_output["matches"][0], "WorkerCreate");
+        assert_eq!(selected_with_alias_output["matches"][1], "CronCreate");
     }
 
     #[test]
