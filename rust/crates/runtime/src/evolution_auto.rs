@@ -285,6 +285,21 @@ fn run_test_gate(source_root: &Path) -> Option<String> {
     })
 }
 
+/// 跑一条**验收判据**命令，返回是否通过（`Ok(true)` = 通过）。
+///
+/// 与测试门共用「按空白切分 → 直接 exec」的策略（不经 shell，避免注入）。
+fn run_acceptance_command(source_root: &Path, cmd: &str) -> Result<bool, String> {
+    let mut parts = cmd.split_whitespace();
+    let prog = parts.next().ok_or_else(|| "空命令".to_string())?;
+    let args: Vec<&str> = parts.collect();
+    let status = crate::sandbox::quiet_command(prog)
+        .args(&args)
+        .current_dir(source_root)
+        .status()
+        .map_err(|e| format!("启动失败: {e}"))?;
+    Ok(status.success())
+}
+
 /// 单条提案的最大尝试次数。超过则移入 `quarantine/`,不再自动重试。
 ///
 /// **为什么必须有**: `run_pipeline` 取 inbox 排序后的第一条。若某条提案永远
@@ -402,6 +417,43 @@ pub fn run_pipeline(source_root: &Path) -> Result<String, String> {
     let parsed = crate::evolution_runner::parse_proposal(&text);
     let prompt = crate::evolution_runner::evolution_prompt(&proposal_path, &parsed);
 
+    // 0. 验收判据「修复前」基线：必须在当前代码上**不通过**。
+    //
+    //    **为什么必须有这一步**：验收判据是自动进化的唯一裁决依据。若不做
+    //    before 基线，一个恒真的命令（如 `cargo --version`、或一条修复前就
+    //    已经绿了的测试）会让任何改动都「验证通过」，闸门形同虚设。
+    //    语义：修复前不通过 = 缺陷可复现（或新测试尚不存在，等价于未通过）。
+    //
+    //    缺 acceptance 的提案直接拒绝部署：旧模板通道的产物（只有
+    //    iterations/elapsed 两个数字）正是因此无法验证，历史 21 条全部命中。
+    let Some(acceptance) = parsed
+        .acceptance
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    else {
+        let tag = note_failure(&inbox, &proposal_path);
+        return Err(format!(
+            "提案缺少「## 验收判据」段,无法验证修复是否成立,拒绝部署{tag}"
+        ));
+    };
+    match run_acceptance_command(source_root, acceptance) {
+        // 修复前已通过 → 判据无效（恒真），这条提案无法证明任何东西。
+        Ok(true) => {
+            let _ = quarantine_proposal(&inbox, &proposal_path);
+            return Err(format!(
+                "验收判据在修复前就已通过(`{acceptance}`),无法证明缺陷存在(已隔离)"
+            ));
+        }
+        // 修复前不通过 = 缺陷可复现，符合预期，继续。
+        Ok(false) => {}
+        // 命令本身跑不起来（程序不存在/语法错）→ 判据不可用，不消耗重试。
+        Err(e) => {
+            let _ = quarantine_proposal(&inbox, &proposal_path);
+            return Err(format!("验收判据无法执行(`{acceptance}`: {e}),已隔离"));
+        }
+    }
+
     // 1. 在源码根拉起 claw 子进程修复(继承其自身可执行文件, 不依赖 PATH)。
     let head_before = head_sha(source_root);
     let exe = std::env::current_exe().map_err(|e| format!("取当前 exe 失败: {e}"))?;
@@ -448,6 +500,27 @@ pub fn run_pipeline(source_root: &Path) -> Result<String, String> {
     if let Some(failed) = run_test_gate(source_root) {
         let tag = note_failure(&inbox, &proposal_path);
         return Err(format!("测试门未过(`{failed}`),拒绝部署{tag}"));
+    }
+
+    // 2.6 验收判据「修复后」复核：before 不通过 → after 必须通过。
+    //
+    //    与 2.5 的分工：测试门保证「没弄坏别的」，本步保证「真的修好了」。
+    //    二者缺一不可 —— 只跑测试门时，子智能体完全可以提交一个与缺陷无关
+    //    但能让全仓变绿的小改动（或干脆什么都不修就提交），照样被部署。
+    match run_acceptance_command(source_root, acceptance) {
+        Ok(true) => {}
+        Ok(false) => {
+            let tag = note_failure(&inbox, &proposal_path);
+            return Err(format!(
+                "验收判据修复后仍未通过(`{acceptance}`),修复无效,拒绝部署{tag}"
+            ));
+        }
+        Err(e) => {
+            let tag = note_failure(&inbox, &proposal_path);
+            return Err(format!(
+                "验收判据修复后无法执行(`{acceptance}`: {e}),拒绝部署{tag}"
+            ));
+        }
     }
 
     // 3. 自动部署到全局。失败则回滚,提案保留。

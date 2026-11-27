@@ -87,8 +87,42 @@ pub struct ParsedProposal {
     pub trigger: Option<String>,
     pub severity: Option<String>,
     pub category: Option<String>,
+    /// 验收判据（正文 `## 验收判据` 段的可执行命令）。
+    ///
+    /// 这是自动进化的**唯一裁决依据**：管道在部署前跑一次，不通过就不部署。
+    /// 缺此字段的提案（旧模板通道产物）不应被部署 —— 没有它无法判断
+    /// 「修好了没有」，只能盲改盲部署。
+    pub acceptance: Option<String>,
     /// 提案正文(去掉 front-matter)。
     pub body: String,
+}
+
+/// 从正文提取 `## 验收判据` 段（到下一个 `## ` 标题或文末）。
+///
+/// 只认这一种写法，因为 `render_proposal` 与 prompt 都按此格式产出；
+/// 宽松解析会让「正文里偶然出现的命令」被误当成判据执行。
+#[must_use]
+fn extract_acceptance_section(body: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut inside = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("## ") {
+            if inside {
+                break; // 下一段开始，判据段结束
+            }
+            if trimmed.contains("验收判据") {
+                inside = true;
+            }
+            continue;
+        }
+        if inside {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    let text = out.trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 /// 解析提案 markdown:提取 front-matter 的简单键值 + 正文。
@@ -132,12 +166,16 @@ pub fn parse_proposal(text: &str) -> ParsedProposal {
             body.push('\n');
         }
     }
+    let body = body.trim().to_string();
+    // 验收判据从正文 `## 验收判据` 段提取（渲染格式见 evolution_inbox::render_proposal）。
+    let acceptance = extract_acceptance_section(&body);
     ParsedProposal {
         id,
         trigger,
         severity,
         category,
-        body: body.trim().to_string(),
+        acceptance,
+        body,
     }
 }
 
@@ -188,6 +226,39 @@ pub fn evolution_prompt(proposal_path: &Path, proposal: &ParsedProposal) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_extracts_acceptance_section() {
+        // 与 render_proposal 产出格式一致：`## 验收判据` 段到下一个 `## ` 标题。
+        let text = "---\ntrigger: agent_reported\n---\n\n## 观察\n框架慢了\n\n## 证据\n- x\n\n## 验收判据\ncargo test -p runtime --lib convergence\n\n## 备注\n不应被当作判据\n";
+        let p = parse_proposal(text);
+        assert_eq!(
+            p.acceptance.as_deref(),
+            Some("cargo test -p runtime --lib convergence"),
+            "应只提取验收判据段，不含后续段落"
+        );
+    }
+
+    /// 缺 `## 验收判据` 段 → `None`。
+    ///
+    /// 这是旧模板通道（只写 iterations/elapsed）产物的特征，管道据此拒绝部署。
+    #[test]
+    fn parse_without_acceptance_section_yields_none() {
+        let text = "---\ntrigger: soft_threshold\n---\n\n## 观察\nturn 收尾命中廉价信号\n\n## 证据\n- iterations=64\n";
+        let p = parse_proposal(text);
+        assert!(
+            p.acceptance.is_none(),
+            "无验收判据段时必须为 None，否则管道会误判可验证"
+        );
+    }
+
+    /// 空段（只有标题没有内容）→ `None`，不能返回空串让管道当成"有判据"。
+    #[test]
+    fn parse_empty_acceptance_section_yields_none() {
+        let text = "## 观察\nx\n\n## 验收判据\n\n## 其它\ny\n";
+        let p = parse_proposal(text);
+        assert!(p.acceptance.is_none(), "空判据段应视为缺失");
+    }
 
     #[test]
     fn parse_extracts_front_matter_and_body() {
