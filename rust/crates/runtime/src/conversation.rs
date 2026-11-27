@@ -1925,6 +1925,18 @@ pub struct ConversationRuntime<C, T> {
     /// 证据路径 + 提案要求」一并交给模型，由模型判断是否调用
     /// `report_framework_gap`。用 `Cell` 是因为写入点持有 `&self`。
     pending_gap_hint: Cell<Option<String>>,
+    /// 本轮用户输入（证据包的「在做什么任务」）。
+    ///
+    /// **为什么需要**：自动通道已降级为纯采集，但此前只采集 iterations/elapsed
+    /// 两个数字 —— 模型据此无法判断「这是框架缺陷还是用户代码问题」，而这正是
+    /// 提案质量的唯一分水岭。用户原始诉求是判断的前提，故在 turn 起点留存。
+    /// 用 `Cell` 是因为写入点持有 `&self`。
+    turn_user_input: Cell<String>,
+    /// 本轮失败工具摘要（`工具名: 错误摘要`），供证据包「用了哪个工具、报什么错」。
+    ///
+    /// 由 `record_turn_completed` / `record_turn_failed` 在调用上报**之前**填充 ——
+    /// 只有那里拿得到 `tool_results`，而 `maybe_report_framework_gap` 只收信号。
+    turn_failed_tools: Cell<Vec<String>>,
     /// Harness V(验证)层:幻觉/偷懒信号扫描器。
     /// 在 PostToolUse hook 中对 write_file/edit_file 产物扫描占位标记
     /// (unimplemented!/placeholder/TODO),命中时以 warning 追加到 hook
@@ -2582,6 +2594,8 @@ where
             turn_punchback: false,
             last_gap_report_ms: Cell::new(0),
             pending_gap_hint: Cell::new(None),
+            turn_user_input: Cell::new(String::new()),
+            turn_failed_tools: Cell::new(Vec::new()),
             slop_scanner: SlopScanner::new(),
             slop_scan_enabled: feature_config.slop_scan().unwrap_or(true),
             completion_verifier: crate::completion_verifier::CompletionVerifier::new(),
@@ -4105,6 +4119,12 @@ where
         self.turn_start.set(Some(Instant::now()));
 
         self.record_turn_started(&user_input);
+
+        // 证据包「在做什么任务」：留存本 turn 用户原始诉求。
+        // 自动通道降级为纯采集后，模型需要它才能判断「是框架缺陷还是用户代码
+        // 问题」—— 这是提案质量的唯一分水岭，而 iterations/elapsed 无法提供。
+        self.turn_user_input.set(user_input.clone());
+        self.turn_failed_tools.set(Vec::new());
 
         // 收敛契约 · 打回率埋点(基线阶段,零 LLM):本 turn 的前置若存在 assistant
         // 收尾答复(即非会话首 turn),则对该 user 输入做打回判定并落盘会话级
@@ -9909,6 +9929,25 @@ where
                 })
             }));
 
+        // 证据包「用了哪个工具、报什么错」：只收失败项（成功的工具调用对
+        // 诊断框架缺陷没有信息量），并截断输出避免证据包膨胀。
+        self.turn_failed_tools.set(
+            summary
+                .tool_results
+                .iter()
+                .flat_map(|m| m.blocks.iter())
+                .filter_map(|b| match b {
+                    ContentBlock::ToolResult {
+                        tool_name,
+                        is_error,
+                        output,
+                        ..
+                    } if *is_error => Some(format!("{tool_name}: {}", truncate_str(output, 300))),
+                    _ => None,
+                })
+                .collect(),
+        );
+
         if let Some(session_tracer) = &self.session_tracer {
             let mut attributes = Map::new();
             attributes.insert(
@@ -10000,9 +10039,24 @@ where
             return;
         }
         self.last_gap_report_ms.set(now_ms);
+        // ── 证据包内容：回答「在做什么任务 / 用什么工具 / 碰到什么问题」──
+        // 只给 iterations/elapsed 两个数字时，模型无法判断「这是框架缺陷还是
+        // 用户代码问题」，提案质量必然为零（历史 21 条全命中）。三项事实缺一
+        // 不可，故依次写入：
+        //   1) 任务：本 turn 用户原始诉求（turn 起点留存）；
+        //   2) 工具：失败工具名 + 输出摘要（收尾时从 tool_results 提取）；
+        //   3) 问题：触发信号 + 失败原因（若为失败 turn）。
         let mut evidence = vec![format!(
             "turn: iterations={iterations} elapsed={elapsed_secs}s trigger={trigger}"
         )];
+        let user_task = self.turn_user_input.take();
+        if !user_task.trim().is_empty() {
+            evidence.push(format!("task: {}", truncate_str(&user_task, 300)));
+        }
+        let failed_tools = self.turn_failed_tools.take();
+        for item in &failed_tools {
+            evidence.push(format!("failed_tool: {item}"));
+        }
         if let Some(msg) = failure {
             evidence.push(format!("failure: {msg}"));
         }
