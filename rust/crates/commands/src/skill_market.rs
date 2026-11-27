@@ -2701,9 +2701,12 @@ mod tests {
         }
     }
 
-    /// 同一进程内改写 `CLAW_CONFIG_HOME` 的用例必须串行，否则并行时互相
-    /// 覆盖对方的环境变量，导致技能发现指向别人的临时目录。
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // 同一进程内改写 `CLAW_CONFIG_HOME` 的用例必须串行，否则并行时互相
+    // 覆盖对方的环境变量，导致技能发现指向别人的临时目录。
+    //
+    // 2026-11-27 修复：改用 crate 级共享锁 `crate::env_lock()`。此前这里是
+    // 一把**独立的** `static ENV_LOCK`，与 `lib.rs` 的 `env_lock()` 互不互斥，
+    // 两把锁守同一个环境变量等于没有串行化（详见 `lib.rs` 该函数的注释）。
 
     struct Fixture {
         _tmp: TempDir,
@@ -2959,7 +2962,7 @@ mod tests {
             ]),
         );
         let previous_config_home = std::env::var_os("CLAW_CONFIG_HOME");
-        let _env_lock = ENV_LOCK
+        let _env_lock = crate::env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config_home = fixture.paths.install_root.parent().expect("config home");
@@ -3238,7 +3241,7 @@ mod tests {
             .expect("config home")
             .to_path_buf();
         let previous = std::env::var_os("CLAW_CONFIG_HOME");
-        let _env_lock = ENV_LOCK
+        let _env_lock = crate::env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);

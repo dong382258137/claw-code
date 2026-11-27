@@ -16,6 +16,24 @@ pub mod plugin_market;
 /// 放在 `commands` 而不是 CLI crate，是为了让 `/skills install` 与 WebUI
 /// 市场安装共用**同一条**原子安装流水线，避免两套安装语义并存。
 pub mod skill_market;
+
+/// 测试专用：串行化所有改写 `CLAW_CONFIG_HOME` 的用例。
+///
+/// 2026-11-27 修复（并发隔离缺陷）：此前 `lib.rs` 的 `env_lock()` 与
+/// `skill_market.rs` 的 `static ENV_LOCK` 是**两把独立的锁**，却守同一个
+/// 进程级环境变量。两把锁彼此不互斥，并行测试仍会互相覆盖该变量，
+/// 使技能发现指向别人的临时目录 —— 表现为间歇失败：
+///   `MarketError { status: 404, message: "技能 demo 不存在" }`
+/// （对照组：在未含本修复的 base 提交上连跑 3 轮同样间歇失败）
+///
+/// 提升为 crate 级单例后，跨模块的改写才真正串行。
+/// 这同时消除对执行顺序/时序的依赖（铁律 I7）。
+#[cfg(test)]
+pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 pub use plugin_commands::{
     discover_plugin_commands, find_plugin_command, render_plugin_command, PluginCommand,
 };
@@ -5174,7 +5192,6 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -5185,13 +5202,8 @@ mod tests {
         std::env::temp_dir().join(format!("commands-plugin-{label}-{nanos}"))
     }
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        env_lock()
+        crate::env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
