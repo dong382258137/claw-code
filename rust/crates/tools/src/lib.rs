@@ -8943,6 +8943,10 @@ pub fn progressive_always_injected_tool_names() -> &'static [&'static str] {
         // 澄清出口:收敛契约允许「询问用户方向」,工具不可见会让模型
         // 只能自行猜测或空转。
         "AskUserQuestion",
+        // 热升级必须常驻:改完 claw 自身源码时,工具结果的
+        // `[hot-upgrade] / [hot-upgrade-debt]` 提示会直接要求模型调用它;
+        // 若被渐进模式延迟,模型看不到工具,只能回复"工具集里没有 HotUpgrade"。
+        "HotUpgrade",
         // ---- prompt 中以反引号**明确点名**的工具(2026-11-20 实测补齐) ----
         // 依据:对最新主会话请求体(system 33536 字符 + 尾部 6 条注入消息)
         // 统计"反引号点名的工具",以下 25 个被点名 1~7 次却不在旧核心集内。
@@ -11009,6 +11013,19 @@ mod tests {
         assert!(
             names.contains(&"plan_update".to_string()) || !available.contains("plan_update"),
             "plan_update 若可用则必须常驻: {names:?}"
+        );
+    }
+
+    /// HotUpgrade 必须常驻：改自身源码后的工具结果会直接要求调用它，
+    /// 被渐进模式延迟时模型只能回复"工具集里没有 HotUpgrade"。
+    #[test]
+    fn hot_upgrade_is_always_injected_not_deferred() {
+        assert!(progressive_always_injected_tool_names().contains(&"HotUpgrade"));
+        assert!(
+            !deferred_tool_specs()
+                .iter()
+                .any(|spec| spec.name == "HotUpgrade"),
+            "HotUpgrade 不应再出现在延迟集"
         );
     }
 

@@ -1220,8 +1220,13 @@ fn detect_os_version() -> Option<String> {
     }
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
+        // `claw serve` 经热升级后会以 DETACHED_PROCESS 重启（没有控制台），
+        // 这里若不带 CREATE_NO_WINDOW，每轮构造 provider 都会弹一个命令行窗口。
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let output = std::process::Command::new("cmd")
             .args(["/C", "ver"])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .ok()?;
         let text = String::from_utf8_lossy(&output.stdout);
