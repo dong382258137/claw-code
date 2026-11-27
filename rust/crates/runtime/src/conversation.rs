@@ -2901,6 +2901,14 @@ where
             coordinator.set_workspace_root(root.clone());
         }
         self.hook_runner.set_workspace(root.clone());
+        // 2026-11-27 修复:验证器必须在**工作区**而非进程 CWD 下执行 verify_command。
+        // VerifierAgent 由 app 层在构造 runtime 之前创建(此时拿不到 workspace),
+        // 而本方法在之后调用 —— 此前无人回填,导致 `cargo test` 在
+        // %TEMP%\claw-serve 下执行并报 "could not find Cargo.toml",计划步骤
+        // 被误判 failed(实测与 step_1 的 verify 失败信息逐字一致)。
+        if let Some(agent) = &mut self.verifier_agent {
+            agent.rule_verifier_mut().set_working_dir(root.clone());
+        }
         self.workspace_root = Some(root);
         self
     }
@@ -22860,6 +22868,55 @@ mod tests {
     }
 
     // ===== 计划面板不更新修复(2026-11-27):plan_update 必须能自磁盘恢复 =====
+
+    /// `with_workspace_root` 必须把工作区回填给验证器作为执行目录。
+    ///
+    /// 缺陷背景：`VerifierAgent` 由 app 层在构造 runtime **之前**创建
+    /// （app.rs:746），此时拿不到 workspace；`with_workspace_root` 之后才调用
+    /// （app.rs:1046）。此前无人回填，`verify_command` 于是在进程 CWD
+    /// （Web 服务是 `%TEMP%\claw-serve`）下执行 —— 实测 `cargo test` 报
+    /// `could not find Cargo.toml`，计划步骤被误判 failed。
+    #[test]
+    fn with_workspace_root_wires_verifier_working_dir() {
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        // 模拟 app.rs 的真实顺序：先注入验证器，再设工作区。
+        .with_verifier_agent(crate::verifier::VerifierAgent::new())
+        .with_workspace_root(tempdir.path().to_path_buf());
+
+        let dir = runtime
+            .verifier_agent
+            .as_ref()
+            .expect("verifier 已注入")
+            .rule_verifier()
+            .working_dir();
+        assert_eq!(
+            dir,
+            Some(tempdir.path()),
+            "验证器执行目录必须等于工作区，否则 cargo test 会在进程 CWD 下失败"
+        );
+    }
+
+    /// 未注入验证器时 `with_workspace_root` 不得 panic（纯单测常见路径）。
+    #[test]
+    fn with_workspace_root_without_verifier_does_not_panic() {
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tempdir.path().to_path_buf());
+        assert!(runtime.verifier_agent.is_none());
+    }
 
     /// 建一个带 `.claw/plans` 目录的临时工作区，写入指定计划。
     fn runtime_with_persisted_plan(

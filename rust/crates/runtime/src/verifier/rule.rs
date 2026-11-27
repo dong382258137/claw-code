@@ -195,6 +195,20 @@ impl RuleVerifier {
         self
     }
 
+    /// 可变版本：`&mut self` 设置工作目录。
+    ///
+    /// 用于运行期补注入 —— `VerifierAgent` 由 app 层在构造 `ConversationRuntime`
+    /// 之前创建，此时拿不到 workspace_root；而 `with_workspace_root` 在之后调用。
+    pub fn set_working_dir(&mut self, dir: impl Into<std::path::PathBuf>) {
+        self.working_dir = Some(dir.into());
+    }
+
+    /// 当前工作目录（诊断用）。
+    #[must_use]
+    pub fn working_dir(&self) -> Option<&std::path::Path> {
+        self.working_dir.as_deref()
+    }
+
     /// 验证 step — 执行 verify_command 检查 exit_code。
     ///
     /// # 参数
