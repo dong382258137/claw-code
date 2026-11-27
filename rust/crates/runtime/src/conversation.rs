@@ -3543,6 +3543,49 @@ where
         }
     }
 
+    /// 从 `.claw/plans` 扫描并恢复**最近一个未完成**的计划。
+    ///
+    /// 背景(2026-11-27 修复):进程重启/热升级后 `active_plan` 被初始化为
+    /// `None`,而此前的恢复入口只挂在 serve.rs 的断点续跑路径
+    /// (`job.resume.plan_id`)上。于是正常 turn 里 `plan_update` 静默 no-op,
+    /// Web 计划面板(`read_plan_artifacts` 只读磁盘)永远显示 Pending。
+    ///
+    /// "未完成"判定:phase 非 `Completed`,且至少有一个 step 不是
+    /// `Succeeded`/`Skipped`。按文件 mtime 取最新。
+    ///
+    /// 返回 `None` 表示无可恢复计划(目录缺失/全已完成/全部解析失败)——
+    /// 调用方应据此报错,而不是假装更新成功。
+    fn recover_most_recent_unfinished_plan(&self) -> Option<PlanArtifact> {
+        let root = self.workspace_root.as_ref()?;
+        let dir = root.join(".claw").join("plans");
+        let mut candidates: Vec<(u64, PlanArtifact)> = Vec::new();
+        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(plan) = crate::planner::load_plan_artifact(&path) else {
+                continue;
+            };
+            if plan.phase == crate::planner::PlanPhase::Completed {
+                continue;
+            }
+            let unfinished = plan.steps.iter().any(|s| {
+                !matches!(
+                    s.status,
+                    crate::planner::StepStatus::Succeeded | crate::planner::StepStatus::Skipped
+                )
+            });
+            if !unfinished {
+                continue;
+            }
+            // 用 created_at_ms 排序(比文件 mtime 更稳定,不受检出不触碰文件的影响)。
+            candidates.push((plan.created_at_ms, plan));
+        }
+        candidates.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
+        candidates.into_iter().next().map(|(_, plan)| plan)
+    }
+
     /// F5 计划文件集校验:若写入目标路径不在当前 active plan 涉及的文件集合内,
     /// 返回一条软警告文本;否则返回 `None`。`input` 是写工具调用入参的 JSON。
     ///
@@ -8538,11 +8581,29 @@ where
             .map_err(|e| format!("invalid plan_update input JSON: {e}"))?;
         // 先 clone verifier,避免与 active_plan 的可变借用冲突。
         let verifier = self.verifier_agent.clone();
+        // 2026-11-27 修复(计划面板不更新):active_plan 为 None 时先尝试从磁盘恢复。
+        //
+        // 背景:进程重启/热升级后 `active_plan` 被初始化为 None(见构造函数),
+        // 而唯一的恢复入口此前挂在 serve.rs 的断点续跑路径(`job.resume.plan_id`)。
+        // 正常 turn 里 plan_update 于是静默 no-op,而 Web 计划面板只读磁盘
+        // (`read_plan_artifacts`),导致步骤状态永远停在 Pending —— 调用方(LLM)
+        // 也因返回 Ok 而误以为更新成功,直接违反「不得假报完成」。
+        if self.active_plan.is_none() {
+            if let Some(plan) = self.recover_most_recent_unfinished_plan() {
+                self.emit_diag(format!(
+                    "[diag] plan_update: restored plan '{}' from disk (active_plan was None)",
+                    plan.id
+                ));
+                self.active_plan = Some(plan);
+            }
+        }
         let Some(plan) = self.active_plan.as_mut() else {
-            return Ok(
-                "plan_update: no active plan. A plan is only created for complex tasks \
-                 (>200 chars or matching planning keywords). No state changed."
-                    .to_string(),
+            // 无计划且无可恢复计划 → 必须返回 Err,不能静默 Ok。
+            return Err(
+                "plan_update: no active plan, and none recoverable from `.claw/plans` \
+                 (all plans are Completed or the directory is empty). \
+                 Create one with `create_plan` first. No state changed."
+                    .into(),
             );
         };
         // 规范化纯数字 step 引用("done: 1" → "done: step_1"),对齐 step.id。
@@ -22783,6 +22844,126 @@ mod tests {
         )
         .with_workspace_root(tempdir.path().to_path_buf());
         (runtime, tempdir)
+    }
+
+    // ===== 计划面板不更新修复(2026-11-27):plan_update 必须能自磁盘恢复 =====
+
+    /// 建一个带 `.claw/plans` 目录的临时工作区，写入指定计划。
+    fn runtime_with_persisted_plan(
+        plan: &crate::planner::artifact::PlanArtifact,
+    ) -> (
+        ConversationRuntime<NoopApi, StaticToolExecutor>,
+        tempfile::TempDir,
+    ) {
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        crate::planner::persist_plan_artifact(plan, tempdir.path()).expect("persist plan");
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tempdir.path().to_path_buf());
+        (runtime, tempdir)
+    }
+
+    /// active_plan 为 None（进程重启/热升级后的常态）但磁盘有未完成计划时，
+    /// plan_update 必须先恢复该计划再推进，并把新状态写回磁盘。
+    ///
+    /// 修复前：静默返回 Ok("no active plan")，步骤永远停在 Pending，
+    /// 而 Web 面板只读磁盘 → 面板永不更新。
+    #[test]
+    fn plan_update_recovers_unfinished_plan_from_disk() {
+        use crate::planner::artifact::{PlanArtifact, PlanStep};
+        use crate::planner::{load_plan_artifact, StepStatus};
+
+        let plan = PlanArtifact::new(
+            "磁盘恢复的任务",
+            vec![
+                PlanStep::new("step_1", "第一步", "通过"),
+                PlanStep::new("step_2", "第二步", "通过"),
+            ],
+        );
+        let (mut runtime, tempdir) = runtime_with_persisted_plan(&plan);
+        // 关键前置：内存态为空（模拟重启后状态）。
+        assert!(runtime.active_plan().is_none(), "前置条件:内存态无计划");
+
+        let out = runtime
+            .execute_plan_update(r#"{"update":"done: 1"}"#)
+            .expect("有可恢复计划时必须成功，而不是静默 no-op");
+        assert!(out.contains("plan_update applied"), "实际输出: {out}");
+
+        // 内存态已恢复并推进。
+        let restored = runtime.active_plan().expect("应已恢复计划");
+        assert_eq!(restored.id, plan.id);
+        assert_eq!(restored.steps[0].status, StepStatus::Succeeded);
+        assert_eq!(restored.steps[1].status, StepStatus::Pending);
+
+        // 磁盘已同步（面板读的就是这份）。
+        let path = tempdir
+            .path()
+            .join(".claw")
+            .join("plans")
+            .join(format!("{}.json", plan.id));
+        let on_disk = load_plan_artifact(&path).expect("磁盘计划应可解析");
+        assert_eq!(
+            on_disk.steps[0].status,
+            StepStatus::Succeeded,
+            "磁盘未同步则面板永远显示 Pending"
+        );
+    }
+
+    /// 无 active_plan 且磁盘无可恢复计划（目录为空）时，必须返回 Err。
+    ///
+    /// 修复前返回 Ok，调用方（LLM）无法区分「更新成功」与「根本没计划」，
+    /// 直接违反「不得假报完成」。
+    #[test]
+    fn plan_update_errors_when_no_recoverable_plan() {
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tempdir.path().to_path_buf());
+        assert!(runtime.active_plan().is_none());
+
+        let err = runtime
+            .execute_plan_update(r#"{"update":"done: 1"}"#)
+            .expect_err("无计划时必须报错，禁止静默 Ok");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no active plan"),
+            "错误信息应指明无计划: {msg}"
+        );
+        assert!(
+            msg.contains("create_plan"),
+            "错误信息应给出下一步指引: {msg}"
+        );
+    }
+
+    /// 全部计划已完成时不得被恢复（否则会把旧任务当当前任务续跑）。
+    #[test]
+    fn plan_update_does_not_recover_completed_plan() {
+        use crate::planner::artifact::{PlanArtifact, PlanPhase, PlanStep};
+
+        let mut plan = PlanArtifact::new(
+            "已完成的旧任务",
+            vec![PlanStep::new("step_1", "唯一一步", "通过")],
+        );
+        plan.steps[0].mark_succeeded();
+        plan.phase = PlanPhase::Completed;
+
+        let (mut runtime, _tmp) = runtime_with_persisted_plan(&plan);
+        assert!(runtime.active_plan().is_none());
+
+        let err = runtime
+            .execute_plan_update(r#"{"update":"done: 1"}"#)
+            .expect_err("已完成的计划不应被恢复");
+        assert!(err.to_string().contains("no active plan"));
     }
 
     /// 改动 claw 自身源码(工作区内 rust/crates 下的 .rs)→ 触发热升级提醒。
