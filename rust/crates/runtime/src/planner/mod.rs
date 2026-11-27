@@ -333,6 +333,10 @@ fn build_plan_generation_prompt(user_input: &str) -> String {
 fn platform_verify_hint() -> String {
     if cfg!(windows) {
         "- Target OS: Windows. verify_command runs via `cmd /C <command>` — NOT a POSIX shell.\n\
+         - verify_command runs with its working directory set to the WORKSPACE ROOT. \
+         If the build manifest or script is not at the root (e.g. Cargo.toml lives in `rust/`), \
+         prefix the command accordingly: `cd rust && cargo test -p runtime --lib <filter>` \
+         or use `cargo test --manifest-path rust/Cargo.toml <filter>`.\n\
          - Do NOT use POSIX-only shell builtins: `test`, `[`, `[[`, `export`, `source`, \
          `unset`, `alias`, `declare`, `local`, `trap`, `umask`. They do not exist in cmd.exe.\n\
          - Do NOT reference `.sh` / bash scripts. Only use scripts that exist in this repo \
@@ -347,6 +351,10 @@ fn platform_verify_hint() -> String {
             .to_string()
     } else {
         "- Target OS: Unix-like. verify_command runs via `sh -c <command>`.\n\
+         - verify_command runs with its working directory set to the WORKSPACE ROOT. \
+         If the build manifest or script is not at the root (e.g. Cargo.toml lives in `rust/`), \
+         prefix the command accordingly: `cd rust && cargo test -p runtime --lib <filter>` \
+         or use `cargo test --manifest-path rust/Cargo.toml <filter>`.\n\
          - POSIX shell builtins and pipes/redirection are available.\n\
          - Prefer cross-platform commands: `cargo test -p <crate>`, \
          `cargo clippy --workspace -- -D warnings`, `git diff --check`.\n\
