@@ -135,8 +135,8 @@ pub(crate) struct AnthropicRuntimeClient {
     /// 服务端 prefix cache 命中率下降检测器。
     ///
     /// 每次请求记录 prompt 指纹,与上次对比,命中率下降超过阈值时触发 break event。
-    /// 持久化到 `~/.claude/cache/prompt-cache/<session>/stats.json`,供
-    /// `claw doctor --cache-stats` 诊断。不缓存响应(只做检测)。
+    /// 持久化到 `~/.claude/cache/prompt-cache/<session>/stats.json`,结果经
+    /// Web 端会话统计面板展示。不缓存响应(只做检测)。
     cache_break_detector: api::CacheBreakDetector,
     /// 子智能体请求的独立缓存统计 session(`subagent-{session_id}`)。
     ///
@@ -469,7 +469,7 @@ impl ApiClient for AnthropicRuntimeClient {
 
         // P0-1 Pre-flight Guard:请求发出前断言静态前缀不变式。
         // 检测到 model/静态 system/tools 指纹漂移时,原因已计入 detector stats
-        // (`claw doctor --cache-stats` 可见),此处不改变请求行为、不新增 UI 输出。
+        // (Web 端会话统计面板可见),此处不改变请求行为、不新增 UI 输出。
         let _ = self.cache_break_detector.note_request(&message_request);
 
         // 请求分歧探针:wire 层消息级指纹 + 轮边界成对请求体落盘(仅 Main 请求)。

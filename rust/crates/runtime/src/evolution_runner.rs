@@ -35,9 +35,25 @@ pub const FORBIDDEN_PATH_FRAGMENTS: &[&str] = &[
 ];
 
 /// 测试门:cargo 命令(必须全过才允许提交)。
+///
+/// 三项缺一不可,对应 BLUEPRINT 铁律 I8 的交付基线
+/// (`cargo clippy --workspace --all-targets -- -D warnings` 与
+/// `scripts/fmt.sh --check` 全绿方可提交):
+///
+/// - `cargo test --workspace`:行为不回退;
+/// - `cargo clippy ... -D warnings`:静态问题不得被自动部署进生产 ——
+///   此前门禁只有 test + fmt,自动进化可以带着 clippy 错误上线,而人工
+///   提交却必须过 clippy,两条路径的交付标准不一致;
+/// - `cargo fmt --check`:格式与仓库一致。
+///
+/// 注意 `run_test_gate` 按空白切分命令串,故此处不可使用 shell 引号或管道。
 #[must_use]
 pub fn test_gate_commands() -> Vec<&'static str> {
-    vec!["cargo test --workspace", "cargo fmt --check"]
+    vec![
+        "cargo test --workspace",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo fmt --check",
+    ]
 }
 
 /// 自动闸门:校验本次进化改动的文件列表是否触碰黑名单。

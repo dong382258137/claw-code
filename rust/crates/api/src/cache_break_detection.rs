@@ -5,7 +5,10 @@
 //! DeepSeek 服务端 prefix cache 通过 `prompt_cache_hit_tokens` /
 //! `prompt_cache_miss_tokens` 字段在每次 API 响应中返回命中信息。
 //! 本模块**不缓存响应**(那是客户端 completion cache 的职责,已废弃),
-//! 只做**命中率下降检测与原因分类**,供 `claw doctor --cache-stats` 诊断。
+//! 只做**命中率下降检测与原因分类**,结果供 Web 端会话统计面板展示
+//! (`/api/session/*/stats` 的 `cache_hit_pct`,前端 `Composer.jsx` 渲染)。
+//! 注:`claw doctor --cache-stats` 自 Phase 3 起已随 CLI 界面一并移除,
+//! 不再存在该入口。
 //!
 //! ## 工作原理
 //!
@@ -252,8 +255,8 @@ impl CacheBreakDetector {
     ///
     /// 在请求**发出前**调用:比对上一轮 model / 静态 system / tools 指纹。
     /// 若静态前缀意外漂移(未来代码把动态值写进静态区、工具定义中途变化),
-    /// 返回漂移原因并累加 `break_reasons.prefix_drifted` 计数(供
-    /// `claw doctor --cache-stats` 诊断),不触发任何请求侧行为变更。
+    /// 返回漂移原因并累加 `break_reasons.prefix_drifted` 计数(供 Web 端
+    /// 会话统计面板展示),不触发任何请求侧行为变更。
     ///
     /// `messages` 数组增长不参与比对(多轮/tool-loop 预期行为)。
     /// 独立维护 `previous_request_side` 状态槽,与响应侧 `record_usage`
@@ -360,7 +363,7 @@ impl CacheBreakDetector {
 //      "轮边界缓存整段失效"(实测:轮首请求 read 回落到仅系统前缀)。
 //
 // 与 [`CacheBreakDetector`] 的关系:detector 只做整指纹命中率下降检测+分类
-// (`claw doctor --cache-stats`);probe 补充"分叉位置 + 请求体证据"。二者
+// (结果经 Web 端会话统计面板展示);probe 补充"分叉位置 + 请求体证据"。二者
 // 独立持久化,互不修改对方状态文件。
 //
 // 存储(沿用 detector 的 session 目录,见 [`CacheBreakPaths`]):

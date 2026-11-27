@@ -1331,6 +1331,8 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         spawn_upgrade_resume(state.clone());
         // P0:周期性排空进化 inbox 存量(积压提案的唯一消费者)。
         spawn_evolution_drain(state.clone());
+        // P0:消费 `.deployed` 标记,让「已部署的新二进制」真正接管运行进程。
+        spawn_deploy_watcher(state.clone());
         // Phase 6:进程内 tick 线程,扫描各工作区到期的定时任务并入队。
         cron_runner::spawn_cron_runner(state.clone());
         // Phase 8:启动时只探测语义检索可用性（检查 onnxruntime.dll），
@@ -2281,31 +2283,95 @@ struct SessionWorker {
 /// 冷却/锁/递归三道防护都在 `spawn_pipeline_detached` 内部，本线程只负责
 /// 「定期敲门」，不重复实现门控。
 ///
-/// **默认关闭（显式 opt-in）**：开启后每消耗一条提案，都会触发
-/// 「LLM 改源码 → `cargo test --workspace` 测试门 → 通过则 `install_binary`
-/// 覆盖运行中的 exe」。这是**无人复核的自动部署**，不应作为某次重启的
-/// 附带副作用被悄悄打开 —— 尤其当 inbox 已有大量积压时，启动瞬间就会
-/// 连跑多轮。故要求显式设置 `CLAW_EVOLUTION_DRAIN_SECS=<秒>` 才启用。
+/// **默认开启，但以「调度器空闲」为安全闸**：BLUEPRINT §5 的 P0 目标是
+/// 「inbox → 修复 → 测试门 → 部署，全程无人工中转」，因此不应默认关闭。
+/// 但每消耗一条提案都会跑一轮 `cargo test --workspace` + `cargo build
+/// --release`，若在用户正跑 turn 时启动会抢 CPU/IO 且放大超时风险。
+/// 故本线程只在 `scheduler.is_quiet()` 时敲门，有活跃 turn 就跳过本周期。
 ///
-/// 需要启用时（例如已人工审过积压内容）：
-/// `CLAW_EVOLUTION_DRAIN_SECS=600` 后重启 serve。
+/// 间隔由 `CLAW_EVOLUTION_DRAIN_SECS` 覆盖（默认 600s，`0` = 彻底禁用）。
 fn spawn_evolution_drain(state: AppState) {
-    let Some(interval_secs) = std::env::var("CLAW_EVOLUTION_DRAIN_SECS")
+    let interval_secs = std::env::var("CLAW_EVOLUTION_DRAIN_SECS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
-    else {
-        return;
-    };
+        .unwrap_or(600);
     if interval_secs == 0 {
         return;
     }
     std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(interval_secs));
+        // 空闲才动手：不打断用户正在进行的 turn（构建会吃满 CPU/IO）。
+        if !state.scheduler.is_quiet() {
+            continue;
+        }
         // 失败静默：未登记源码根 / 锁被持有 / 冷却未到都是正常路径，
         // 不属于需要打扰用户的错误。
         let _ = runtime::evolution_auto::spawn_pipeline_detached(&state.workspace);
-        std::thread::sleep(Duration::from_secs(interval_secs));
     });
 }
+
+/// 部署标记 `.deployed` 的消费端：把「新二进制已就位」变成「运行进程已切换」。
+///
+/// **为什么需要**：进化管道成功后会 `install_binary` 覆盖运行路径上的 exe
+/// 并落 `.deployed` 标记，但**正在运行的 serve 仍是旧镜像**。没有消费端时，
+/// 自动进化的最后一段（部署 → 生效）是开环：磁盘上换了新版本，用户手里的
+/// 进程却永远停在旧版本，直到下次手工重启。
+///
+/// **为什么不无条件重启**：本进程可能正在跑用户的 turn（构建/重启会中断它）。
+/// 故沿用与 drain 相同的安全闸 —— 只在 `scheduler.is_quiet()` 时消费标记并
+/// 触发既有热升级链路；有活跃 turn 时保留标记，下个周期再试。
+fn spawn_deploy_watcher(state: AppState) {
+    let Some(source_root) = runtime::source_root::resolve_source_root() else {
+        return;
+    };
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(30));
+        // 只读检查：未到安全时机就不消费，标记留在原地等下一轮。
+        if runtime::evolution_auto::read_deploy_marker(&source_root).is_none() {
+            continue;
+        }
+        if !state.scheduler.is_quiet() {
+            continue;
+        }
+        // 先消费再动作：即使重启失败也不会陷入无限重启循环。
+        let Some(stamp) = runtime::evolution_auto::take_deploy_marker(&source_root) else {
+            continue;
+        };
+        let request = crate::session_mgr::UpgradeRequest {
+            session_id: DEPLOY_WATCHER_SESSION.to_string(),
+            plan_id: None,
+            requested_at_ms: runtime::evolution_auto::now_ms(),
+            from_version: crate::version_label(),
+            old_pid: std::process::id(),
+            web_port: Some(state.port),
+            web_token: Some(state.token.clone()),
+            session_path: None,
+            workspace: Some(state.workspace.to_string_lossy().to_string()),
+            permission: None,
+            model: None,
+            suspended_tool_use_id: None,
+            suspended_tool_name: None,
+            pending_after: Vec::new(),
+            phase: Some(crate::session_mgr::UpgradePhase::Suspended),
+            queued_prompts: Vec::new(),
+        };
+        let workspace = state.workspace.clone();
+        if let Err(error) = crate::session_mgr::write_upgrade_request(&workspace, &request) {
+            // 写请求失败：把标记放回去，下轮重试（否则这次部署永远丢失）。
+            runtime::evolution_auto::write_deploy_marker(&source_root, stamp);
+            eprintln!("[deploy-watcher] 写入升级请求失败: {error}");
+            continue;
+        }
+        eprintln!(
+            "[deploy-watcher] 检测到已部署的新版本（标记 {}），空闲，触发热升级接管",
+            stamp
+        );
+        spawn_upgrade_coordinator(state.clone(), request);
+    });
+}
+
+/// 部署监听线程使用的伪会话 id（不属于任何真实会话，故不阻塞 `is_quiet_except`）。
+const DEPLOY_WATCHER_SESSION: &str = "__deploy_watcher__";
 
 /// 会话级看门狗：一个后台线程扫描所有在跑的会话，替代「每 turn 一个
 /// sleep 线程」的旧实现。语义保持不变：超过阈值没有任何流式事件就发
