@@ -188,6 +188,9 @@ fn run_helper_flow(
     let expected_old_pid = read_upgrade_request(user_cwd).map(|req| req.old_pid);
     if web_request.is_none() {
         wait_for_exited(user_cwd, expected_old_pid, &log_file)?;
+        // 同 Web 路径：标记 ≠ 进程已死。CLI 路径虽无端口可抢，但旧进程若
+        // 仍持有 exe 与工作区状态，迁移后会出现两个进程并存。这里一并确认。
+        ensure_old_process_gone(expected_old_pid, None, &log_file);
         log_out(&log_file, "[upgrade-helper] 旧进程已退出,开始迁移");
     } else {
         log_out(
@@ -417,6 +420,11 @@ fn run_helper_flow(
         }
         // 旧进程读到结果（或收到 commit）后写 exited 标记并退出。
         wait_for_exited(user_cwd, Some(request.old_pid), &log_file)?;
+        // 标记 ≠ 进程已死。旧进程可能写了标记却未真正退出（卡在析构、
+        // 被挂起的会话线程、或子进程继承了监听 socket），此时若直接启动
+        // 新进程，旧进程会变成孤儿继续占着端口，新进程 bind 失败退回随机
+        // 端口，已打开的页面失联。这里强制确认它真的消失了。
+        ensure_old_process_gone(Some(request.old_pid), Some(port), &log_file);
     }
 
     // 4. 启动新 exe(user_cwd 为工作目录 → 自动检测标记 → resume 会话)。
@@ -758,6 +766,214 @@ fn wait_for_exited(
             return Err(message.into());
         }
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// 确认旧进程**真的**消失了；仍存活则强制终止，再确认端口释放。
+///
+/// **为什么必须有**:`wait_for_exited` 只信任旧进程写下的文件标记,从不验证
+/// 该进程是否真的消失。一旦旧进程写了标记却因故未退出(卡在析构、被挂起的
+/// 会话线程、或子进程继承了监听 socket),helper 仍会照常启动新进程,于是:
+///
+/// - 旧进程成为**孤儿**,继续占着端口与内存;
+/// - 新进程 bind 失败 → 退回随机端口,已打开的页面失联;
+/// - 最坏情况两个进程同时活着,对同一工作区各写一份状态。
+///
+/// 实测症状:4317 上残留一个 3.5 小时前启动的孤儿 serve,而当时的新进程被
+/// 挤到 58014,日志里却只有"Web 服务已重启: port=4317"的成功记录 —— 因为
+/// helper 根本没检查过旧进程是否还在。
+///
+/// 这里补上"标记 ≠ 进程已死"这一课:先给一个短暂宽限期让正常退出完成,
+/// 之后仍存活就强制终止进程树,确保新进程能拿到原端口。
+fn ensure_old_process_gone(old_pid: Option<u32>, port: Option<u16>, log_file: &Option<File>) {
+    let Some(pid) = old_pid.filter(|p| *p != 0) else {
+        return;
+    };
+    // 宽限期:正常退出路径在写完标记后约 300ms 内 exit(0),
+    // 给 2s 避免把"正在优雅退出"误判为"卡死"而强杀。
+    let grace = Instant::now();
+    while grace.elapsed() < Duration::from_secs(2) {
+        if !process_is_alive(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // ⚠ PID 复用防护：旧进程可能早已退出，而系统把同一个 PID 分配给了
+    // 无关进程。此时只凭"PID 存活"就去 kill，会误杀无辜进程。
+    // 必须确认该 PID 当前的映像名仍是 claw，才允许强制终止。
+    if !process_is_claw(pid) {
+        log_out(
+            log_file,
+            &format!("[upgrade-helper] pid={pid} 存活但已不是 claw（PID 复用），跳过强制终止"),
+        );
+        return;
+    }
+    log_out(
+        log_file,
+        &format!(
+            "[upgrade-helper] 旧进程 pid={pid} 已写退出标记但仍在运行，强制终止（否则新进程无法接管端口）"
+        ),
+    );
+    kill_process_tree(pid);
+    // 终止后等它真正消失,再等端口释放,避免新进程 bind 抢跑。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if !process_is_alive(pid) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if let Some(port) = port {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if !port_is_listening(port) {
+                log_out(
+                    log_file,
+                    &format!("[upgrade-helper] 端口 {port} 已释放，可安全接管"),
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        log_out(
+            log_file,
+            &format!("[upgrade-helper] 端口 {port} 仍被占用，新进程可能退回随机端口"),
+        );
+    }
+}
+
+/// 进程是否仍存活。
+///
+/// 用 `tasklist`/`kill -0` 而非 Win32 FFI:`claw-server` 未声明 `windows-sys`
+/// 依赖,为一次存活检查引入平台 FFI 不划算,且子进程方式跨平台一致。
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let output = runtime::sandbox::quiet_command("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output();
+        match output {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                // 无匹配时 tasklist 输出固定提示 "INFO: No tasks..."(本地化会变),
+                // 因此改判"是否出现该 PID 的 CSV 行"更稳:CSV 首字段是映像名,
+                // 第二字段是 PID。
+                text.lines().any(|line| {
+                    line.split(',')
+                        .nth(1)
+                        .map(|field| field.trim_matches('"') == pid.to_string())
+                        .unwrap_or(false)
+                })
+            }
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
+/// 该 PID 当前的映像名是否仍是 claw。
+///
+/// **为什么必须有**：`ensure_old_process_gone` 会强制终止 `old_pid`。但旧进程
+/// 可能早已退出，而系统会**复用 PID** —— 此时同一 PID 属于某个无关进程，
+/// 仅凭"PID 存活"就 kill 会误杀用户正在用的程序。强制终止前必须确认它还是
+/// 本产品（`claw.exe` / `claw-web.exe` / `claw-plus.exe` 均为本产品映像）。
+///
+/// 查询失败（进程刚好退出、tasklist/ps 不可用）时返回 `false`：
+/// 宁可少杀一次（新进程退回随机端口，用户手动切 URL），也不误杀无关进程。
+fn process_is_claw(pid: u32) -> bool {
+    let Some(image) = process_image_name(pid) else {
+        return false;
+    };
+    let image = image.trim().to_ascii_lowercase();
+    // 取文件名主干再比较，避免路径里恰好含 "claw" 的无关进程被误判。
+    let stem = image
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(image.as_str())
+        .trim_end_matches(".exe");
+    stem.starts_with("claw")
+}
+
+/// 查询 PID 的映像名。
+///
+/// Windows 用 `tasklist /FO CSV /NH`（首字段为映像名、次字段为 PID）；
+/// Unix 用 `ps -o comm=`。两者都不依赖额外 crate —— `claw-server` 未声明
+/// `windows-sys`，为一次存活检查引入平台 FFI 不划算。
+fn process_image_name(pid: u32) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let output = runtime::sandbox::quiet_command("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        // 无匹配时 tasklist 打印本地化的 "INFO: No tasks..." 提示，
+        // 因此不判提示文本，而是找"第二字段等于该 PID"的 CSV 行。
+        text.lines().find_map(|line| {
+            let mut fields = line.split(',');
+            let image = fields.next()?.trim_matches('"').trim();
+            let got_pid = fields.next()?.trim_matches('"').trim();
+            (got_pid == pid.to_string() && !image.is_empty()).then(|| image.to_string())
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let output = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+}
+
+/// 本机端口是否仍处于监听状态。
+fn port_is_listening(port: u16) -> bool {
+    use std::net::{SocketAddr, TcpListener};
+    // 能 bind 成功 = 已释放;bind 失败 = 仍被占用。
+    // 不用 connect 探测:旧进程可能监听但暂时不 accept。
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    match TcpListener::bind(addr) {
+        Ok(listener) => {
+            drop(listener);
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+/// 终止进程树(尽力而为,失败不影响后续启动尝试)。
+fn kill_process_tree(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = runtime::sandbox::quiet_command("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -1313,5 +1529,47 @@ mod tests {
         let built = resolve_built_product(dir.path(), "release", "claw-web.exe")
             .expect("应回退到 claw.exe");
         assert_eq!(built, release.join("claw.exe"));
+    }
+
+    // ---- 2026-11-27 旧进程未退出导致端口交接失败 ----
+
+    /// 当前进程必然存活 —— 存活检测不能把活进程判死（否则会误杀自己）。
+    #[test]
+    fn process_is_alive_detects_self() {
+        assert!(
+            process_is_alive(std::process::id()),
+            "自身 PID 必须判为存活"
+        );
+    }
+
+    /// 不存在的 PID 必须判为已死 —— 这是"旧进程是否真的退出"的判据。
+    /// 用 `u32::MAX` 而非随机小 PID：Windows 的 PID 是 4 的倍数且远小于
+    /// 该值，不会误命中真实进程。
+    #[test]
+    fn process_is_alive_rejects_impossible_pid() {
+        assert!(!process_is_alive(u32::MAX), "不存在的 PID 必须判为已死");
+    }
+
+    /// 端口占用探测：自己绑上就是"被占用"，释放后就是"已释放"。
+    /// 不依赖固定端口号，由系统分配，避免与真实服务冲突。
+    #[test]
+    fn port_is_listening_tracks_bind_state() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(port_is_listening(port), "自己绑定的端口应判为被占用");
+        drop(listener);
+        // 关闭后可能短暂处于 TIME_WAIT，但 TcpListener::bind 用 SO_REUSEADDR
+        // 语义在 Windows 上会立刻成功，故无需重试循环。
+        assert!(!port_is_listening(port), "已释放的端口应判为可用");
+    }
+
+    /// `old_pid` 缺失/为 0 时必须直接返回，不做任何探测。
+    /// 旧标记（升级前写入、无 old_pid 字段）会让这里为 None，若误判成
+    /// "进程存活"就会去 kill PID 0（Windows 上等价于终止空闲进程组）。
+    #[test]
+    fn ensure_old_process_gone_is_noop_without_pid() {
+        // 无日志文件句柄：仅验证不 panic、不阻塞。
+        ensure_old_process_gone(None, Some(1), &None);
+        ensure_old_process_gone(Some(0), Some(1), &None);
     }
 }
