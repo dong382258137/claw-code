@@ -9942,7 +9942,16 @@ where
                         is_error,
                         output,
                         ..
-                    } if *is_error => Some(format!("{tool_name}: {}", truncate_str(output, 300))),
+                    } if *is_error => {
+                        let body = truncate_str(output, 300);
+                        // 工具输出常已自带前缀（如 `read_file: path ... does not exist`），
+                        // 直接再拼一次会得到 `read_file: read_file: ...`。去重后更易读。
+                        let body = body
+                            .strip_prefix(&format!("{tool_name}: "))
+                            .unwrap_or(&body)
+                            .to_string();
+                        Some(format!("{tool_name}: {body}"))
+                    }
                     _ => None,
                 })
                 .collect(),
