@@ -16002,6 +16002,10 @@ mod skill_toggle_tests {
     /// 返回 unknown，而不是继续返回正文。
     #[test]
     fn disabled_skill_loads_as_unknown() {
+        // 2026-11-27: 必须持 env_guard —— 本测试改写进程级 CLAW_CONFIG_HOME，
+        // 与其它改写该变量的测试（含 powershell_* 改写 PATH）并行时互相污染。
+        // 此前不持锁，全量并行时报「禁用后按名加载必须失败」但实际加载成功。
+        let _guard = super::tests::env_guard();
         let root = std::env::temp_dir().join(format!("claw-skill-toggle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let workspace = root.join("workspace");
