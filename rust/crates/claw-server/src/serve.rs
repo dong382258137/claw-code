@@ -7145,6 +7145,63 @@ fn open_browser(url: &str) {
 mod tests {
     use super::*;
 
+    /// plan_update 写出的计划文件必须能被面板读取路径正确解析。
+    ///
+    /// 缺陷背景(2026-11-27):面板 `read_plan_artifacts` 只读磁盘,而
+    /// `plan_update` 在 `active_plan` 为 None 时静默 no-op,导致磁盘从不更新、
+    /// 面板永远显示 Pending。修复后写路径已同步磁盘,本测试锁定「写→读」契约:
+    /// 磁盘上 Rust 枚举名(`Succeeded`)必须被 `normalize_plan_status` 归一为
+    /// 前端使用的 `done`。
+    #[test]
+    fn plan_written_to_disk_is_visible_to_plan_panel() {
+        use runtime::planner::artifact::{PlanArtifact, PlanPhase, PlanStep};
+
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let mut plan = PlanArtifact::new(
+            "面板可见性验证",
+            vec![
+                PlanStep::new("step_1", "第一步", "通过"),
+                PlanStep::new("step_2", "第二步", "通过"),
+            ],
+        );
+        plan.steps[0].mark_succeeded();
+        plan.phase = PlanPhase::Executing;
+        runtime::planner::persist_plan_artifact(&plan, tmp.path()).expect("persist plan");
+
+        // 面板读取路径：扫描目录 → 取 plan 值 → 展开步骤。
+        let plans = read_plan_artifacts(tmp.path());
+        assert_eq!(plans.len(), 1, "面板应看到 1 个计划");
+        let artifact = &plans[0]["plan"];
+        let steps = plan_steps_from_artifact(artifact);
+
+        assert_eq!(steps.len(), 2, "两个步骤都应出现在面板数据中");
+        assert_eq!(steps[0]["id"], "step_1");
+        // 磁盘存的是 Rust 枚举名 Succeeded，面板须归一为 done。
+        assert_eq!(
+            steps[0]["status"], "done",
+            "磁盘枚举名 Succeeded 必须归一为 done，否则面板显示不出完成状态"
+        );
+        assert_eq!(steps[1]["status"], "pending");
+        assert_eq!(steps[1]["description"], "第二步");
+    }
+
+    /// 状态归一化必须覆盖 Rust 枚举名与历史 TodoWrite 两套写法。
+    #[test]
+    fn normalize_plan_status_accepts_artifact_enum_names() {
+        for (raw, want) in [
+            ("Pending", "pending"),
+            ("Executing", "executing"),
+            ("Succeeded", "done"),
+            ("Failed", "failed"),
+            ("Skipped", "skipped"),
+            // 历史 TodoWrite 写法仍需兼容。
+            ("in_progress", "executing"),
+            ("completed", "done"),
+        ] {
+            assert_eq!(normalize_plan_status(raw), want, "raw={raw}");
+        }
+    }
+
     #[test]
     fn permission_key_round_trips_through_parser() {
         for (mode, key) in [
