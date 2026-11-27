@@ -61,6 +61,8 @@ pub struct TraeClient {
     http: reqwest::Client,
     base_url: String,
     access_token: String,
+    /// JWT `exp`（毫秒）。None 表示令牌不透明或解析失败，由上层按短 TTL 缓存。
+    expires_at_ms: Option<u64>,
     user_id: String,
     machine_id: Option<String>,
     device_id: Option<String>,
@@ -88,7 +90,7 @@ impl TraeClient {
             .and_then(|credential| credential.user_id.clone())
             .or_else(|| env::var("TRAE_USER_ID").ok())
             .unwrap_or_default();
-        let identity = read_identity();
+        let identity = read_identity_cached();
         let app_version = identity
             .app_version
             .clone()
@@ -101,6 +103,7 @@ impl TraeClient {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            expires_at_ms: jwt_expiry_ms(&access_token),
             access_token,
             user_id,
             machine_id: identity.machine_id,
@@ -112,6 +115,12 @@ impl TraeClient {
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_FUNCTION.to_string()),
         })
+    }
+
+    /// 凭证 JWT 的过期时间（毫秒时间戳）。`None` 表示无法解析 `exp`。
+    #[must_use]
+    pub const fn expires_at_ms(&self) -> Option<u64> {
+        self.expires_at_ms
     }
 
     pub async fn send_message(
@@ -1152,7 +1161,7 @@ fn now_ms() -> u64 {
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct TraeIdentity {
     machine_id: Option<String>,
     device_id: Option<String>,
@@ -1168,6 +1177,13 @@ struct StorageFile {
     device_id: Option<String>,
     #[serde(default, rename = "iCubeLastVersion")]
     app_version: Option<String>,
+}
+
+/// 机器/设备/版本/系统信息在进程生命周期内不会变化，读一次即可：
+/// 避免每轮构造 provider 都重复读 `storage.json` 并执行 `cmd /C ver`。
+fn read_identity_cached() -> TraeIdentity {
+    static IDENTITY: std::sync::OnceLock<TraeIdentity> = std::sync::OnceLock::new();
+    IDENTITY.get_or_init(read_identity).clone()
 }
 
 fn read_identity() -> TraeIdentity {
@@ -1262,6 +1278,14 @@ fn dashed_id(trace: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jwt_expiry_reads_exp_in_milliseconds() {
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"exp":1700000000}"#);
+        let token = format!("header.{payload}.sig");
+        assert_eq!(jwt_expiry_ms(&token), Some(1_700_000_000_000));
+        assert_eq!(jwt_expiry_ms("opaque-token"), None);
+    }
 
     #[test]
     fn send_backoff_grows_and_caps() {

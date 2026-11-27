@@ -162,6 +162,18 @@ impl ApiError {
         }
     }
 
+    /// 是否为凭证类失败（401/403）。上层可据此丢弃缓存的 provider
+    /// 并重读本地凭证后重试一次。
+    #[must_use]
+    pub fn is_auth_error(&self) -> bool {
+        match self {
+            Self::Auth(_) => true,
+            Self::Api { status, .. } => matches!(status.as_u16(), 401 | 403),
+            Self::RetriesExhausted { last_error, .. } => last_error.is_auth_error(),
+            _ => false,
+        }
+    }
+
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
         match self {
