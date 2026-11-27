@@ -6889,6 +6889,50 @@ fn spawn_upgrade_coordinator(state: AppState, request: crate::session_mgr::Upgra
     });
 }
 
+/// 启动恢复时决定 `HotUpgrade` 的工具结果文案与是否标记错误。
+///
+/// - 有结果：按 `ok` 区分"升级完成(含耗时)" / "编译失败(带错误)"；
+/// - 无结果 + `Building`：构建没跑完就断了，必须报"未完成"，不能谎报成功；
+/// - 无结果 + 其它阶段（`Resuming`）：上次结果已被消费，按正常完成处理。
+fn resume_outcome(
+    request: &crate::session_mgr::UpgradeRequest,
+    result: Option<&crate::session_mgr::UpgradeResult>,
+) -> (String, bool) {
+    match result {
+        Some(result) if !result.ok => (upgrade_failure_output(result), true),
+        Some(result) => (
+            format!(
+                "热升级完成：版本 {}（构建耗时 {:.0}s）。请继续原任务。",
+                crate::version_label(),
+                result.elapsed_ms.unwrap_or(0) as f64 / 1000.0
+            ),
+            false,
+        ),
+        None if matches!(
+            request.phase,
+            Some(crate::session_mgr::UpgradePhase::Building)
+        ) =>
+        {
+            (
+                format!(
+                    "热升级未完成：未找到本次构建结果（进程可能在构建完成前退出）。\
+                     当前可能仍在旧版本运行，请确认修复已生效后重试 HotUpgrade。\
+                     （当前版本 {}）",
+                    crate::version_label()
+                ),
+                true,
+            )
+        }
+        None => (
+            format!(
+                "热升级完成：版本 {}。请继续原任务。",
+                crate::version_label()
+            ),
+            false,
+        ),
+    }
+}
+
 /// 构建失败时回传给模型的工具结果文案。
 fn upgrade_failure_output(result: &crate::session_mgr::UpgradeResult) -> String {
     let detail = result
@@ -6972,24 +7016,7 @@ fn spawn_upgrade_resume(state: AppState) {
         // P1:构建结果区分成功/失败。失败时把编译错误作为 HotUpgrade 的错误
         // 结果回传，模型在旧版本里直接修复重试（无需用户再次下指令）。
         let result = crate::session_mgr::read_upgrade_result(&workspace);
-        let (output, is_error) = match &result {
-            Some(result) if !result.ok => (upgrade_failure_output(result), true),
-            Some(result) => (
-                format!(
-                    "热升级完成：版本 {}（构建耗时 {:.0}s）。请继续原任务。",
-                    crate::version_label(),
-                    result.elapsed_ms.unwrap_or(0) as f64 / 1000.0
-                ),
-                false,
-            ),
-            None => (
-                format!(
-                    "热升级完成：版本 {}。请继续原任务。",
-                    crate::version_label()
-                ),
-                false,
-            ),
-        };
+        let (output, is_error) = resume_outcome(&request, result.as_ref());
         match crate::upgrade_resume::resolve_session(&request, &output, is_error) {
             Ok(plan) => {
                 crate::session_mgr::update_upgrade_phase(
@@ -7131,6 +7158,59 @@ mod tests {
             assert_eq!(permission_key(mode), key);
             assert_eq!(crate::permission_mode_from_label(key), mode);
         }
+    }
+
+    fn sample_upgrade_request(
+        phase: crate::session_mgr::UpgradePhase,
+    ) -> crate::session_mgr::UpgradeRequest {
+        crate::session_mgr::UpgradeRequest {
+            session_id: "s1".to_string(),
+            plan_id: None,
+            requested_at_ms: 0,
+            from_version: "test".to_string(),
+            old_pid: 1,
+            web_port: Some(4317),
+            web_token: Some("token".to_string()),
+            session_path: None,
+            workspace: None,
+            permission: Some("workspace-write".to_string()),
+            model: None,
+            suspended_tool_use_id: Some("call_1".to_string()),
+            suspended_tool_name: Some("HotUpgrade".to_string()),
+            pending_after: Vec::new(),
+            phase: Some(phase),
+            queued_prompts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resume_outcome_fails_when_build_interrupted() {
+        let request = sample_upgrade_request(crate::session_mgr::UpgradePhase::Building);
+        let (output, is_error) = resume_outcome(&request, None);
+        assert!(is_error, "Building 阶段无结果不能谎报成功");
+        assert!(output.contains("热升级未完成"), "got: {output}");
+    }
+
+    #[test]
+    fn resume_outcome_resuming_without_result_is_success() {
+        let request = sample_upgrade_request(crate::session_mgr::UpgradePhase::Resuming);
+        let (output, is_error) = resume_outcome(&request, None);
+        assert!(!is_error);
+        assert!(output.contains("热升级完成"), "got: {output}");
+    }
+
+    #[test]
+    fn resume_outcome_reports_compile_error() {
+        let request = sample_upgrade_request(crate::session_mgr::UpgradePhase::Building);
+        let result = crate::session_mgr::UpgradeResult {
+            ok: false,
+            elapsed_ms: None,
+            stderr_tail: Some("error[E0308]: mismatched types".to_string()),
+            message: None,
+        };
+        let (output, is_error) = resume_outcome(&request, Some(&result));
+        assert!(is_error);
+        assert!(output.contains("error[E0308]"), "got: {output}");
     }
 
     #[test]
