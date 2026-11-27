@@ -18,6 +18,28 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+/// 「跳过验证」结果的 detail 前缀。
+///
+/// 用于区分两种语义截然不同的非通过结果：
+/// - **命令执行了但失败** → `passed = false`，`detail` 不含本前缀
+/// - **命令在当前平台根本无法执行** → `passed = true` + 本前缀（skipped）
+///
+/// 后者若被当成 failed，会让 POSIX-only 写法或不存在的脚本把任务误判为失败
+/// （假阴性），且用户无法区分「任务真失败」与「验收命令本身跑不起来」。
+pub const SKIP_PREFIX: &str = "verification skipped";
+
+/// 「命令在当前平台无法执行」结果的 detail 前缀。
+///
+/// 与 [`SKIP_PREFIX`] 的区别在于语义归属：
+/// - [`SKIP_PREFIX`]：**未配置** verify_command（主动跳过，passed=true）
+/// - 本前缀：**配置了但跑不起来**（验证没发生，passed=false）
+///
+/// 后者必须 `passed=false` —— 否则下游会把步骤标成 Succeeded，构成
+/// 静默假通过（比假阴性更危险）。同时它也不能算 failed：任务本身可能
+/// 是好的，只是验收命令在当前平台无法执行。故由调用方据此标记
+/// `StepStatus::Skipped`。
+pub const UNEXECUTABLE_PREFIX: &str = "verification unexecutable";
+
 /// 规则验证结果。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleVerdict {
@@ -27,6 +49,101 @@ pub struct RuleVerdict {
     pub detail: String,
     /// 失败时的修正建议。
     pub remediation: Option<String>,
+}
+
+impl RuleVerdict {
+    /// 验证被**主动跳过**（未配置 verify_command）。
+    ///
+    /// 判定依据是 detail 前缀而非新增字段：既有 skip 分支已统一使用
+    /// [`SKIP_PREFIX`] 开头，无需改动任何构造点。
+    #[must_use]
+    pub fn is_skipped(&self) -> bool {
+        self.passed && self.detail.starts_with(SKIP_PREFIX)
+    }
+
+    /// 命令在当前平台**无法执行**（不是任务失败，是验收命令跑不起来）。
+    ///
+    /// 调用方应据此标记 `StepStatus::Skipped` 而非 `Failed`，避免把
+    /// POSIX-only 写法或不存在的脚本误判成任务失败。
+    #[must_use]
+    pub fn is_unexecutable(&self) -> bool {
+        self.detail.starts_with(UNEXECUTABLE_PREFIX)
+    }
+}
+
+/// 预检：命令在当前平台上是否**根本无法执行**。
+///
+/// 返回 `Some(原因)` 表示不可执行，调用方应记为 skipped 而非 failed。
+///
+/// 设计约束：**只在能确证时返回 Some**。误判为不可执行会跳过真实验证，
+/// 让有问题的步骤静默通过，比假阴性更危险。故仅覆盖三类确定性情形：
+///
+/// 1. POSIX-only shell 内建（`test`/`[`/`export` 等），cmd.exe 无对应内建；
+/// 2. 显式脚本路径（`.sh`/`.ps1`/`.bat`/`.cmd`）在磁盘上不存在；
+/// 3. 裸命令名不在 PATH 中。
+///
+/// 不能用 stderr 文本匹配：中文 Windows 下 cmd.exe 输出 GBK，经
+/// `from_utf8_lossy` 解码后是乱码，任何英文/中文特征串都匹配不到。
+fn preflight_unexecutable(command: &str) -> Option<String> {
+    let head = command.split_whitespace().next()?.trim_matches('"');
+    if head.is_empty() {
+        return None;
+    }
+
+    // 1) POSIX-only shell 内建：Windows cmd.exe 不提供。
+    #[cfg(windows)]
+    {
+        const POSIX_ONLY_BUILTINS: &[&str] = &[
+            "test", "[", "[[", "export", "source", "unset", "alias", "declare", "local", "trap",
+            "umask", "readonly",
+        ];
+        if POSIX_ONLY_BUILTINS.contains(&head) {
+            return Some(format!(
+                "`{head}` is a POSIX shell builtin with no cmd.exe equivalent"
+            ));
+        }
+    }
+
+    // 2) 显式脚本路径：存在性可直接判定。
+    let lower = head.to_ascii_lowercase();
+    if [".sh", ".ps1", ".bat", ".cmd", ".bash"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+    {
+        if !std::path::Path::new(head).exists() {
+            return Some(format!("script `{head}` does not exist"));
+        }
+        return None;
+    }
+
+    // 3) 裸命令名：查 PATH。带路径分隔符的交给系统解析。
+    if !head.contains('/') && !head.contains('\\') && !resolves_in_path(head) {
+        return Some(format!("`{head}` not found in PATH"));
+    }
+
+    None
+}
+
+/// 在 PATH 中查找可执行文件（不启子进程，跨平台）。
+fn resolves_in_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        // 无 PATH 信息时不做判断，避免误判为不可执行。
+        return true;
+    };
+    // Windows 需要尝试 PATHEXT 后缀；Unix 直接匹配裸名。
+    #[cfg(windows)]
+    let suffixes: &[&str] = &["", ".exe", ".bat", ".cmd", ".com"];
+    #[cfg(not(windows))]
+    let suffixes: &[&str] = &[""];
+
+    for dir in std::env::split_paths(&path) {
+        for suffix in suffixes {
+            if dir.join(format!("{name}{suffix}")).is_file() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// 规则验证器 — 执行 verify_command 检查 exit_code。
@@ -111,6 +228,31 @@ impl RuleVerifier {
                 passed: true,
                 detail: "verification skipped — verify_command is empty".to_owned(),
                 remediation: None,
+            };
+        }
+
+        // 2026-11-27 修复(verify 假阴性):先做平台可执行性预检。
+        // 命令在当前平台根本无法执行时，语义是「验证没发生」——
+        // 既不是失败（任务可能本身是好的），也绝不能当作通过（否则就是
+        // 静默假通过）。故返回 passed=false + 可识别的 unexecutable 标记，
+        // 由调用方据此标记 StepStatus::Skipped 而非 Failed。
+        if let Some(reason) = preflight_unexecutable(cmd) {
+            return RuleVerdict {
+                passed: false,
+                detail: format!(
+                    "{UNEXECUTABLE_PREFIX} '{cmd}': {reason} (criteria: {acceptance_criteria})"
+                ),
+                remediation: Some(format!(
+                    "Step verification could not run — the verify_command is not executable \
+                     on this platform.\n\
+                     Command: {cmd}\n\
+                     Error: {reason}\n\
+                     Acceptance criteria: {acceptance_criteria}\n\
+                     \n\
+                     This step is marked SKIPPED (not failed): the work may be fine, but it \
+                     was not verified. Replace verify_command with a command runnable on this \
+                     platform, or set it to null to skip verification explicitly.",
+                )),
             };
         }
 
@@ -345,6 +487,95 @@ mod tests {
         // Should mention spawn failure or similar
         let rem = verdict.remediation.unwrap();
         assert!(rem.contains("Command:") || rem.contains("Error:"));
+    }
+
+    /// 平台无法执行的命令 → 标记为 unexecutable（由调用方转 Skipped），
+    /// 而非普通 failed。避免 POSIX-only 写法把正常任务误判为失败。
+    #[test]
+    fn posix_only_builtin_is_classified_unexecutable_on_windows() {
+        let v = RuleVerifier::new();
+        let verdict = v.verify("output", "criteria", Some("test 1 -eq 1"));
+        #[cfg(windows)]
+        {
+            assert!(
+                verdict.is_unexecutable(),
+                "Windows 下 test 内建应判为 unexecutable，实际 detail: {}",
+                verdict.detail
+            );
+            // 不能算通过，否则就是静默假通过。
+            assert!(!verdict.passed, "unexecutable 不得当作通过");
+            // 也不该被当作普通失败：它不是任务失败。
+            assert!(!verdict.is_skipped(), "它不是主动跳过");
+        }
+        #[cfg(not(windows))]
+        {
+            // Unix 上 test 是真命令，应当真的执行并通过。
+            assert!(verdict.passed, "Unix 下 test 1 -eq 1 应通过");
+            assert!(!verdict.is_unexecutable());
+        }
+    }
+
+    /// 显式脚本路径不存在 → unexecutable。
+    #[test]
+    fn missing_script_path_is_classified_unexecutable() {
+        let v = RuleVerifier::new();
+        let verdict = v.verify(
+            "output",
+            "criteria",
+            Some("scripts/definitely_missing_script_xyz.sh --env e2e"),
+        );
+        assert!(
+            verdict.is_unexecutable(),
+            "不存在的脚本应判为 unexecutable，实际: {}",
+            verdict.detail
+        );
+        assert!(!verdict.passed);
+    }
+
+    /// 可执行但退出码非零 → 仍是 failed，不能被 unexecutable 误吞。
+    #[test]
+    fn executable_with_nonzero_exit_stays_failed() {
+        let v = RuleVerifier::new();
+        #[cfg(windows)]
+        let cmd = "cmd /C exit 7";
+        #[cfg(not(windows))]
+        let cmd = "exit 7";
+        let verdict = v.verify("output", "criteria", Some(cmd));
+        assert!(!verdict.passed, "非零退出码必须是失败");
+        assert!(
+            !verdict.is_unexecutable(),
+            "能执行但失败，不得归为 unexecutable: {}",
+            verdict.detail
+        );
+        assert!(!verdict.is_skipped(), "不是主动跳过");
+    }
+
+    /// 可执行且退出码 0 → 通过，且不属于任何 skipped/unexecutable 分类。
+    #[test]
+    fn executable_zero_exit_is_plain_pass() {
+        let v = RuleVerifier::new();
+        #[cfg(windows)]
+        let cmd = "cmd /C exit 0";
+        #[cfg(not(windows))]
+        let cmd = "true";
+        let verdict = v.verify("output", "criteria", Some(cmd));
+        assert!(verdict.passed);
+        assert!(!verdict.is_skipped());
+        assert!(!verdict.is_unexecutable());
+    }
+
+    /// PATH 中真实存在的命令不得被误判为 unexecutable。
+    #[test]
+    fn command_present_in_path_is_not_unexecutable() {
+        let v = RuleVerifier::new();
+        // cargo 一定在 PATH 中（本测试由 cargo 驱动）。
+        let verdict = v.verify("output", "criteria", Some("cargo --version"));
+        assert!(
+            !verdict.is_unexecutable(),
+            "cargo 在 PATH 中，不应判为 unexecutable: {}",
+            verdict.detail
+        );
+        assert!(verdict.passed, "cargo --version 应退出 0");
     }
 
     #[test]
