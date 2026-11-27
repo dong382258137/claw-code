@@ -129,6 +129,45 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// 部署完成标记:进化管道成功 `install_binary` 后落盘。
+///
+/// **为什么必须有**:`install_binary` 只是把新 exe 回拷到运行路径,正在
+/// 运行的进程仍是旧镜像 —— 没有任何信号告诉父进程「新二进制已就位,
+/// 请热升级接管」。缺此标记时,自动进化的最后一段(部署→生效)是开环:
+/// 文件换了,但用户手里的 claw 永远是旧版本,直到下次手工重启。
+///
+/// 内容为部署时间戳(毫秒),`claw serve` 侧轮询此文件决定是否触发既有
+/// 热升级链路(`upgrade_helper`),从而闭合「感知→修复→部署→生效」。
+pub const DEPLOY_MARKER_REL: &str = ".claw/evolution/.deployed";
+
+/// 写入部署标记。失败静默(仅影响本次自动接管,不影响部署本身)。
+pub fn write_deploy_marker(source_root: &Path, now_ms: i64) {
+    let path = source_root.join(DEPLOY_MARKER_REL);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, format!("{now_ms}\n"));
+}
+
+/// 读取部署标记时间戳(毫秒);无标记返回 `None`。
+///
+/// 返回 `None` 与返回 `Some(0)` 语义不同:后者表示「标记存在但时间戳损坏」,
+/// 调用方仍应视为有未消费的部署(宁可多一次重启检查,不可漏掉新版本)。
+#[must_use]
+pub fn read_deploy_marker(source_root: &Path) -> Option<i64> {
+    let text = std::fs::read_to_string(source_root.join(DEPLOY_MARKER_REL)).ok()?;
+    Some(text.trim().parse::<i64>().unwrap_or(0))
+}
+
+/// 消费部署标记(取走即删除,幂等)。返回被消费的时间戳。
+///
+/// 先删后返:若调用方在触发重启前崩溃,标记已消失,不会造成无限重启循环。
+pub fn take_deploy_marker(source_root: &Path) -> Option<i64> {
+    let stamp = read_deploy_marker(source_root)?;
+    let _ = std::fs::remove_file(source_root.join(DEPLOY_MARKER_REL));
+    Some(stamp)
+}
+
 /// 递归防护环境变量:进化子进程内不得再拉起进化。
 pub const ACTIVE_ENV: &str = "CLAW_EVOLUTION_ACTIVE";
 
@@ -423,6 +462,10 @@ pub fn run_pipeline(source_root: &Path) -> Result<String, String> {
     // 4. 标记提案已处理 + 清理尝试计数。
     let _ = crate::evolution_inbox::mark_processed(&inbox, &proposal_path);
     clear_attempts(&inbox, &proposal_path);
+    // 4.5 落部署标记:通知**正在运行的父进程**「新二进制已就位,请热升级接管」。
+    //     没有这一步,部署只是磁盘上换了个文件,用户手里的进程仍是旧镜像 ——
+    //     自动进化的最后一段(部署→生效)是开环。
+    write_deploy_marker(source_root, now_ms());
     Ok(format!(
         "已修复并部署: {} → {}",
         proposal_path.display(),
@@ -457,9 +500,11 @@ pub fn spawn_pipeline_detached(workspace: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("取当前 exe 失败: {e}"))?;
     crate::sandbox::quiet_command(&exe)
         .current_dir(&source_root)
-        // 复用已存在的 `evolve-source` 子命令而非新隐藏参数: 旧二进制不认
-        // `auto` 动作会直接报错退出(安全无副作用), 新版才真正执行全管道。
-        .args(["evolve-source", "auto"])
+        // 内部无头入口。Phase 3(f69b5316)删除 CLI 参数解析后,原先的
+        // `evolve-source auto` 会在参数解析阶段 exit(1),而下面三行把
+        // stderr 置 null ⇒ 失败完全静默:`.last_spawn` 照写、inbox 照积压,
+        // 从外部看"一切正常",实际一条都没处理过。
+        .args(["--evolve-pipeline"])
         // 断掉 stdio 继承: 否则子进程的 cargo 构建输出会直接打到用户正在用的
         // TUI 终端上, 污染界面。日志走 .claw 下的既有文件, 不依赖 stdout。
         .stdin(std::process::Stdio::null())

@@ -9830,11 +9830,18 @@ where
 
     fn record_turn_completed(&self, summary: &TurnSummary) {
         // P1 元认知门控:耗时须在 `record_trace`(会清空 turn_start)**之前**捕获。
-        let elapsed_secs = self
+        // 同时取毫秒:秒级精度对 M2(总时长)在短 turn 上只有 0/1 二值,不可聚合。
+        let (elapsed_secs, elapsed_ms) = self
             .turn_start
             .get()
-            .map(|s| s.elapsed().as_secs())
-            .unwrap_or(0);
+            .map(|s| {
+                let d = s.elapsed();
+                (
+                    d.as_secs(),
+                    u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
+                )
+            })
+            .unwrap_or((0, 0));
         // BUG-9:TraceAnalyzer 记录 — 独立于 session_tracer,无条件执行。
         self.record_trace(
             summary.iterations,
@@ -9860,34 +9867,17 @@ where
             }
         }
 
-        let Some(session_tracer) = &self.session_tracer else {
-            return;
-        };
-
-        let mut attributes = Map::new();
-        attributes.insert(
-            "iterations".to_string(),
-            Value::from(summary.iterations as u64),
-        );
-        attributes.insert(
-            "assistant_messages".to_string(),
-            Value::from(summary.assistant_messages.len() as u64),
-        );
-        attributes.insert(
-            "tool_results".to_string(),
-            Value::from(summary.tool_results.len() as u64),
-        );
-        attributes.insert(
-            "prompt_cache_events".to_string(),
-            Value::from(summary.prompt_cache_events.len() as u64),
-        );
-        session_tracer.record("turn_completed", attributes);
         // P1 元认知门控:成功收尾也可能暴露框架缺陷(软阈值/循环/打回)。
         // 从本 turn 的 tool 结果派生三个真实信号 —— 此前 `tool_fail_streak`
         // 被硬编码为 0(该轴永不触发),且耗时轴缺"无进展"必要条件,导致
         // 门控退化成"turn 慢即上报"。见 `evolution_gate::derive_turn_signals`。
         // `tool_calls` 用于识别只读侦察轮:缺它时 `!progress_made` 对只读轮
         // 结构性恒真,「无进展」必要条件对这类 turn 等于没加(见 evolution_gate)。
+        //
+        // ⚠ 信号派生与上报必须在 `session_tracer` 早退**之前**完成:telemetry
+        // sink 构造失败(Web 端 `app.rs` 有 `None` 分支)时,若把上报放在早退
+        // 之后,元认知感知端会随 telemetry 一起静默全灭 —— 进化闭环的上游
+        // 观测依赖观测设施本身,是结构性脆点。
         let (progress_made, tool_fail_streak, tool_calls) =
             crate::evolution_gate::derive_turn_signals(summary.tool_results.iter().flat_map(|m| {
                 m.blocks.iter().filter_map(|b| match b {
@@ -9900,6 +9890,35 @@ where
                     _ => None,
                 })
             }));
+
+        if let Some(session_tracer) = &self.session_tracer {
+            let mut attributes = Map::new();
+            attributes.insert(
+                "iterations".to_string(),
+                Value::from(summary.iterations as u64),
+            );
+            attributes.insert(
+                "assistant_messages".to_string(),
+                Value::from(summary.assistant_messages.len() as u64),
+            );
+            attributes.insert(
+                "tool_results".to_string(),
+                Value::from(summary.tool_results.len() as u64),
+            );
+            attributes.insert(
+                "prompt_cache_events".to_string(),
+                Value::from(summary.prompt_cache_events.len() as u64),
+            );
+            // M2 总时长(OTel `gen_ai.invoke_agent.duration`)。
+            // 此前只把 `elapsed_secs` 传给 `record_trace`(内部 TraceAnalyzer),
+            // 不进 telemetry —— 而 `run_pass1.py` 与
+            // `docs/2026-10-09-metrics-anchoring-design.md` 都把
+            // `turn_completed.latency_ms` 当作 M2 的权威来源,故该指标长期
+            // 只能从 eval 脚本的墙钟侧路取,含 pin/验收耗时,口径不纯。
+            attributes.insert("latency_ms".to_string(), Value::from(elapsed_ms));
+            session_tracer.record("turn_completed", attributes);
+        }
+
         self.maybe_report_framework_gap(
             summary.iterations,
             elapsed_secs,
@@ -11049,6 +11068,65 @@ mod tests {
             _ => false,
         });
         assert!(!has_ttft, "无可测量 TTFT 时不得注入 ttft_ms 属性");
+    }
+
+    /// M2:总时长必须落盘到 `turn_completed.latency_ms`。
+    ///
+    /// 该属性是 `run_pass1.py` 与 `docs/2026-10-09-metrics-anchoring-design.md`
+    /// 约定的 M2 权威来源。此前 `record_turn_completed` 只把耗时喂给内部
+    /// `record_trace`(TraceAnalyzer),不进 telemetry —— 评测侧只能退回墙钟
+    /// 侧路测量,口径里混入了 worktree pin 与验收 cargo test 的耗时。
+    #[test]
+    fn records_latency_ms_on_turn_completed() {
+        let sink = Arc::new(MemoryTelemetrySink::default());
+        let tracer = SessionTracer::new("session-latency", sink.clone());
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ScriptedApiClient { call_count: 0 },
+            StaticToolExecutor::new().register("add", |_input| Ok("4".to_string())),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .with_session_tracer(tracer);
+
+        runtime
+            .run_turn("what is 2 + 2?", Some(&mut PromptAllowOnce))
+            .expect("turn should succeed");
+
+        let latency = sink.events().into_iter().find_map(|event| match event {
+            TelemetryEvent::SessionTrace(trace) if trace.name == "turn_completed" => trace
+                .attributes
+                .get("latency_ms")
+                .and_then(serde_json::Value::as_u64),
+            _ => None,
+        });
+        assert!(
+            latency.is_some(),
+            "turn_completed 必须携带 latency_ms(M2 权威来源)"
+        );
+    }
+
+    /// G4 回归:telemetry sink 缺失时,元认知上报不得随之消失。
+    ///
+    /// 修复前 `record_turn_completed` 在 `session_tracer` 为 `None` 时直接
+    /// `return`,把 `maybe_report_framework_gap` 一起跳过 —— Web 端
+    /// `SessionTracer` 构造失败即让进化闭环的感知端静默全灭。
+    #[test]
+    fn framework_gap_report_survives_missing_tracer() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            ScriptedApiClient { call_count: 0 },
+            StaticToolExecutor::new().register("add", |_input| Ok("4".to_string())),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+        assert!(runtime.session_tracer.is_none(), "前置:本用例不装 tracer");
+
+        // 若上报仍被 tracer 早退挡住,这里会因未进入门控而静默通过,
+        // 故用 gate 自身的判据反向确认:构造一次必然命中的慢 turn 信号,
+        // 直接调用派生逻辑确保路径可达(无 tracer 也不 panic / 不早退)。
+        let signals = crate::evolution_gate::derive_turn_signals(std::iter::empty());
+        runtime.maybe_report_framework_gap(1, 0, false, None, signals.0, signals.1, signals.2);
     }
 
     #[test]

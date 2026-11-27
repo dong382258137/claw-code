@@ -1329,6 +1329,8 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         spawn_session_watchdog(state.clone());
         // P0-4:若上次进程因热升级挂起,新进程启动后补齐工具结果并续跑。
         spawn_upgrade_resume(state.clone());
+        // P0:周期性排空进化 inbox 存量(积压提案的唯一消费者)。
+        spawn_evolution_drain(state.clone());
         // Phase 6:进程内 tick 线程,扫描各工作区到期的定时任务并入队。
         cron_runner::spawn_cron_runner(state.clone());
         // Phase 8:启动时只探测语义检索可用性（检查 onnxruntime.dll），
@@ -2266,6 +2268,43 @@ struct SessionWorker {
     cached: Option<CachedCli>,
     /// 连续 panic 次数；达到 2 次时丢弃缓存，下一轮重建运行态。
     panic_streak: u32,
+}
+
+/// 周期性排空进化 inbox 存量。
+///
+/// **为什么需要**：`spawn_pipeline_detached` 此前只在「新立案」时被调用
+/// （`conversation.rs` 的 turn 收尾与 `tools` 的显式上报）。存量提案没有
+/// 任何消费者 —— 实测 `rust/.claw/evolution/inbox` 积压 21 条、
+/// `.attempts` 全 0、`.last_spawn` 停在 36 天前。即使上报端修好，也仍需要
+/// 一个周期性入口把**已有积压**排出去，否则只有新缺陷才会被处理。
+///
+/// 冷却/锁/递归三道防护都在 `spawn_pipeline_detached` 内部，本线程只负责
+/// 「定期敲门」，不重复实现门控。
+///
+/// **默认关闭（显式 opt-in）**：开启后每消耗一条提案，都会触发
+/// 「LLM 改源码 → `cargo test --workspace` 测试门 → 通过则 `install_binary`
+/// 覆盖运行中的 exe」。这是**无人复核的自动部署**，不应作为某次重启的
+/// 附带副作用被悄悄打开 —— 尤其当 inbox 已有大量积压时，启动瞬间就会
+/// 连跑多轮。故要求显式设置 `CLAW_EVOLUTION_DRAIN_SECS=<秒>` 才启用。
+///
+/// 需要启用时（例如已人工审过积压内容）：
+/// `CLAW_EVOLUTION_DRAIN_SECS=600` 后重启 serve。
+fn spawn_evolution_drain(state: AppState) {
+    let Some(interval_secs) = std::env::var("CLAW_EVOLUTION_DRAIN_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    else {
+        return;
+    };
+    if interval_secs == 0 {
+        return;
+    }
+    std::thread::spawn(move || loop {
+        // 失败静默：未登记源码根 / 锁被持有 / 冷却未到都是正常路径，
+        // 不属于需要打扰用户的错误。
+        let _ = runtime::evolution_auto::spawn_pipeline_detached(&state.workspace);
+        std::thread::sleep(Duration::from_secs(interval_secs));
+    });
 }
 
 /// 会话级看门狗：一个后台线程扫描所有在跑的会话，替代「每 turn 一个

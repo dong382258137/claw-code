@@ -14,6 +14,7 @@
 pub mod api_client;
 pub mod app;
 pub mod checkpoint;
+pub mod headless;
 pub mod init;
 pub mod llm_clients;
 pub mod plugin_state;
@@ -232,9 +233,47 @@ fn help_text() -> String {
     )
 }
 
+/// 内部无头入口分发(非产品面,不出现在 `--help`)。
+///
+/// 返回 `Some(exit_code)` 表示已处理(调用方应立即退出);`None` 表示不是
+/// 无头调用,继续走常规入口。
+///
+/// **为什么用隐藏参数而不是恢复 `-p` / `evolve-source`**:Phase 3 的产品
+/// 决定是"只保留 Web 入口",恢复公开子命令会违背该决定;而管道与评测器
+/// 只需要**能跑**,不需要用户可见的命令面。隐藏参数复用既有
+/// `--upgrade-helper` 的工程模式,改动面最小且可随时撤回。
+///
+/// 支持三种形态:
+/// - `--evolve-pipeline`:跑一次进化管道(替代 `evolve-source auto`);
+/// - `--headless-prompt <prompt>`:跑一次无头 turn(替代 `-p <prompt>`);
+/// - `-p <prompt>`:同上,兼容 `run_pass1.py` 与既有调用方。
+///
+/// ⚠ `-p` **不要求位于首位**:两个既有调用方都把
+/// `--dangerously-skip-permissions` 放在 `-p` 之前。只检查首个参数会让它们
+/// 继续落进"不支持的参数"分支 —— 这正是本次要修的静默失效本身。
+fn dispatch_internal_headless(argv: &[String]) -> Option<i32> {
+    let args = argv.get(1..).unwrap_or_default();
+    if args.first().map(String::as_str) == Some("--evolve-pipeline") {
+        return Some(headless::run_pipeline_cli());
+    }
+    // 找到 `-p` / `--headless-prompt` 的位置,其后的**全部**参数 join 成 prompt
+    // —— 与 Phase 3 前的语义一致(prompt 中可能含空格,不能只取一个参数)。
+    // `-p` 之前允许存在其它开关(如 `--dangerously-skip-permissions`),它们
+    // 在无头模式下恒等语义(本入口本就以 DangerFullAccess 运行),故忽略。
+    let prompt_flag = args
+        .iter()
+        .position(|arg| arg == "-p" || arg == "--headless-prompt")?;
+    let prompt = args.get(prompt_flag + 1..).unwrap_or_default().join(" ");
+    if prompt.trim().is_empty() {
+        eprintln!("error: `-p` / `--headless-prompt` 需要一段提示词");
+        return Some(1);
+    }
+    Some(headless::run_prompt_once(&prompt))
+}
+
 /// `claw` binary 的唯一入口。
 ///
-/// 只处理三件事：`--upgrade-helper`、`serve`、`--version/--help`。
+/// 只处理：`--upgrade-helper`、内部无头入口、`serve`、`--version/--help`。
 pub fn main_entry() {
     // 诊断：注册 panic hook,落盘到 ~/.claw/claw-crash.log
     // 双击运行时 stderr 不可见,panic hook 是唯一能确认"是否 panic"的可靠信号。
@@ -270,6 +309,14 @@ pub fn main_entry() {
             std::process::exit(1);
         }
         std::process::exit(0);
+    }
+
+    // 内部无头入口(非产品面):Phase 3 删除 CLI 后,自动进化管道与 pass^1
+    // 评测器仍按旧语法拉起子进程,导致子进程在参数解析阶段即 exit(1),
+    // 而 spawn 侧 stderr 已置 null ⇒ 失败完全静默。这里恢复两条通道,
+    // 但不恢复公开子命令(保持"只保留 Web 入口"的产品面)。
+    if let Some(code) = dispatch_internal_headless(&argv) {
+        std::process::exit(code);
     }
 
     // 快速启动器：同一个二进制以 `claw-web` 命名（副本或硬链接）时等价于
